@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Scheduler runtime state: task history, event stream, logs
+.bts/
+.autopilot/
+
+# Logs
+*.log
+
+# Backups
+*.bak
+*.bak-*
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
