@@ -1,0 +1,354 @@
+# 权限与审批 — background-task-scheduler v2.7
+
+本文描述 L0-L3 分级、策略上限、白名单、审批闭环。实现见 `scripts/bts.py` 的
+`policy()`、`whitelist_match()`、`permission_gate()`、`gate_operation()`、
+`create_approval()`、`approval_check()`、`cmd_approve()`。
+
+---
+
+## 1. 设计意图
+
+调度器在无人值守环境里执行命令，最大风险是「Agent 自行决定跑了一条破坏性命令」。权限层要解决的问题是：
+
+1. **分级**：不同破坏力的命令用不同门槛
+2. **上限**：即使 Agent 自称高权限，也不能越过运维设定的硬上限
+3. **留痕**：每次放行/拦截都有事件与日志
+4. **需人点头**：高风险操作必须留下人类批准记录，且审批绑定具体命令
+5. **不误伤**：已知安全的命令走白名单，不必反复审批
+
+它**不**解决：
+
+- 身份伪造（能改环境变量的人可以自称 L3）
+- 审计防篡改（文件可被删改）
+- 多租户隔离
+
+这些需要外层系统提供。
+
+---
+
+## 2. 等级定义
+
+| 等级 | 名称 | 判定标准 | 示例 |
+| --- | --- | --- | --- |
+| L0 | 只读 | 不改变任何持久状态 | `ls`、`cat`、`git status`、`grep` |
+| L1 | 可恢复 | 改变工作区但可用 git/备份回滚 | `npm run build`、`pytest`、写临时文件、`pip install` 到虚拟环境 |
+| L2 | 有外部影响 | 影响他人/共享资源 | 部署到测试环境、改 CI 配置、`git push`、删除非关键目录 |
+| L3 | 不可逆 | 无法自动回滚 | 删库、`git push --force` 到主干、改生产配置、格式化磁盘 |
+
+**定级原则**
+
+1. 按「最坏后果」定，不按「通常后果」定
+2. 涉及 `--force`、`--hard`、`rm -rf`、`drop`、`truncate` 一律上调
+3. 涉及生产环境标识（`prod`、`live`、`release`）至少 L2
+4. 不确定时上调一级
+
+---
+
+## 3. 判定流程
+
+```
+输入：command（命令原文）、required_level、approval_id、context
+
+1. 白名单
+   for rule in allow_rules:
+       若 re.search(rule, command, IGNORECASE) → ALLOW(whitelist=rule)，结束
+
+2. 策略上限
+   若 rank(required_level) > rank(max_level) → DENY(denied_policy)，结束
+   （审批不能绕过；这是硬上限）
+
+3. 身份上限
+   若 rank(required_level) <= rank(actor_level) → ALLOW(level)，结束
+
+4. 审批
+   check = approval_check(approval_id, command)
+   若 check.ok → ALLOW(approval)，结束
+   否则 → DENY(approval_required)，并在调用方决定是否创建审批
+```
+
+`effective_level = min(required_level, actor_level, max_level)` 只用于**解释**拦截原因，不参与放行判定。
+
+---
+
+## 4. 策略来源与优先级
+
+```
+默认值  <  <root>/policy.json  <  环境变量
+```
+
+| 键 | 默认 | 环境变量 | 说明 |
+| --- | --- | --- | --- |
+| `max_level` | `L3` | `BTS_MAX_LEVEL` | 硬上限 |
+| `actor_level` | `L3` | `BTS_ACTOR_LEVEL` | 当前身份 |
+| `allow_rules` | `[]` | `BTS_ALLOW_RULES` | 正则，`\|\|` 分隔 |
+| `approval_ttl_seconds` | `86400` | `BTS_APPROVAL_TTL` | 审批有效期，`<=0` 不过期 |
+| `keep_runs_per_plan` | `5` | `BTS_KEEP_RUNS` | 快照保留数，`<=0` 不清理 |
+| `stall_seconds` | `300` | `BTS_STALL` | 停滞阈值，`<=0` 关闭 |
+
+`policy.json` 示例：
+
+```json
+{
+  "max_level": "L2",
+  "actor_level": "L1",
+  "allow_rules": ["^git status", "^git diff", "^ls ", "^npm run (lint|test|build)"],
+  "approval_ttl_seconds": 3600,
+  "keep_runs_per_plan": 3,
+  "stall_seconds": 120
+}
+```
+
+查看生效值：
+
+```bash
+python scripts/bts.py policy --json
+```
+
+**注意**：环境变量优先于文件，便于临时提升/收紧权限。生产环境应把 `actor_level` 设低（如 L1），让 L2+ 必须走审批。
+
+---
+
+## 5. 白名单
+
+### 5.1 语义
+
+- 规则是**正则**，用 `re.search` 匹配命令原文（不区分大小写）
+- 列表顺序即匹配顺序，第一条命中即返回
+- 命中后**跳过等级检查与审批**，直接放行
+- 白名单**不能**突破「不存在」之类的实体检查（只影响权限判定）
+
+### 5.2 写法建议
+
+```json
+"allow_rules": [
+  "^git status$",
+  "^git (diff|log|show)",
+  "^ls( -\\w+)? .*",
+  "^npm run (lint|test|build|typecheck)$",
+  "^pytest( .*)?$",
+  "^python -m pytest( .*)?$",
+  "^cargo (check|clippy|test)$"
+  ]
+```
+
+推荐原则：
+
+1. **锚定开头**（`^`）并尽量锚定结尾（`$`），避免 `.*` 兜底
+2. 用精确子命令集合（`(lint|test|build)`），不要用 `npm run .*`
+3. 不把带 `--force` / `--hard` / `rm` / `deploy` / `publish` 的命令放进白名单
+4. 定期 review 白名单；一条 `.*` 等于把整套权限体系废掉
+
+### 5.3 命中样例
+
+| 命令 | 规则 | 结果 |
+| --- | --- | --- |
+| `git status` | `^git status$` | 放行 |
+| `git status --short` | `^git status$` | 不命中（`$` 限制了） |
+| `git status --short` | `^git status` | 放行 |
+| `npm run deploy` | `^npm run (lint\|test)$` | 不命中 |
+| `rm -rf build` | 任意常见白名单 | 不命中 → 走等级判定 |
+
+---
+
+## 6. 审批生命周期
+
+```
+                 ┌─────────── reject ───────────┐
+                 │                               ▼
+创建 ──► pending ── approve ──► approved ──►（使用）
+   │        │                        │
+   │        └── 到期 ──► expired      └── 到期 ──► expired（不可用）
+   │
+   └──（命令变更）──► mismatch（不可用）
+```
+
+### 6.1 状态
+
+| 状态 | 可用 | 说明 |
+| --- | --- | --- |
+| `pending` | 否 | 等待决策 |
+| `approved` | 是（且未过期） | 已批准 |
+| `rejected` | 否 | 永久失效 |
+| `expired` | 否 | 超过 `expires_at` |
+
+### 6.2 字段
+
+```json
+{
+  "id": "ap-3f2a91c4",
+  "command": "npm run deploy",
+  "required_level": "L2",
+  "status": "pending",
+  "created_at": 1793512103,
+  "created_iso": "2026-11-01T13:48:23",
+  "expires_at": 1793515703,
+  "resolved_at": null,
+  "resolved_iso": null,
+  "resolved_by": null,
+  "note": null,
+  "source": "run",
+  "schedule_id": null,
+  "plan_id": null,
+  "stage_id": null,
+  "step_id": null,
+  "task_id": "deploy1",
+  "resume": "python bts.py run deploy1 --approval <approval_id>"
+}
+```
+
+- `source`：`run`（任务）、`plan`（计划步骤）、`operation`（stop/delete/pause/cancel/rerun）
+- 定位字段用于回查：`schedule_id/plan_id/stage_id/step_id/task_id`
+- `resume` 是给 Agent / 人复制粘贴的完整续跑命令
+
+### 6.3 有效期
+
+- 默认 86400 秒（24 小时）
+- `approval_ttl_seconds <= 0`：不设 `expires_at`，永不过期（不推荐）
+- 过期判定在**读取时**计算：`now >= expires_at`
+- `approve` 遇到已过期：把状态永久置为 `expired`，返回 `error=expired`
+- 执行遇到已过期：`approval_check` 返回 `expired` → 被拦
+
+**为什么要有效期**：审批是对「此刻这条命令」的授权，不是永久通行证。24 小时后环境可能已变。
+
+### 6.4 命令绑定
+
+`approval_check` 比较 `record.command == command`（严格字符串相等）：
+
+- 改了空格、改了参数、改了路径 → `mismatch`
+- 因此**不要在审批后动态拼接命令**；审批生成时就应当把最终命令确定下来
+- **指令包（`pack`）**：审批绑定的是**条目自身的 `command`**（切分后 `strip()` 的原文），不是整包文本；`pack` 本身不产生审批，也不豁免任何条目
+- **`@enc` 钩子**：创建时钩子已从命令文本剥离，审批与白名单匹配的都是**主命令**；钩子不单独过权限门，随任务等级一起执行
+
+### 6.5 拒绝
+
+`approve <id> --reject --note "..."`：
+
+- `status=rejected`，`resolved_by=actor:<level>`
+- 同一审批 ID 永久不可用（再次 `approve` 返回 `already_rejected`）
+- 需要重新执行 → 触发一次新的审批创建
+
+### 6.6 批量
+
+```bash
+python scripts/bts.py approve --all              # 批准所有 pending 且未过期
+python scripts/bts.py approve --all --reject     # 全部拒绝（慎用）
+python scripts/bts.py approve a1 a2 a3          # 指定多个
+```
+
+`--all` 会跳过已过期记录（顺带把它们置为 `expired`），返回实际处理结果。
+
+单条批量返回结构：
+
+```json
+{
+  "approvals": [
+    {"approval_id": "ap-1", "ok": true, "status": "approved", "approval": {...}, "event": {...}},
+    {"approval_id": "ap-2", "ok": false, "error": "expired"}
+  ],
+  "count": 2,
+  "events": [...],
+  "actor_level": "L3"
+}
+```
+
+`ok=false` 的 `error` 取值：`missing`、`expired`、`already_approved`、`already_rejected`、
+`already_expired`、`insufficient_level`。
+
+### 6.7 批准者等级
+
+批准者身份为当前 `actor_level`；要求 `rank(actor) >= rank(required_level)`，否则：
+
+```json
+{"approval_id": "ap-1", "ok": false, "error": "insufficient_level",
+ "required_level": "L3", "actor_level": "L1"}
+```
+
+这条规则防止「低权限进程自己批自己的请求」。
+
+**退出码**：单条 `approve <id>` 失败时给出可判别退出码——`insufficient_level` → `4`（EXIT_DENIED），`missing` / `expired` / `already_*` → `3`（EXIT_CONFLICT）。`approve --all` 是批量语义，无论部分成败一律返回 `0`，逐项结果看 `approvals[]` 里的 `ok` / `error`。
+
+### 6.8 Plan 层自动重发
+
+在执行 Plan 的 Step 时：
+
+```
+check = approval_check(state.approval_id, command)
+若 check.error ∈ {missing, expired} 且 rank(actor) >= rank(required_level):
+    创建新审批 → 写入 state.approval_id / approval_reissued_at
+    投递 approval_created（带 reissued 标记）
+    返回 paused
+```
+
+要点：
+
+- `rejected` **不会**自动重发（尊重拒绝决定）
+- `pending` **不会**重发（避免刷屏），只等待
+- `mismatch` **不会**重发（命令已变，需要人重新确认）
+- 身份不足时仍会创建一次审批（用于交给更高权限的人批），但不会被视为「自动重发」
+
+---
+
+## 7. 操作型权限门
+
+`gate_operation` 用于不执行命令、但会改变调度状态的动作：
+
+| 操作 | 需要等级 | label 示例 |
+| --- | --- | --- |
+| `stop` | L1 | `stop t1` |
+| `delete` task | L2 | `delete t1` |
+| `pause` schedule | L1 | `pause p1` |
+| `cancel` schedule | L2 | `cancel p1` |
+| `rerun_task` | L1 | `rerun p1/s1/step` |
+| `rerun_plan` | L1 | `rerun_plan p1-a1` |
+| `resume_schedule` | L1 | `resume_schedule p1` |
+| `delete` plan/schedule | L2 | `delete p1-a1` |
+
+与 `permission_gate` 的差异：
+
+- 审批绑定的文本是 **label**（不是命令），例如 `stop t1`
+- 失败时**自动创建审批**并投递事件，返回 `approval_id` 与 `resume`
+- 返回结构直接带 `reason`，便于 Agent 判断是 `denied_policy` 还是 `approval_required`
+
+---
+
+## 8. 事件与日志
+
+| 动作 | 事件 | 日志 msg |
+| --- | --- | --- |
+| 创建审批 | `approval_created` | `approval_created` |
+| 批准 | `approval_resolved`（`status=approved`） | `approval_resolved` |
+| 拒绝 | `approval_resolved`（`status=rejected`） | `approval_resolved` |
+| 过期（批准时发现） | — | `approval_expired` |
+| 执行被拦 | — | `task_blocked`（Task 层） |
+| Plan 请求/重发审批 | `approval_created` + `plan_paused` | `approval_requested` / `approval_reissued` / `plan_paused` |
+
+投递位置：
+
+- 记录带 `schedule_id` → `schedules/<sid>/events.jsonl`
+- 否则 → `<root>/events.jsonl`
+
+---
+
+## 9. 未实现
+
+| 项 | 说明 | 替代方案 |
+| --- | --- | --- |
+| 身份鉴权 | `actor_level` 可被任何进程声明 | 外层 CI token / 操作系统账户 / 人工二次确认 |
+| 黑名单硬拒绝 | 没有「这些命令永不批准」的规则 | 用 `max_level` 限制 + 白名单只放安全命令 |
+| 审批双人复核 | 单人即可批准 | 外部流程保证（如审批人必须是另一账号） |
+| 审批委托/转交 | 无 | 人为在群里转达 |
+| 审批记录清理 / 归档 | 只有 JSON 文件与日志 | 清理用 `bts.py approval prune`（只删 `approved`/`rejected`/`expired`，`pending` 永不删）；归档仍需外部定期备份 `approvals/` 与 `scheduler.log` |
+
+---
+
+## 10. 反模式
+
+| 反模式 | 后果 | 正确做法 |
+| --- | --- | --- |
+| `allow_rules: [".*"]` | 权限体系形同虚设 | 只放精确安全命令 |
+| `actor_level: "L3"` 长期不变 | 所有审批都被跳过 | 默认 L1，需要时临时提升 |
+| 审批后拼接变量再执行 | `mismatch` 永远失败 | 审批前确定最终命令 |
+| TTL 设为 0（永久） | 过期授权被长期复用 | 按任务时长设 1-24 小时 |
+| 把 `--force` 命令放白名单 | 不可逆操作无门槛 | 显式走审批 |
+| 用 `approve --all` 当日常操作 | 一次误批全部高危命令 | 逐条批准，或至少人工 review 列表 |
+| 拒绝后复用同一审批 ID | 永远失败 | 重新执行以生成新审批 |

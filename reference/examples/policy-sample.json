@@ -1,0 +1,13 @@
+{
+  "max_level": "L2",
+  "actor_level": "L1",
+  "allow_rules": [
+    "^python -c",
+    "^echo ",
+    "^git status",
+    "^git diff --stat"
+  ],
+  "approval_ttl_seconds": 3600,
+  "keep_runs_per_plan": 5,
+  "stall_seconds": 300
+}

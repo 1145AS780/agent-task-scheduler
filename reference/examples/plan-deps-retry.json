@@ -1,0 +1,41 @@
+{
+  "id": "dep-retry",
+  "title": "依赖传播 + 重试退避",
+  "on_stage_failure": "continue",
+  "stages": [
+    {
+      "id": "fanout",
+      "mode": "parallel",
+      "steps": [
+        {
+          "id": "flaky",
+          "command": "python -c \"import sys; print('failing on purpose'); sys.exit(3)\"",
+          "level": "L0",
+          "timeout": 60,
+          "retry": 2,
+          "retry_backoff": 2
+        },
+        {
+          "id": "downstream",
+          "command": "python -c \"print('should be skipped')\"",
+          "level": "L0",
+          "timeout": 60,
+          "depends_on": "flaky"
+        },
+        {
+          "id": "independent",
+          "command": "python -c \"print('runs anyway')\"",
+          "level": "L0",
+          "timeout": 60
+        },
+        {
+          "id": "deep",
+          "command": "python -c \"print('propagated skip')\"",
+          "level": "L0",
+          "timeout": 60,
+          "depends_on": "downstream"
+        }
+      ]
+    }
+  ]
+}

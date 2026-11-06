@@ -1,0 +1,27 @@
+{
+  "id": "patrol-plan",
+  "title": "巡检计划（供周期 Schedule 复用）",
+  "on_stage_failure": "continue",
+  "stages": [
+    {
+      "id": "probe",
+      "mode": "parallel",
+      "steps": [
+        {
+          "id": "disk",
+          "command": "python -c \"print('disk ok')\"",
+          "level": "L0",
+          "timeout": 60,
+          "retry": 1,
+          "retry_backoff": 3
+        },
+        {
+          "id": "service",
+          "command": "python -c \"print('service ok')\"",
+          "level": "L0",
+          "timeout": 60
+        }
+      ]
+    }
+  ]
+}

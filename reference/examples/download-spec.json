@@ -1,0 +1,25 @@
+{
+  "outputs": "./.bts-examples/dl",
+  "items": [
+    {
+      "url": "https://example.com/releases/v1.0.0.zip",
+      "save_as": "v1.0.0.zip"
+    },
+    {
+      "url": "https://example.com/releases/v1.0.0.zip.sha256",
+      "save_as": "v1.0.0.zip.sha256"
+    },
+    {
+      "url": "https://example.com/mirror/assets/logo.png",
+      "save_as": "assets/logo.png",
+      "headers": {"Referer": "https://example.com/"}
+    }
+  ],
+  "concurrency": 2,
+  "rate_limit": 1048576,
+  "retry": 2,
+  "retry_backoff": 3,
+  "io_timeout": 30,
+  "resume": true,
+  "overwrite": false
+}

@@ -1,0 +1,38 @@
+{
+  "id": "gated",
+  "title": "审批门样例（L2 / L3）",
+  "on_stage_failure": "continue",
+  "stages": [
+    {
+      "id": "prepare",
+      "mode": "serial",
+      "steps": [
+        {
+          "id": "check",
+          "command": "python -c \"print('prepare ok')\"",
+          "level": "L0",
+          "timeout": 60
+        }
+      ]
+    },
+    {
+      "id": "release",
+      "mode": "serial",
+      "steps": [
+        {
+          "id": "deploy",
+          "command": "python -c \"print('deploy ok')\"",
+          "level": "L2",
+          "timeout": 120
+        },
+        {
+          "id": "purge",
+          "command": "python -c \"print('purge ok')\"",
+          "level": "L3",
+          "timeout": 120,
+          "depends_on": "deploy"
+        }
+      ]
+    }
+  ]
+}

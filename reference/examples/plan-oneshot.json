@@ -1,0 +1,37 @@
+{
+  "id": "ci-lint-test",
+  "title": "静态检查 + 测试（最小样例）",
+  "on_stage_failure": "continue",
+  "stages": [
+    {
+      "id": "lint",
+      "mode": "serial",
+      "steps": [
+        {
+          "id": "syntax",
+          "command": "python -c \"print('syntax ok')\"",
+          "level": "L0",
+          "timeout": 60
+        }
+      ]
+    },
+    {
+      "id": "test",
+      "mode": "parallel",
+      "steps": [
+        {
+          "id": "unit",
+          "command": "python -c \"print('unit ok')\"",
+          "level": "L0",
+          "timeout": 120
+        },
+        {
+          "id": "e2e",
+          "command": "python -c \"print('e2e ok')\"",
+          "level": "L0",
+          "timeout": 180
+        }
+      ]
+    }
+  ]
+}

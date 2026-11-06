@@ -1,0 +1,8 @@
+{
+  "id": "patrol-sample",
+  "every": 5,
+  "start_at": 0,
+  "max_runs": 3,
+  "on_stage_failure": "continue",
+  "plan": "./reference/examples/plan-patrol.json"
+}
