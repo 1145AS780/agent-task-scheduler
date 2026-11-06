@@ -689,15 +689,15 @@ python scripts/bts.py logs --plain | Select-String "ci1-a1"   # 只看某次
 
 ## 12. 目录索引
 
-- [orchestration-spec.md](reference/orchestration-spec.md) — 编排规格、能力矩阵、事件与命令映射
-- [permissions.md](reference/permissions.md) — 等级、策略、白名单、审批闭环细节
-- [data-model.md](reference/data-model.md) — 所有 JSON 字段与语义
-- [storage-layout.md](reference/storage-layout.md) — `.bts` 目录树与清理策略
-- [state-machine.md](reference/state-machine.md) — 状态迁移与事件对应
-- [error-taxonomy.md](reference/error-taxonomy.md) — 错误分类与重试矩阵
-- [command-guide.md](reference/command-guide.md) — 命令书写与调用规范
-- [anti-patterns.md](reference/anti-patterns.md) — 常见错误用法
-- [examples/](reference/examples) — 可直接运行的最小样例
+- [orchestration-spec.md](references/orchestration-spec.md) — 编排规格、能力矩阵、事件与命令映射
+- [permissions.md](references/permissions.md) — 等级、策略、白名单、审批闭环细节
+- [data-model.md](references/data-model.md) — 所有 JSON 字段与语义
+- [storage-layout.md](references/storage-layout.md) — `.bts` 目录树与清理策略
+- [state-machine.md](references/state-machine.md) — 状态迁移与事件对应
+- [error-taxonomy.md](references/error-taxonomy.md) — 错误分类与重试矩阵
+- [command-guide.md](references/command-guide.md) — 命令书写与调用规范
+- [anti-patterns.md](references/anti-patterns.md) — 常见错误用法
+- [examples/](references/examples) — 可直接运行的最小样例
 
 ---
 

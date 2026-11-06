@@ -2,7 +2,7 @@
 
 本目录是「复制即可用」的样例集。所有 JSON 都经过校验，所有命令都可直接跑（不依赖 npm / pytest，用 `echo` / `python -c` 保证跨平台可执行）。
 
-目录定位：`<skill_root>/reference/examples/`，脚本在 `<skill_root>/scripts/`。
+目录定位：`<skill_root>/references/examples/`，脚本在 `<skill_root>/scripts/`。
 
 ---
 
