@@ -54,7 +54,12 @@ Schedule (periodic or one-shot)
 
 Every step is a task behind a permission gate, so it reuses the task layer's approval, events, and logging.
 
-![Three entity layers and the permission-gate checkpoint chain](assets/bts-architecture.svg)
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/bts-architecture-dark.svg">
+    <img src="assets/bts-architecture.svg" alt="Three entity layers and the permission-gate checkpoint chain" width="100%">
+  </picture>
+</p>
 
 ## Requirements
 

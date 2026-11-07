@@ -54,7 +54,12 @@ Schedule（周期/一次性）
 
 每个 Step 本质上是「带权限门的 Task」，直接复用 Task 层的审批、事件与日志能力。
 
-![三层实体模型与权限闸门安检链](assets/bts-architecture.svg)
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/bts-architecture-dark.svg">
+    <img src="assets/bts-architecture.svg" alt="三层实体模型与权限闸门安检链" width="100%">
+  </picture>
+</p>
 
 ## 环境要求
 
