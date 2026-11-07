@@ -1,5 +1,9 @@
 # Background Task Scheduler
 
+<p align="center">
+  <img src=".github/assets/banner.svg" alt="Background Task Scheduler" width="100%">
+</p>
+
 **English** | [中文](README.zh-CN.md)
 
 A purely local, daemon-free task scheduler for AI agents. Commands are split into three entity layers, the filesystem is the single source of truth, and the agent advances state between turns.

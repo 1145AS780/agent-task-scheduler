@@ -1,5 +1,9 @@
 # 后台任务调度器
 
+<p align="center">
+  <img src=".github/assets/banner.svg" alt="后台任务调度器" width="100%">
+</p>
+
 [English](README.md) | **中文**
 
 面向 AI Agent 的纯本地、无守护进程任务调度器。它把「命令」分成三层实体，用文件系统作为唯一状态源，由 Agent 在轮次之间主动推进。
