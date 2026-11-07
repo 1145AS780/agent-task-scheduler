@@ -1,4 +1,4 @@
-# 编排规格 — background-task-scheduler v2.7
+# 编排规格 — background-task-scheduler v2.9
 
 本文是 Plan / Schedule 层的权威规格。实现以 `scripts/bts_plan.py` 为准；若文档与实现不一致，以脚本行为为准并修正文档。
 

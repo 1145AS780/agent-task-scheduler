@@ -50,6 +50,8 @@ Schedule (periodic or one-shot)
 
 Every step is a task behind a permission gate, so it reuses the task layer's approval, events, and logging.
 
+![Three entity layers and the permission-gate checkpoint chain](assets/bts-architecture.svg)
+
 ## Requirements
 
 - Python 3 (standard library only)

@@ -1,10 +1,10 @@
 ---
 name: background-task-scheduler
-description: Local background task scheduler for AI agents. Three entity layers (Task / Plan / Schedule), L0-L3 permission tiers with human approval, intra-stage dependency orchestration with failure propagation, step retry with backoff, stall detection, run snapshots and logs, a built-in HTTP downloader with resume and integrity check, torrent and magnet download via aria2c, and automatic encoding conversion via the @enc hook. Use when a long-running command must leave the chat turn, when commands need staged orchestration, when work repeats on a schedule, when batch-downloading files or torrents, or when a high-risk command needs approval first. 中文触发：面向 AI Agent 的本地后台任务调度技能。三层实体（Task / Plan / Schedule）、L0-L3 分级权限与人工审批闭环（有效期、批量批准、白名单放行）、Stage 内依赖编排（depends_on + 失败传播）、步骤自动重试与退避、停滞检测（plan_stalled）、运行快照与调度器日志、内置 HTTP 下载器（断点续传、自动重试、完整性校验、并发与限速）、种子/磁力下载（aria2c）、命令成功后自动编码转换（`@enc` 钩子）。当需要让长时间运行的命令脱离对话轮次、分阶段编排多条命令、按周期反复执行、批量下载文件或种子、把多条命令一次性登记为指令包（仅登记不执行）、或需要审批才能执行高风险命令时使用。
-version: "2.7"
+description: Local background task scheduler for AI agents. Three entity layers (Task / Plan / Schedule), L0-L3 permission tiers with human approval, intra-stage dependency orchestration with failure propagation, step retry with backoff, stall detection, run snapshots and logs, a built-in HTTP downloader with resume and integrity check, torrent and magnet download via aria2c, and automatic encoding conversion via the @enc hook. Use when a long-running command must leave the chat turn, when commands need staged orchestration, when work repeats on a schedule, when batch-downloading files or torrents, or when a high-risk command needs approval first. 中文触发：面向 AI Agent 的本地后台任务调度技能。三层实体（Task / Plan / Schedule）、L0-L3 分级权限与人工审批闭环（有效期、批量批准、白名单放行、存活租约免审）、Stage 内依赖编排（depends_on + 失败传播）、步骤自动重试与退避、停滞检测（plan_stalled）、运行快照与调度器日志、内置 HTTP 下载器（断点续传、自动重试、完整性校验、并发与限速）、种子/磁力下载（aria2c）、命令成功后自动编码转换（`@enc` 钩子）。当需要让长时间运行的命令脱离对话轮次、分阶段编排多条命令、按周期反复执行、批量下载文件或种子、把多条命令一次性登记为指令包（仅登记不执行）、或需要审批才能执行高风险命令时使用。Licensed MIT. Source: github.com/1145AS780
+version: "2.9"
 ---
 
-# background-task-scheduler v2.7
+# background-task-scheduler v2.9
 
 一个纯本地、无守护进程的调度器。它把「命令」分成三层实体，用文件系统作为唯一状态源，由 Agent 在轮次之间主动推进。
 
@@ -36,6 +36,8 @@ version: "2.7"
 ---
 
 ## 2. 三层模型
+
+![三层实体模型与权限闸门安检链](assets/bts-architecture.svg)
 
 | 层 | 载体 | 一句话职责 | 生命长度 |
 | --- | --- | --- | --- |
@@ -367,11 +369,13 @@ python tools/encoding_converter.py logs --detect --to utf-8 --dry-run
 ### 5.2 判定顺序
 
 1. **白名单放行**：命令文本命中 `allow_rules` 任一正则 → 直接允许（优先于等级）
-2. **策略上限**：`level > max_level` → 直接拒绝，审批不能绕过
+2. **策略上限**：`level > max_level` → 直接拒绝，审批与租约都不能绕过
 3. **身份上限**：`level <= actor_level` → 直接允许
-4. **审批**：否则要求有效审批；无审批则创建审批记录、投递事件、返回 `approval_required`
+4. **存活租约免审**：`lease_autonomy` 总闸开启、租约存活且命令命中其白名单 → 直接允许（见 5.6）
+5. **审批**：否则要求有效审批；无审批则创建审批记录、投递事件、返回 `approval_required`
 
 有效等级 = `min(required_level, actor_level, max_level)`，用于解释为什么被拦。
+`reason` 取值按上表一一对应：`whitelist` / `denied_policy` / `level` / `lease_autonomy` / `approval` / `approval_required`。
 
 ### 5.3 策略文件与环境变量
 
@@ -384,7 +388,14 @@ python tools/encoding_converter.py logs --detect --to utf-8 --dry-run
   "allow_rules": ["^git status", "^npm run (lint|test)", "^pytest"],
   "approval_ttl_seconds": 3600,
   "keep_runs_per_plan": 5,
-  "stall_seconds": 300
+  "stall_seconds": 300,
+  "lease_autonomy": {
+    "enabled": false,
+    "max_level": "L2",
+    "rules": ["^jar-deploy", "^gradlew build"],
+    "deny_rules": ["--force", "^rm "]
+  },
+  "lease_file": ""
 }
 ```
 
@@ -398,6 +409,8 @@ python tools/encoding_converter.py logs --detect --to utf-8 --dry-run
 | `approval_ttl_seconds` | `BTS_APPROVAL_TTL` | 审批有效期，`<=0` 表示不过期 |
 | `keep_runs_per_plan` | `BTS_KEEP_RUNS` | 每个 plan 保留快照数，`<=0` 不清理 |
 | `stall_seconds` | `BTS_STALL` | 停滞阈值，`<=0` 关闭检测 |
+| `lease_autonomy` | `BTS_LEASE_AUTONOMY` | 租约免审配置，JSON 字符串；坏值一律回落关闭 |
+| `lease_file` | `BTS_LEASE_FILE` | 租约文件路径，默认 `<root>/../temp/py_lease.json`，不存在则回落 `<root>/../.autopilot/temp/py_lease.json` |
 
 ### 5.4 审批闭环
 
@@ -446,6 +459,35 @@ python scripts/bts.py run deploy1 --approval ap-3f2a91c4
 ### 5.5 身份模型的能力边界
 
 `actor_level` 是**声明式**的：任何能改环境变量或 `policy.json` 的进程都能自称 L3。它约束的是「Agent 自觉」，不是敌对环境下的安全边界。需要真正鉴权请在外层包一层（CI token、人工二次确认、操作系统账户隔离）。
+
+### 5.6 存活租约免审（`lease_autonomy`）
+
+当外部授权窗口（`.trae/scripts/py_consent.py`）仍在运行时，BTS 可以据此对**命中白名单的高危指令**跳过逐条审批。它是第 4 条放行路径，**不是新等级**。
+
+五道关缺一不可，任一不满足即退回普通审批：
+
+| 关 | 判据 | 不满足时 |
+| --- | --- | --- |
+| 1 总闸 | `policy.lease_autonomy.enabled` 为真且有 `rules` | 权限门根本不读租约文件 |
+| 2 等级 | `required_level <= min(policy.max_level, 租约授予的 max_level)` | 退回审批（策略上限那一关已先行拦截） |
+| 3 存活 | 租约 `granted`、心跳未过期（默认 8s）、未到期限、宿主 PID 仍存活 | 退回审批 |
+| 4 命令 | 命中 `rules` 且不命中 `deny_rules` | 退回审批 |
+| 5 边界 | 租约里勾过的「额外禁止」未命中该动作 | 退回审批并记 `lease_autonomy_blocked` |
+
+放行时**不产生待办**，但会写一条 `status=approved` 的审批记录留痕：`auto_approved=true`、`resolved_by="py_lease:<令牌>"`、`note="lease_autonomy: <规则>"`，并附带 `lease_token` / `lease_pid` / `lease_heartbeat_at`。事后审计走 `approvals/`，`approve --all` 不会把它当成待决议项。
+
+```json
+// policy.json 片段
+"lease_autonomy": {"enabled": true, "max_level": "L2", "rules": ["^jar-deploy"], "deny_rules": ["--force"]}
+```
+
+关键语义：
+
+- **默认关闭**：配置缺失、字段拼错、类型不对、`enabled` 非真，一律按关闭处理（fail-closed）
+- **不突破策略上限**：`max_level` 仍是硬天花板，租约只能放宽「审批」这一关，不能放宽等级
+- **租约授予由用户勾选**：`py_consent.py` 第 4 题选「否 / 仅 L2 / 含 L3」，自定义文本**不构成授予**
+- **随租约消亡**：窗口关闭或心跳过期后，下一次权限门立刻回到审批流程，无需清理配置
+- **只读判定**：BTS 只读租约文件，不写、不删、不杀进程；撤销仍由用户关窗完成
 
 ---
 
@@ -711,7 +753,8 @@ python scripts/bts.py logs --plain | Select-String "ci1-a1"   # 只看某次
 | 秒级精确定时 | 不实现 | 由 Agent 轮询驱动，精度≈轮询间隔 |
 | `watch` 长驻监听 | 不实现 | 用 `check` / `check_schedule` 轮询替代 |
 | cron 宏语法 | 不实现 | 只支持 `every` 秒数 + `start_at` + `max_runs` |
-| 审批黑名单仲裁 | 不实现 | 只有白名单放行，没有「某些命令永不批准」的硬拒绝层 |
+| 审批黑名单仲裁 | 不实现 | 只有白名单放行，没有「某些命令永不批准」的硬拒绝层（`lease_autonomy.deny_rules` 只作用于租约这一条路径） |
+| 租约免审的鉴权强度 | 与 `actor_level` 同级 | 能写 `policy.json` 或伪造租约文件的进程都能自证；不是敌对环境下的安全边界 |
 | BT / 磁力 | 支持（`torrent`） | 经 aria2c 下载，需单独安装；单文件 HTTP 多段并发仍不支持 |
 | 指令包自动执行 | 不实现 | `pack` 只登记文本（全部 `pending`），不解析、不运行；必须逐条 `run` |
 | 钩子类型 | 仅 `enc` | 目前只支持 `@enc` 编码转换钩子；不支持任意「成功后追加命令」的通用链 |
@@ -723,6 +766,7 @@ python scripts/bts.py logs --plain | Select-String "ci1-a1"   # 只看某次
 
 | 版本 | 变更 |
 | --- | --- |
+| 2.8 | 新增「存活租约免审」`lease_autonomy`：`policy.json` / `BTS_LEASE_AUTONOMY` 配置 `enabled` / `max_level` / `rules` / `deny_rules`，`lease_file` / `BTS_LEASE_FILE` 指定租约路径（默认 `<root>/../temp/py_lease.json`，不存在则回落 `<root>/../.autopilot/temp/py_lease.json`）；`permission_gate` 与 `gate_operation` 在身份判定之后、审批之前插入该路径，放行写 `status=approved` 的留痕审批（`auto_approved=true`、`resolved_by=py_lease:<令牌>`）不投待办；判定为五道关（总闸 / 等级上限 / 租约存活 / 命令白名单 / 租约自带约束），任一不满足退回审批，坏配置一律回落关闭；`policy` 命令新增 `lease` 段报告租约状态；`py_consent.py` 第 4 题把授予范围变成用户可勾选项 |
 | 2.7 | 新增 `@enc` 后缀钩子：命令文本末尾追加 `@enc <转换器参数>` 即把编码转换登记为任务的 `post_hook`，主命令退出码为 0 才执行（转换器 `tools/encoding_converter.py`，可用 `BTS_ENCODER_PATH` 覆盖）；钩子失败则任务 `failed` 且 `exit_code` 取钩子码，日志 `hook-enc.log`、事件 `task_post_hook`；`create` / `pack` 均支持，坏语法报 `bad_hook` / `bad_hook_item`；转换器仍可独立 CLI 使用 |
 | 2.6 | 新增「关键任务失败即停」：Step 级 `critical: true` + Plan 级 `fail_on_critical: "stop"`，或 `run_plan` / `resume` 加 `--fail-fast`（临时视全部 Step 为 critical）；判定为**重试耗尽后仍失败**（`failed` / `timeout`），触发后立即 `taskkill /T /F` 终止同批兄弟进程树（`step.json` 记 `aborted_by="fail_fast"` + `aborted_at`，事件 `task_aborted`），当前 Stage 剩余 Step 标 `skipped(critical_failed)`、后续 Stage 标 `skipped`、`plan.status=failed`；修复 Plan 级 `fail_on_critical` 未写入 `plan.json` 与停止路径 `plan_end` 状态残留 `running` |
 | 2.5 | 新增 `bts.py pack`「指令包」：一次登记多条命令（英文逗号分隔，支持 `\,` / `\\` 转义），各建独立 `pending` Task（`kind="pack"`、共享 `pack_id`、`pack` 元数据），**只传文本不执行**；`list --pack` 按包筛选；空包 / 空项分别报 `pack_empty` / `pack_empty_item` 且整包不落盘 |

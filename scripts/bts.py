@@ -66,6 +66,14 @@ EXIT_USAGE = 2
 EXIT_CONFLICT = 3
 EXIT_DENIED = 4
 
+DEFAULT_LEASE_AUTONOMY = {
+    "enabled": False,
+    "max_level": "L2",
+    "rules": [],
+    "deny_rules": [],
+}
+DEFAULT_LEASE_STALE = 8.0             # 与 py_consent 的 STALE_AFTER 对齐
+
 POLICY_DEFAULTS = {
     "max_level": DEFAULT_MAX_LEVEL,
     "actor_level": DEFAULT_ACTOR_LEVEL,
@@ -73,6 +81,8 @@ POLICY_DEFAULTS = {
     "approval_ttl_seconds": DEFAULT_APPROVAL_TTL,
     "keep_runs_per_plan": KEEP_RUNS_DEFAULT,
     "stall_seconds": STALL_SECONDS_DEFAULT,
+    "lease_autonomy": DEFAULT_LEASE_AUTONOMY,
+    "lease_file": "",
 }
 
 POLICY_ENV = {
@@ -82,6 +92,8 @@ POLICY_ENV = {
     "approval_ttl_seconds": "BTS_APPROVAL_TTL",
     "keep_runs_per_plan": "BTS_KEEP_RUNS",
     "stall_seconds": "BTS_STALL",
+    "lease_autonomy": "BTS_LEASE_AUTONOMY",
+    "lease_file": "BTS_LEASE_FILE",
 }
 
 INT_POLICY_KEYS = ("approval_ttl_seconds", "keep_runs_per_plan", "stall_seconds")
@@ -151,10 +163,46 @@ def read_jsonl(path):
 
 # ---------------------------------------------------------------- 策略与日志
 
+def rule_list(value):
+    """把规则归一成字符串列表：支持 list / "a||b" 字符串；非法项直接丢弃。"""
+    if isinstance(value, str):
+        value = [x.strip() for x in value.split("||") if x.strip()]
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(x).strip() for x in value if str(x).strip()]
+
+
+def normalize_lease_autonomy(value):
+    """把 lease_autonomy 归一成固定四字段；任何不合法输入一律回落到「关闭」。
+
+    这是「租约免审」的总闸：enabled 为假时权限门根本不读租约，
+    所以配置损坏、字段拼错、类型不对都不会意外放开审批。
+    """
+    cfg = {"enabled": False, "max_level": DEFAULT_LEASE_AUTONOMY["max_level"],
+           "rules": [], "deny_rules": []}
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return cfg
+    if not isinstance(value, dict):
+        return cfg
+    enabled = value.get("enabled")
+    if isinstance(enabled, str):
+        enabled = enabled.strip().lower() in ("1", "true", "yes", "on")
+    cfg["enabled"] = bool(enabled)
+    level = str(value.get("max_level") or DEFAULT_LEASE_AUTONOMY["max_level"]).upper()
+    cfg["max_level"] = level if level in LEVEL_RANK else DEFAULT_LEASE_AUTONOMY["max_level"]
+    cfg["rules"] = rule_list(value.get("rules"))
+    cfg["deny_rules"] = rule_list(value.get("deny_rules"))
+    return cfg
+
+
 def policy(root, data=None):
     """读取策略：默认值 < policy.json < 环境变量。
 
-    返回 dict，键固定为 POLICY_DEFAULTS 的六个字段。
+    返回 dict，键集合固定为 POLICY_DEFAULTS 的键；lease_autonomy 与 lease_file
+    是「存活租约免审」的两个开关，默认关闭，必须显式配置才生效。
     """
     pol = dict(POLICY_DEFAULTS)
     pol["allow_rules"] = []
@@ -193,6 +241,8 @@ def policy(root, data=None):
         pol[key] = str(pol[key]).upper()
         if pol[key] not in LEVEL_RANK:
             pol[key] = POLICY_DEFAULTS[key]
+    pol["lease_autonomy"] = normalize_lease_autonomy(pol.get("lease_autonomy"))
+    pol["lease_file"] = str(pol.get("lease_file") or "").strip()
     return pol
 
 
@@ -312,12 +362,65 @@ def approval_expired(record) -> bool:
         return False
 
 
+def find_pending_approval(root, command, context):
+    """查找同一条命令、同一个任务实例的待决审批，用于去重复用。
+
+    重复发起同一条被拦命令时复用既有待决记录，避免每试一次就堆一条待办。
+    """
+    context = dict(context or {})
+    for p in sorted(approvals_dir(root).glob("ap-*.json")):
+        rec = jread(p, {})
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("status") != "pending":
+            continue
+        if rec.get("command") != command:
+            continue
+        if rec.get("source") != context.get("source", "operation"):
+            continue
+        if rec.get("task_id") != context.get("task_id"):
+            continue
+        if not approval_instance_match(rec, context):
+            continue
+        if approval_expired(rec):
+            continue
+        return rec
+    return None
+
+
+def approval_instance_match(record, context):
+    """审批是否绑定在同一个任务实例上。
+
+    删除/停止这类操作型审批的 command 由任务 id 拼成，而任务 id 可以被回收复用；
+    若不校验实例，旧审批就能作用于同名的新任务。判据优先级：instance_id →
+    created_at（兼容未写 instance_id 的老任务）→ 一律判不匹配（fail-closed）。
+    """
+    if not record:
+        return False
+    context = dict(context or {})
+    task_id = context.get("task_id")
+    if not task_id:
+        return True
+    if record.get("task_id") != task_id:
+        return False
+    instance = context.get("task_instance")
+    if instance:
+        return record.get("task_instance") == instance
+    created = context.get("task_created_at")
+    if created is not None:
+        return record.get("task_created_at") == created
+    return False
+
+
 def create_approval(root, command, required_level, context=None, ttl=None, resume=None):
     context = dict(context or {})
     pol = policy(root)
     if ttl is None:
         ttl = int(pol.get("approval_ttl_seconds", DEFAULT_APPROVAL_TTL))
     created = now_ts()
+    reuse = find_pending_approval(root, command, context)
+    if reuse:
+        return reuse
     record = {
         "id": new_approval_id(),
         "command": command,
@@ -336,6 +439,8 @@ def create_approval(root, command, required_level, context=None, ttl=None, resum
         "stage_id": context.get("stage_id"),
         "step_id": context.get("step_id"),
         "task_id": context.get("task_id"),
+        "task_instance": context.get("task_instance"),
+        "task_created_at": context.get("task_created_at"),
         "resume": resume or context.get("resume"),
     }
     save_approval(root, record)
@@ -388,14 +493,200 @@ def mark_approval_expired(root, record):
 
 # ---------------------------------------------------------------- 权限门
 
+def regex_match(rules, text):
+    """在给定规则集里找第一条命中的规则；未命中返回 None。规则按正则、忽略大小写。"""
+    for rule in rules or []:
+        try:
+            if re.search(rule, text or "", re.IGNORECASE):
+                return rule
+        except re.error:
+            continue
+    return None
+
+
+def lease_path(root, pol=None) -> Path:
+    """租约文件位置：默认取 BTS 根目录同级的 temp/py_lease.json。
+
+    BTS_ROOT 可能指向 <repo>/.bts，也可能指向 <repo>/.autopilot/.bts；后者的同级
+    temp 才是 py_consent 的落点。未显式指定时按候选顺序取第一个存在的，避免
+    「配置没错却永远读不到租约」。候选都不存在则返回首个（判为 lease_absent）。
+    """
+    custom = str((pol or policy(root)).get("lease_file") or "").strip()
+    if custom:
+        path = Path(custom)
+        return path if path.is_absolute() else Path(root) / path
+    base = Path(root).parent
+    candidates = [
+        base / "temp" / "py_lease.json",
+        base / ".autopilot" / "temp" / "py_lease.json",
+    ]
+    for cand in candidates:
+        if cand.exists():
+            return cand
+    return candidates[0]
+
+
+def lease_state(root, pol=None):
+    """只读判定 py 授权租约是否存活，返回 (租约 dict 或 None, 判定码)。
+
+    判据与 py_consent.check 一致：granted、心跳未过期、未到期限、宿主 PID 存活。
+    任何一环读不出来都判为无效（fail-closed）；本函数只读，不写、不删、不杀进程。
+    """
+    path = lease_path(root, pol)
+    if not path.exists():
+        return None, "lease_absent"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return None, "lease_unreadable"
+    if not isinstance(data, dict) or not data.get("granted"):
+        return None, "lease_invalid"
+    try:
+        beat = float(data.get("heartbeat_epoch", 0))
+    except (TypeError, ValueError):
+        return None, "lease_heartbeat_broken"
+    try:
+        stale = float(data.get("stale_after") or DEFAULT_LEASE_STALE)
+    except (TypeError, ValueError):
+        stale = DEFAULT_LEASE_STALE
+    if time.time() - beat > stale:
+        return None, "lease_stale"
+    expires = data.get("expires_epoch")
+    if expires:
+        try:
+            if time.time() > float(expires):
+                return None, "lease_expired"
+        except (TypeError, ValueError):
+            return None, "lease_expiry_broken"
+    if not pid_alive(data.get("pid")):
+        return None, "lease_host_dead"
+    return data, "lease_alive"
+
+
+LEASE_CONSTRAINT_GUARDS = (
+    ("删除", ("删除", "del ", "erase", "remove", "rm ", "rmdir", "unlink", "rimraf")),
+    ("覆盖", ("覆盖", "overwrite", "copy ", "copy-item", "move ", "move-item",
+              "mv ", "robocopy", "rename")),
+    ("联网", ("联网", "下载", "download", "curl", "wget", "invoke-webrequest",
+              "http://", "https://", "ftp://")),
+)
+
+
+def lease_constraint_block(record, text):
+    """租约里勾了「额外禁止」时，命中对应动作就不给免审，退回人工审批。
+
+    这是租约自带的收紧项，不是策略配置：宁可多问一次，也不越过用户勾过的边界。
+    """
+    haystack = (text or "").lower()
+    for item in record.get("extra_constraints") or []:
+        for keyword, patterns in LEASE_CONSTRAINT_GUARDS:
+            if keyword not in str(item):
+                continue
+            for pattern in patterns:
+                try:
+                    if re.search(pattern, haystack, re.IGNORECASE):
+                        return "%s约束命中 /%s/" % (keyword, pattern)
+                except re.error:
+                    continue
+    return None
+
+
+def create_lease_approval(root, command, required_level, lease, rule, context=None):
+    """把「租约免审」落成一条已通过的审批记录，供事后追溯。
+
+    与人工审批的区别写进 resolved_by / note / auto_approved 三个字段：
+    它从诞生起就是 approved，不写 pending、不投递 approval_created，
+    这样待办列表不会被虚假条目污染，但每次放行仍然留痕。
+    """
+    context = dict(context or {})
+    created = now_ts()
+    record = {
+        "id": new_approval_id(),
+        "command": command,
+        "required_level": str(required_level).upper(),
+        "status": "approved",
+        "created_at": created,
+        "created_iso": iso(created),
+        "expires_at": None,
+        "resolved_at": created,
+        "resolved_iso": iso(created),
+        "resolved_by": "py_lease:%s" % lease.get("token"),
+        "note": "lease_autonomy: %s" % rule,
+        "source": context.get("source", "operation"),
+        "schedule_id": context.get("schedule_id"),
+        "plan_id": context.get("plan_id"),
+        "stage_id": context.get("stage_id"),
+        "step_id": context.get("step_id"),
+        "task_id": context.get("task_id"),
+        "task_instance": context.get("task_instance"),
+        "task_created_at": context.get("task_created_at"),
+        "resume": None,
+        "auto_approved": True,
+        "lease_token": lease.get("token"),
+        "lease_pid": lease.get("pid"),
+        "lease_started_at": lease.get("started_at"),
+        "lease_heartbeat_at": lease.get("heartbeat_at"),
+    }
+    save_approval(root, record)
+    log_event(root, "approval_lease_auto", approval_id=record["id"],
+              required_level=record["required_level"], rule=rule,
+              lease_token=record["lease_token"], source=record["source"],
+              task_id=record["task_id"], plan_id=record["plan_id"],
+              schedule_id=record["schedule_id"])
+    return record
+
+
+def lease_autonomy(root, required_level, text, context=None):
+    """存活租约 + 命中白名单 → 免审放行；不适用时返回 None，交回原有审批流程。
+
+    五道关缺一不可：
+      1) policy.lease_autonomy.enabled 为真（总闸，默认关）
+      2) required_level ≤ min(policy 上限, 租约 Q4 授予上限)
+      3) 租约存活（心跳未过期 / 未到期限 / 宿主进程仍在）
+      4) 命令命中 rules 且不命中 deny_rules
+      5) 租约自带的「额外禁止」约束未命中
+    策略 max_level 的硬上限由调用方先行拦截，本函数不参与放宽上限。
+    """
+    pol = policy(root)
+    cfg = pol.get("lease_autonomy") or {}
+    if not cfg.get("enabled") or not cfg.get("rules"):
+        return None
+    record, state = lease_state(root, pol)
+    if record is None:
+        return None
+    granted = record.get("bts_autonomy") or {}
+    if not granted.get("granted"):
+        return None
+    cap = lower_level(str(cfg.get("max_level")).upper(),
+                      str(granted.get("max_level") or "L2").upper())
+    if level_rank(required_level) > level_rank(cap):
+        return None
+    hit = regex_match(cfg["rules"], text)
+    if not hit:
+        return None
+    if regex_match(cfg.get("deny_rules"), text):
+        return None
+    blocked = lease_constraint_block(record, text)
+    if blocked:
+        log_event(root, "lease_autonomy_blocked", reason=blocked,
+                  lease_token=record.get("token"), level=required_level)
+        return None
+    approval = create_lease_approval(root, text, required_level, record, hit, context)
+    return {"allowed": True, "reason": "lease_autonomy", "rule": hit,
+            "lease_token": record.get("token"), "lease_pid": record.get("pid"),
+            "lease_state": state, "approval_id": approval["id"],
+            "approval": approval}
+
+
 def permission_gate(root, command, approval_id=None, context=None):
     """Task/Step 执行前的权限门。
 
     context 可含：required_level / task_id / schedule_id / plan_id / stage_id /
     step_id / source / whitelist_text。
     返回 {"allowed", "reason", "required_level", "actor_level", "policy_max",
-          "effective_level", "whitelist", "approval_id", "approval_error", "approval"}。
-    reason ∈ whitelist / level / approval / denied_policy / approval_required
+          "effective_level", "whitelist", "approval_id", "approval_error", "approval",
+          "lease"}。
+    reason ∈ whitelist / level / lease_autonomy / approval / denied_policy / approval_required
     """
     context = dict(context or {})
     pol = policy(root)
@@ -411,6 +702,7 @@ def permission_gate(root, command, approval_id=None, context=None):
         "approval_id": approval_id,
         "approval_error": None,
         "approval": None,
+        "lease": None,
         "allowed": False,
         "reason": None,
     }
@@ -424,7 +716,15 @@ def permission_gate(root, command, approval_id=None, context=None):
     if level_rank(required) <= level_rank(actor):
         result.update(allowed=True, reason="level")
         return result
+    lease = lease_autonomy(root, required, context.get("whitelist_text") or command, context)
+    if lease:
+        result.update(allowed=True, reason="lease_autonomy", whitelist=lease["rule"],
+                      approval_id=lease["approval_id"], approval=lease["approval"],
+                      lease=lease)
+        return result
     check = approval_check(root, approval_id, command)
+    if check["ok"] and not approval_instance_match(check["record"], context):
+        check = {"ok": False, "error": "mismatch", "record": check["record"]}
     result["approval"] = check["record"]
     result["approval_error"] = check["error"]
     if check["ok"]:
@@ -455,7 +755,15 @@ def gate_operation(root, level, label, approval_id=None, context=None):
     if level_rank(level) <= level_rank(actor):
         return {"allowed": True, "reason": "level", "label": label, "level": level}
 
+    lease = lease_autonomy(root, level, context.get("whitelist_text") or label, context)
+    if lease:
+        return {"allowed": True, "reason": "lease_autonomy", "whitelist": lease["rule"],
+                "label": label, "level": level, "approval_id": lease["approval_id"],
+                "approval": lease["approval"], "lease": lease}
+
     check = approval_check(root, approval_id, label)
+    if check["ok"] and not approval_instance_match(check["record"], context):
+        check = {"ok": False, "error": "mismatch", "record": check["record"]}
     if check["ok"]:
         return {"allowed": True, "reason": "approval", "label": label,
                 "approval": check["record"], "level": level}
@@ -749,6 +1057,7 @@ def cmd_create(root, args):
     now = now_ts()
     task = {
         "id": task_id,
+        "instance_id": uuid.uuid4().hex[:12],
         "command": command,
         "cwd": cwd,
         "level": level,
@@ -931,6 +1240,7 @@ def cmd_pack(root, args):
         task_id = new_task_id()
         task = {
             "id": task_id,
+            "instance_id": uuid.uuid4().hex[:12],
             "kind": "pack",
             "command": command,
             "cwd": cwd,
@@ -995,7 +1305,9 @@ def _start_task(root, task_id, approval=None, wait=False, force=False):
 
         gate = permission_gate(root, task["command"], approval,
                                {"required_level": task.get("level") or DEFAULT_TASK_LEVEL,
-                                "source": "run", "task_id": task["id"]})
+                                "source": "run", "task_id": task["id"],
+                                "task_instance": task.get("instance_id"),
+                                "task_created_at": task.get("created_at")})
         if not gate["allowed"]:
             payload = {"error": "approval_required" if gate["reason"] == "approval_required" else gate["reason"],
                        "task_id": task["id"], "level": gate["required_level"],
@@ -1004,7 +1316,9 @@ def _start_task(root, task_id, approval=None, wait=False, force=False):
                        "approval_id": None, "approval_error": gate["approval_error"]}
             if gate["reason"] == "approval_required":
                 rec = create_approval(root, task["command"], gate["required_level"],
-                                      {"source": "run", "task_id": task["id"]},
+                                      {"source": "run", "task_id": task["id"],
+                                       "task_instance": task.get("instance_id"),
+                                       "task_created_at": task.get("created_at")},
                                       resume=("python %s run %s --approval <approval_id>"
                                               % (Path(__file__).name, task["id"])))
                 announce_approval(root, rec)
@@ -1026,6 +1340,7 @@ def _start_task(root, task_id, approval=None, wait=False, force=False):
             except OSError:
                 pass
 
+        effective_approval = approval or (gate.get("lease") or {}).get("approval_id")
         task.update({
             "status": "starting",
             "started_at": now_ts(),
@@ -1033,7 +1348,7 @@ def _start_task(root, task_id, approval=None, wait=False, force=False):
             "ended_at": None,
             "exit_code": None,
             "finalized": False,
-            "approval_id": approval,
+            "approval_id": effective_approval,
             "pid": None,
             "supervisor_pid": None,
         })
@@ -1042,9 +1357,9 @@ def _start_task(root, task_id, approval=None, wait=False, force=False):
         release_run_lock(lock_path)
     emit_event(root, {"type": "task_start", "task_id": task["id"],
                       "level": task.get("level"), "command": task["command"],
-                      "approval_id": approval, "gate": gate["reason"]})
+                      "approval_id": effective_approval, "gate": gate["reason"]})
     log_event(root, "task_start", task_id=task["id"], level=task.get("level"),
-              gate=gate["reason"], approval_id=approval)
+              gate=gate["reason"], approval_id=effective_approval)
 
     if wait:
         _supervise(root, task["id"])
@@ -1357,6 +1672,7 @@ def cmd_download(root, args):
     now = now_ts()
     task = {
         "id": task_id,
+        "instance_id": uuid.uuid4().hex[:12],
         "kind": "download",
         "command": command,
         "cwd": None,
@@ -1468,6 +1784,7 @@ def cmd_torrent(root, args):
     now = now_ts()
     task = {
         "id": task_id,
+        "instance_id": uuid.uuid4().hex[:12],
         "kind": "torrent",
         "command": command,
         "cwd": None,
@@ -1599,6 +1916,30 @@ def cmd_status(root, args):
     return EXIT_OK
 
 
+def purge_task_approvals(root, task_id):
+    """任务被删除后清理指向它的待决审批。
+
+    留着就是悬空引用：任务没了但待办还在，`approve --all` 会把它一并批准，
+    而这条审批的 command 只是「delete <id>」，一旦 id 被回收复用就会指向新任务。
+    已决议记录保留，作为历史留痕。
+    """
+    removed = []
+    for p in sorted(approvals_dir(root).glob("ap-*.json")):
+        rec = jread(p, {})
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("task_id") != task_id or rec.get("status") != "pending":
+            continue
+        try:
+            p.unlink()
+            removed.append(rec.get("id"))
+        except OSError:
+            pass
+    if removed:
+        log_event(root, "approval_purged", task_id=task_id, approvals=removed)
+    return removed
+
+
 def cmd_stop(root, args):
     task = load_task(root, args.task_id)
     if not task:
@@ -1612,6 +1953,8 @@ def cmd_stop(root, args):
     label = "stop %s" % task["id"]
     gate = gate_operation(root, "L1", label, args.approval,
                           {"task_id": task["id"], "source": "stop",
+                           "task_instance": task.get("instance_id"),
+                           "task_created_at": task.get("created_at"),
                            "resume": "python %s stop %s --approval <approval_id>"
                                      % (Path(__file__).name, task["id"])})
     if not gate["allowed"]:
@@ -1638,6 +1981,8 @@ def cmd_delete(root, args):
     label = "delete %s" % task["id"]
     gate = gate_operation(root, "L2", label, args.approval,
                           {"task_id": task["id"], "source": "delete",
+                           "task_instance": task.get("instance_id"),
+                           "task_created_at": task.get("created_at"),
                            "resume": "python %s delete %s --approval <approval_id>"
                                      % (Path(__file__).name, task["id"])})
     if not gate["allowed"]:
@@ -1652,8 +1997,10 @@ def cmd_delete(root, args):
         tdir.rmdir()
     except OSError:
         pass
+    purged = purge_task_approvals(root, task["id"])
     log_event(root, "task_deleted", task_id=task["id"], gate=gate.get("reason"))
-    return print_json({"task_id": task["id"], "deleted": True})
+    return print_json({"task_id": task["id"], "deleted": True,
+                       "purged_approvals": purged})
 
 
 def cmd_approve(root, args):
@@ -1850,6 +2197,16 @@ def cmd_logs(root, args):
 
 def cmd_policy(root, args):
     pol = policy(root)
+    record, state = lease_state(root, pol)
+    pol["lease"] = {
+        "path": str(lease_path(root, pol)),
+        "state": state,
+        "token": (record or {}).get("token"),
+        "pid": (record or {}).get("pid"),
+        "heartbeat_at": (record or {}).get("heartbeat_at"),
+        "scope": (record or {}).get("scope"),
+        "bts_autonomy": (record or {}).get("bts_autonomy"),
+    }
     if args.json:
         return print_json(pol)
     print(json.dumps(pol, ensure_ascii=False, indent=2))

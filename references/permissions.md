@@ -1,8 +1,8 @@
-# 权限与审批 — background-task-scheduler v2.7
+# 权限与审批 — background-task-scheduler v2.9
 
-本文描述 L0-L3 分级、策略上限、白名单、审批闭环。实现见 `scripts/bts.py` 的
-`policy()`、`whitelist_match()`、`permission_gate()`、`gate_operation()`、
-`create_approval()`、`approval_check()`、`cmd_approve()`。
+本文描述 L0-L3 分级、策略上限、白名单、审批闭环与存活租约免审。实现见 `scripts/bts.py` 的
+`policy()`、`whitelist_match()`、`lease_state()`、`lease_autonomy()`、`permission_gate()`、
+`gate_operation()`、`create_approval()`、`create_lease_approval()`、`approval_check()`、`cmd_approve()`。
 
 ---
 
@@ -55,12 +55,17 @@
 
 2. 策略上限
    若 rank(required_level) > rank(max_level) → DENY(denied_policy)，结束
-   （审批不能绕过；这是硬上限）
+   （审批与租约都不能绕过；这是硬上限）
 
 3. 身份上限
    若 rank(required_level) <= rank(actor_level) → ALLOW(level)，结束
 
-4. 审批
+4. 存活租约免审（详见 6.9）
+   若 lease_autonomy.enabled 且租约存活 且 required_level ≤ min(max_level, 租约授予等级)
+   且 command 命中 rules、不命中 deny_rules、未触发租约自带约束
+   → ALLOW(lease_autonomy)，写一条 status=approved 的留痕审批，结束
+
+5. 审批
    check = approval_check(approval_id, command)
    若 check.ok → ALLOW(approval)，结束
    否则 → DENY(approval_required)，并在调用方决定是否创建审批
@@ -84,6 +89,8 @@
 | `approval_ttl_seconds` | `86400` | `BTS_APPROVAL_TTL` | 审批有效期，`<=0` 不过期 |
 | `keep_runs_per_plan` | `5` | `BTS_KEEP_RUNS` | 快照保留数，`<=0` 不清理 |
 | `stall_seconds` | `300` | `BTS_STALL` | 停滞阈值，`<=0` 关闭 |
+| `lease_autonomy` | 关闭 | `BTS_LEASE_AUTONOMY` | 租约免审配置（JSON 字符串），坏值回落关闭 |
+| `lease_file` | `""` | `BTS_LEASE_FILE` | 租约路径，空 = `<root>/../temp/py_lease.json`，不存在则回落 `<root>/../.autopilot/temp/py_lease.json` |
 
 `policy.json` 示例：
 
@@ -192,13 +199,53 @@ python scripts/bts.py policy --json
   "stage_id": null,
   "step_id": null,
   "task_id": "deploy1",
+  "task_instance": "b8ef7c7837a8",
+  "task_created_at": 1793512103,
   "resume": "python bts.py run deploy1 --approval <approval_id>"
 }
 ```
 
 - `source`：`run`（任务）、`plan`（计划步骤）、`operation`（stop/delete/pause/cancel/rerun）
 - 定位字段用于回查：`schedule_id/plan_id/stage_id/step_id/task_id`
+- `task_instance`（12 位 hex）：**任务实例唯一标识**，每次创建任务时生成
+- `task_created_at`：任务创建时间戳，与 `task_instance` 一起作为**双因子绑定**
 - `resume` 是给 Agent / 人复制粘贴的完整续跑命令
+
+#### 6.2.1 实例绑定（防悬空引用）
+
+删除 / 停止这类操作的审批 command 是 `delete <id>`、`stop <id>`，而 `<id>` 可以被回收复用。若只校验 command 字符串，旧审批就能作用于同名新任务——**悬空引用**漏洞。
+
+防御链：
+
+1. 创建任务时写入 `instance_id`（12 位 hex，来自 `uuid4().hex[:12]`），随任务 JSON 一起落盘
+2. 创建审批时把 `task_instance` + `task_created_at` 一起写入审批记录
+3. 执行时 `approval_instance_match()` 按优先级比对：
+   - 两边都有 `task_instance` → 必须完全相同
+   - 仅有 `task_created_at`（老任务）→ 时间戳必须一致
+   - 任一缺字段 → `fail-closed`，拒绝放行
+
+配套保障：
+
+- `delete` 成功时调用 `purge_task_approvals()` 清理所有指向该任务的 **pending** 审批，已决议记录保留作历史
+- `create_approval()` 内部的 `find_pending_approval()` 同样受实例绑定约束，杜绝跨实例复用待办
+
+租约免审生成的记录（见 6.9）在上述字段之外多带五个：
+
+```json
+{
+  "status": "approved",
+  "auto_approved": true,
+  "resolved_by": "py_lease:a01907f0bc0d",
+  "note": "lease_autonomy: ^jar-deploy",
+  "lease_token": "a01907f0bc0d",
+  "lease_pid": 22188,
+  "lease_started_at": 1793512103,
+  "lease_heartbeat_at": 1793512133
+}
+```
+
+- `auto_approved: true` 是唯一可用来区分「机器放行」与「人工批准」的标记
+- 这类记录**创建时即为 `approved`**，不经过 `pending`，也不投递 `approval_created`
 
 ### 6.3 有效期
 
@@ -286,6 +333,42 @@ check = approval_check(state.approval_id, command)
 - `mismatch` **不会**重发（命令已变，需要人重新确认）
 - 身份不足时仍会创建一次审批（用于交给更高权限的人批），但不会被视为「自动重发」
 
+### 6.9 存活租约免审（`lease_autonomy`）
+
+外部授权窗口（`.trae/scripts/py_consent.py`）存活期间，可让命中白名单的高危指令跳过逐条审批。它是**第 4 条放行路径**，位于身份判定之后、审批之前。
+
+五道关（任一不满足即退回普通审批）：
+
+| 关 | 判据 | 失败表现 |
+| --- | --- | --- |
+| 1 总闸 | `lease_autonomy.enabled` 为真且 `rules` 非空 | 权限门不读租约，`reason` 仍是 `approval_required` |
+| 2 等级 | `rank(required_level) <= rank(min(max_level, 租约 max_level))` | 退回审批；若超 `policy.max_level` 则早在第 2 步 `denied_policy` |
+| 3 存活 | `granted`、心跳未过期、未到期限、宿主 PID 存活 | 退回审批；`lease_state()` 给出判定码 |
+| 4 命令 | 命中 `rules` 且不命中 `deny_rules` | 退回审批 |
+| 5 边界 | 租约 `extra_constraints`（如「额外禁止删除」）未命中动作 | 退回审批，日志 `lease_autonomy_blocked` |
+
+`lease_state()` 判定码：`lease_absent` / `lease_unreadable` / `lease_invalid` / `lease_heartbeat_broken` / `lease_stale` / `lease_expired` / `lease_expiry_broken` / `lease_host_dead` / `lease_alive`。**除 `lease_alive` 外一律判无效**。
+
+放行留痕：写一条 `status=approved` 的审批记录，`auto_approved=true`、`resolved_by="py_lease:<令牌>"`、`note="lease_autonomy: <规则>"`，并带 `lease_token` / `lease_pid` / `lease_started_at` / `lease_heartbeat_at`；**不写 pending、不投递 `approval_created`**，因此待办列表不被污染，`approve --all` 也不会把它当待决议项。
+
+```json
+"lease_autonomy": {
+  "enabled": true,
+  "max_level": "L2",
+  "rules": ["^jar-deploy", "^gradlew build"],
+  "deny_rules": ["--force", "^rm "]
+}
+```
+
+约束与边界：
+
+- **默认关闭**，且任何非法输入（JSON 坏、类型错、`max_level` 不在 L0-L3）都回落为关闭
+- **不突破 `max_level`**：租约只放宽「审批」这一关，不放宽等级
+- **授予由用户勾选**：`py_consent.py` 第 4 题「否 / 仅 L2 / 含 L3」，自定义文本不构成授予
+- **随租约消亡**：窗口关闭 / 心跳过期后，下一次权限门立即回到审批，无需清理配置
+- **只读**：BTS 不写、不删租约，也不杀进程；撤销仍由用户关窗完成
+- 与 `actor_level` 同为**声明式**：能伪造租约文件或改 `policy.json` 的进程即可自证，不是敌对环境下的安全边界
+
 ---
 
 ## 7. 操作型权限门
@@ -308,6 +391,7 @@ check = approval_check(state.approval_id, command)
 - 审批绑定的文本是 **label**（不是命令），例如 `stop t1`
 - 失败时**自动创建审批**并投递事件，返回 `approval_id` 与 `resume`
 - 返回结构直接带 `reason`，便于 Agent 判断是 `denied_policy` 还是 `approval_required`
+- 同样支持 6.9 的存活租约免审：命中 `lease_autonomy.rules` 的 label 在租约存活时直接放行
 
 ---
 
@@ -319,6 +403,8 @@ check = approval_check(state.approval_id, command)
 | 批准 | `approval_resolved`（`status=approved`） | `approval_resolved` |
 | 拒绝 | `approval_resolved`（`status=rejected`） | `approval_resolved` |
 | 过期（批准时发现） | — | `approval_expired` |
+| 租约免审放行 | `approval_lease_auto` | — |
+| 租约约束拦下免审 | `lease_autonomy_blocked` | — |
 | 执行被拦 | — | `task_blocked`（Task 层） |
 | Plan 请求/重发审批 | `approval_created` + `plan_paused` | `approval_requested` / `approval_reissued` / `plan_paused` |
 
@@ -334,7 +420,8 @@ check = approval_check(state.approval_id, command)
 | 项 | 说明 | 替代方案 |
 | --- | --- | --- |
 | 身份鉴权 | `actor_level` 可被任何进程声明 | 外层 CI token / 操作系统账户 / 人工二次确认 |
-| 黑名单硬拒绝 | 没有「这些命令永不批准」的规则 | 用 `max_level` 限制 + 白名单只放安全命令 |
+| 租约伪造 | 租约文件是普通 JSON，能写盘就能自证 | 外层账户隔离；`lease_autonomy` 默认关闭，按需开启 |
+| 黑名单硬拒绝 | 没有全局「这些命令永不批准」的规则（`lease_autonomy.deny_rules` 只作用于租约路径） | 用 `max_level` 限制 + 白名单只放安全命令 |
 | 审批双人复核 | 单人即可批准 | 外部流程保证（如审批人必须是另一账号） |
 | 审批委托/转交 | 无 | 人为在群里转达 |
 | 审批记录清理 / 归档 | 只有 JSON 文件与日志 | 清理用 `bts.py approval prune`（只删 `approved`/`rejected`/`expired`，`pending` 永不删）；归档仍需外部定期备份 `approvals/` 与 `scheduler.log` |

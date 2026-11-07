@@ -1,4 +1,4 @@
-# 存储布局 — background-task-scheduler v2.7
+# 存储布局 — background-task-scheduler v2.9
 
 所有状态都在 `BTS_ROOT` 下（默认 `<cwd>/.bts`）。本文描述目录结构、文件语义、生命周期与清理策略。
 

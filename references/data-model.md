@@ -1,8 +1,8 @@
-# 数据模型 — background-task-scheduler v2.7
+# 数据模型 — background-task-scheduler v2.9
 
 本文列出所有落盘 JSON 结构的字段、类型与语义。字段以实际脚本为准。
 
-**实现状态**：v2.7 全部字段生效（含 `waves` 跨 `pause → resume` 累加、`kind`/`argv`/`download`/`torrent`/`pack` 与 `download.json`/`torrent.json`、即停相关 `fail_on_critical`/`critical`/`aborted_by`/`aborted_at`、命令成功钩子 `post_hook`）。
+**实现状态**：v2.8 全部字段生效（含 `waves` 跨 `pause → resume` 累加、`kind`/`argv`/`download`/`torrent`/`pack` 与 `download.json`/`torrent.json`、即停相关 `fail_on_critical`/`critical`/`aborted_by`/`aborted_at`、命令成功钩子 `post_hook`、存活租约免审的 `lease_autonomy`/`lease_file` 与审批记录 `auto_approved`/`lease_token`/`lease_pid`/`lease_started_at`/`lease_heartbeat_at`）。
 
 ---
 
@@ -36,8 +36,11 @@ scheduler.log（全局）
 | `approval_ttl_seconds` | int | `86400` | 审批有效期；`<=0` 不过期 |
 | `keep_runs_per_plan` | int | `5` | 每个 plan 保留快照份数；`<=0` 不清理 |
 | `stall_seconds` | int | `300` | 停滞阈值；`<=0` 关闭检测 |
+| `lease_autonomy` | object \| string | 关闭 | 存活租约免审：`enabled` / `max_level` / `rules` / `deny_rules`；字符串按 JSON 解析 |
+| `lease_file` | string | `""` | 租约路径；空 = `<root>/../temp/py_lease.json`（不存在则回落 `<root>/../.autopilot/temp/py_lease.json`） |
 
-非法值会被回退到默认值（`max_level`/`actor_level` 不在 L0-L3 时；整数字段非整数时）。
+非法值会被回退到默认值（`max_level`/`actor_level` 不在 L0-L3 时；整数字段非整数时；
+`lease_autonomy` 任何解析失败一律回落为 `enabled=false`）。
 
 ---
 
@@ -287,6 +290,8 @@ scheduler.log（全局）
 | `task_post_hook` | `task_id`、`hook`、`status`、`exit_code`、`error_type` |
 | `approval_created` | `approval_id`、`required_level`、`source`、`expires_at`、`resume` + 定位字段 |
 | `approval_resolved` | `approval_id`、`status`、`required_level`、`resolved_by`、`note`、`resume` + 定位字段 |
+| `approval_lease_auto` | `approval_id`、`required_level`、`rule`、`lease_token`、`source` + 定位字段 |
+| `lease_autonomy_blocked` | `reason`、`lease_token`、`level` |
 
 ### 7.3 Plan 层事件
 
