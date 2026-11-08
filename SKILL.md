@@ -37,7 +37,7 @@ version: "2.9.1"
 
 ## 2. 三层模型
 
-![三层实体模型与权限闸门安检链](assets/ats-architecture.svg)
+![三层实体模型与权限闸门安检链](assets/ats-architecture.zh-CN.svg)
 
 | 层 | 载体 | 一句话职责 | 生命长度 |
 | --- | --- | --- | --- |
