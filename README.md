@@ -118,6 +118,9 @@ scripts/                    The scheduler itself
 ├── bts_plan.py             Plan and schedule layer
 ├── bts_download.py         HTTP downloader with resume and integrity check
 └── bts_torrent.py          aria2c wrapper for torrents and magnets
+tests/                      Checks that CI and contributors both run
+├── lint.py                 Compile, indentation, whitespace, final newline
+└── selftest.py             Behavioural cases for tasks, plans, gates, recovery
 ```
 
 ## Conventions
@@ -133,6 +136,25 @@ scripts/                    The scheduler itself
 - The scheduler writes nothing outside `BTS_ROOT`. Deleting that directory resets all state.
 - State is plain files by design: you can inspect, edit, diff, and back it up without special tooling.
 - Paths in the documents use placeholders such as `<cwd>`; they do not correspond to any specific project.
+
+## Contributing
+
+Run both checks locally before opening a pull request:
+
+```bash
+python tests/lint.py       # compile, indentation, whitespace, final newline
+python tests/selftest.py   # tasks, plans, permission gates, supervisor recovery
+```
+
+Both scripts are standard library only, so there is nothing to install. Each test
+case runs in its own temporary `BTS_ROOT` and cleans up after itself.
+
+CI runs these same two commands on Linux, macOS, and Windows across Python 3.9 and
+3.13. The `lint` job gates the `test` matrix, so a syntax or style failure stops the
+pipeline before any behaviour test runs.
+
+When you fix a bug or add behaviour, add a case to `tests/selftest.py`. The suite is
+the contract: a fix without a regression test is an unverified claim.
 
 ## License
 

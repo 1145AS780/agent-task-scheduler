@@ -971,6 +971,17 @@ def refresh_task(root, task):
 
     sup = task.get("supervisor_pid")
     if not task.get("finalized") and sup and not pid_alive(sup):
+        fresh = load_task(root, task["id"])
+        if fresh and fresh.get("finalized"):
+            return fresh, True
+        if code_file.exists():
+            try:
+                code = int(code_file.read_text(encoding="utf-8").strip() or "-1")
+            except ValueError:
+                code = -1
+            status = "succeeded" if code == 0 else "failed"
+            finalize_task(root, task, status, code)
+            return task, True
         finalize_task(root, task, "failed", None,
                       note="supervisor_lost")
         return task, True

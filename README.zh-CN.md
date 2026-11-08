@@ -118,6 +118,9 @@ scripts/                    调度器本体
 ├── bts_plan.py             Plan 与 Schedule 层
 ├── bts_download.py         HTTP 下载器，断点续传与完整性校验
 └── bts_torrent.py          种子与磁力的 aria2c 封装
+tests/                      CI 与贡献者共用的检查
+├── lint.py                编译、缩进、行尾空白、末尾换行
+└── selftest.py            任务、计划、闸门、恢复的行为用例
 ```
 
 ## 目录约定
@@ -133,6 +136,22 @@ scripts/                    调度器本体
 - 调度器不往 `BTS_ROOT` 之外写任何东西，删除该目录即重置全部状态。
 - 状态刻意用纯文件：不需要专用工具就能查看、编辑、diff 与备份。
 - 文档中的路径一律用 `<cwd>` 这类占位符，不对应任何具体工程。
+
+## 参与贡献
+
+提交 PR 前先在本地跑完两项检查：
+
+```bash
+python tests/lint.py       # 编译、缩进、行尾空白、末尾换行
+python tests/selftest.py   # 任务、计划、权限闸门、supervisor 恢复
+```
+
+两个脚本只用标准库，无需安装任何东西。每个用例跑在独立的临时 `BTS_ROOT` 里，结束即清理。
+
+CI 会在 Linux、macOS、Windows 三个平台和 Python 3.9、3.13 两个版本上执行同样两条命令。
+`lint` 任务前置并阻塞 `test` 矩阵：语法或风格不通过，行为测试根本不会开跑。
+
+修 bug 或加行为时，请同步往 `tests/selftest.py` 加用例。这套测试就是契约——没有回归测试的修复等于未经验证的断言。
 
 ## 许可
 
