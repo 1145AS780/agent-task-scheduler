@@ -1,10 +1,10 @@
 ---
 name: agent-task-scheduler
 description: A local task scheduler an AI agent starts, polls, and steers between turns. Three entity layers (Task / Plan / Schedule), L0-L3 permission tiers with human approval, intra-stage dependency orchestration with failure propagation, step retry with backoff, stall detection, run snapshots and logs, a built-in HTTP downloader with resume and integrity check, torrent and magnet download via aria2c, and automatic encoding conversion via the @enc hook. Use when a long-running command must leave the chat turn, when commands need staged orchestration, when work repeats on a schedule, when batch-downloading files or torrents, or when a high-risk command needs approval first. 中文触发：面向 AI Agent 的本地任务调度技能，Agent 能在轮次之间启动、轮询并中途转向。三层实体（Task / Plan / Schedule）、L0-L3 分级权限与人工审批闭环（有效期、批量批准、白名单放行、存活租约免审）、Stage 内依赖编排（depends_on + 失败传播）、步骤自动重试与退避、停滞检测（plan_stalled）、运行快照与调度器日志、内置 HTTP 下载器（断点续传、自动重试、完整性校验、并发与限速）、种子/磁力下载（aria2c）、命令成功后自动编码转换（`@enc` 钩子）。当需要让长时间运行的命令脱离对话轮次、分阶段编排多条命令、按周期反复执行、批量下载文件或种子、把多条命令一次性登记为指令包（仅登记不执行）、或需要审批才能执行高风险命令时使用。Licensed MIT. Source: github.com/1145AS780
-version: "2.9"
+version: "2.9.1"
 ---
 
-# agent-task-scheduler v2.9
+# agent-task-scheduler v2.9.1
 
 一个纯本地、无守护进程的调度器。它把「命令」分成三层实体，用文件系统作为唯一状态源，由 Agent 在轮次之间启动、轮询并中途转向。
 

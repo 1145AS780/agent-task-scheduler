@@ -1,4 +1,4 @@
-# 存储布局 — agent-task-scheduler v2.9
+# 存储布局 — agent-task-scheduler v2.9.1
 
 所有状态都在 `ATS_ROOT` 下（默认 `<cwd>/.ats`）。本文描述目录结构、文件语义、生命周期与清理策略。
 
