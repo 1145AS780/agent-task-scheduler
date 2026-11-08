@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""bts_download.py — background-task-scheduler 的下载 worker。
+"""ats_download.py — agent-task-scheduler 的下载 worker。
 
-由 `bts.py download` 自动派生，**不面向人直接使用**。它读取一份 download spec
+由 `ats.py download` 自动派生，**不面向人直接使用**。它读取一份 download spec
 （JSON），把条目下载到本地，把进度以 JSONL 打到 stdout（由 supervisor 收集）。
 
 特性
@@ -41,7 +41,7 @@ from pathlib import Path
 from urllib import error, request
 
 CHUNK = 64 * 1024
-USER_AGENT = "bts-download/1.0"
+USER_AGENT = "ats-download/1.0"
 
 
 # ---------------------------------------------------------------- 工具
@@ -348,7 +348,7 @@ def main(argv=None):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except (AttributeError, ValueError):
         pass
-    parser = argparse.ArgumentParser(prog="bts_download.py")
+    parser = argparse.ArgumentParser(prog="ats_download.py")
     parser.add_argument("--spec", required=True)
     args = parser.parse_args(argv)
     try:

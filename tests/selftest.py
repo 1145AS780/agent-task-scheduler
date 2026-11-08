@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""BTS 自测：覆盖三层实体的核心语义，供 CI 与本地验证使用。
+"""ATS 自测：覆盖三层实体的核心语义，供 CI 与本地验证使用。
 
 用法：
     python tests/selftest.py            # 全部用例
     python tests/selftest.py -k task    # 只跑名字含 task 的用例
 
-每个用例在独立的临时 BTS_ROOT 中运行，互不干扰，也不污染仓库。
+每个用例在独立的临时 ATS_ROOT 中运行，互不干扰，也不污染仓库。
 标准库 only，退出码 0 表示全部通过。
 """
 from __future__ import annotations
@@ -19,8 +19,8 @@ import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-BTS = REPO / "scripts" / "bts.py"
-BTS_PLAN = REPO / "scripts" / "bts_plan.py"
+ATS = REPO / "scripts" / "ats.py"
+ATS_PLAN = REPO / "scripts" / "ats_plan.py"
 EXAMPLES = REPO / "references" / "examples"
 
 DEAD_PID = 2147483647
@@ -34,20 +34,20 @@ def case(fn):
 
 
 class Sandbox:
-    """一次用例的隔离环境：独立的 BTS_ROOT 与临时目录。"""
+    """一次用例的隔离环境：独立的 ATS_ROOT 与临时目录。"""
 
     def __init__(self):
-        self.dir = Path(tempfile.mkdtemp(prefix="bts-selftest-"))
+        self.dir = Path(tempfile.mkdtemp(prefix="ats-selftest-"))
         self.root = self.dir / "root"
 
     def cleanup(self):
         shutil.rmtree(self.dir, ignore_errors=True)
 
-    def bts(self, *args, timeout=90):
-        return self._run(BTS, *args, timeout=timeout)
+    def ats(self, *args, timeout=90):
+        return self._run(ATS, *args, timeout=timeout)
 
     def plan(self, *args, timeout=120):
-        return self._run(BTS_PLAN, *args, timeout=timeout)
+        return self._run(ATS_PLAN, *args, timeout=timeout)
 
     def _run(self, script, *args, timeout):
         cmd = [sys.executable, str(script), "--root", str(self.root)] + [str(a) for a in args]
@@ -59,7 +59,7 @@ class Sandbox:
         return proc.returncode, (proc.stdout or ""), (proc.stderr or "")
 
     def json_out(self, *args, **kw):
-        return self._json(self.bts, *args, **kw)
+        return self._json(self.ats, *args, **kw)
 
     def json_out_plan(self, *args, **kw):
         return self._json(self.plan, *args, **kw)
@@ -127,7 +127,7 @@ def permission_denied_by_cap():
     try:
         sb.write_policy({"max_level": "L1", "actor_level": "L3"})
         sb.json_out("create", "risky", "--command", "echo nope", "--level", "L2")
-        rc, out, err = sb.bts("run", "risky", "--wait")
+        rc, out, err = sb.ats("run", "risky", "--wait")
         expect(rc == 4, "越权应退出 4，实际 %s\n%s%s" % (rc, out, err))
         payload = json.loads(out)
         expect(payload.get("error") == "denied_policy",
@@ -143,7 +143,7 @@ def permission_needs_approval():
     try:
         sb.write_policy({"max_level": "L3", "actor_level": "L1"})
         sb.json_out("create", "gated", "--command", "echo gated", "--level", "L2")
-        rc, out, err = sb.bts("run", "gated", "--wait")
+        rc, out, err = sb.ats("run", "gated", "--wait")
         expect(rc == 4, "待审批应退出 4，实际 %s\n%s%s" % (rc, out, err))
         payload = json.loads(out)
         expect(payload.get("error") == "approval_required",
@@ -216,6 +216,35 @@ def finished_task_not_misreported():
         expect(st["exit_code"] == 0, "exit_code 应为 0，实际 %s" % st["exit_code"])
     finally:
         sb.cleanup()
+
+
+@case
+def dead_pid_probe_survives_encoding():
+    """已退出/不存在的 PID：pid_alive 返回 False，taskkill/tasklist 输出不得解码崩溃。
+
+    Windows 的 taskkill/tasklist 输出是控制台 OEM 编码；在 PYTHONUTF8=1 下用
+    text=True 解码会抛 UnicodeDecodeError，而「进程已退出」正是主用例。
+    """
+    code = (
+        "import sys\n"
+        "sys.path.insert(0, %r)\n"
+        "import ats\n"
+        "print(ats.pid_alive(%d))\n"
+        "print(ats.kill_pid(%d))\n"
+    ) % (str(REPO / "scripts"), DEAD_PID, DEAD_PID)
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", env=env, timeout=30)
+    expect(proc.returncode == 0,
+           "探测已退出 PID 不应抛异常，stderr=%r" % (proc.stderr or ""))
+    lines = (proc.stdout or "").strip().splitlines()
+    expect(lines and lines[0] == "False",
+           "pid_alive 应返回 False，实际 %r" % (proc.stdout or ""))
+    if os.name == "nt":
+        expect(len(lines) > 1 and lines[1] == "True",
+               "kill_pid 应正常返回，实际 %r" % (proc.stdout or ""))
 
 
 # ---------------------------------------------------------------- 入口

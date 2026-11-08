@@ -1,15 +1,15 @@
 ---
-name: background-task-scheduler
-description: Local background task scheduler for AI agents. Three entity layers (Task / Plan / Schedule), L0-L3 permission tiers with human approval, intra-stage dependency orchestration with failure propagation, step retry with backoff, stall detection, run snapshots and logs, a built-in HTTP downloader with resume and integrity check, torrent and magnet download via aria2c, and automatic encoding conversion via the @enc hook. Use when a long-running command must leave the chat turn, when commands need staged orchestration, when work repeats on a schedule, when batch-downloading files or torrents, or when a high-risk command needs approval first. 中文触发：面向 AI Agent 的本地后台任务调度技能。三层实体（Task / Plan / Schedule）、L0-L3 分级权限与人工审批闭环（有效期、批量批准、白名单放行、存活租约免审）、Stage 内依赖编排（depends_on + 失败传播）、步骤自动重试与退避、停滞检测（plan_stalled）、运行快照与调度器日志、内置 HTTP 下载器（断点续传、自动重试、完整性校验、并发与限速）、种子/磁力下载（aria2c）、命令成功后自动编码转换（`@enc` 钩子）。当需要让长时间运行的命令脱离对话轮次、分阶段编排多条命令、按周期反复执行、批量下载文件或种子、把多条命令一次性登记为指令包（仅登记不执行）、或需要审批才能执行高风险命令时使用。Licensed MIT. Source: github.com/1145AS780
+name: agent-task-scheduler
+description: A local task scheduler an AI agent starts, polls, and steers between turns. Three entity layers (Task / Plan / Schedule), L0-L3 permission tiers with human approval, intra-stage dependency orchestration with failure propagation, step retry with backoff, stall detection, run snapshots and logs, a built-in HTTP downloader with resume and integrity check, torrent and magnet download via aria2c, and automatic encoding conversion via the @enc hook. Use when a long-running command must leave the chat turn, when commands need staged orchestration, when work repeats on a schedule, when batch-downloading files or torrents, or when a high-risk command needs approval first. 中文触发：面向 AI Agent 的本地任务调度技能，Agent 能在轮次之间启动、轮询并中途转向。三层实体（Task / Plan / Schedule）、L0-L3 分级权限与人工审批闭环（有效期、批量批准、白名单放行、存活租约免审）、Stage 内依赖编排（depends_on + 失败传播）、步骤自动重试与退避、停滞检测（plan_stalled）、运行快照与调度器日志、内置 HTTP 下载器（断点续传、自动重试、完整性校验、并发与限速）、种子/磁力下载（aria2c）、命令成功后自动编码转换（`@enc` 钩子）。当需要让长时间运行的命令脱离对话轮次、分阶段编排多条命令、按周期反复执行、批量下载文件或种子、把多条命令一次性登记为指令包（仅登记不执行）、或需要审批才能执行高风险命令时使用。Licensed MIT. Source: github.com/1145AS780
 version: "2.9"
 ---
 
-# background-task-scheduler v2.9
+# agent-task-scheduler v2.9
 
-一个纯本地、无守护进程的调度器。它把「命令」分成三层实体，用文件系统作为唯一状态源，由 Agent 在轮次之间主动推进。
+一个纯本地、无守护进程的调度器。它把「命令」分成三层实体，用文件系统作为唯一状态源，由 Agent 在轮次之间启动、轮询并中途转向。
 
 - 不依赖外部服务、不依赖第三方库（仅 Python 3 标准库）
-- 所有状态落在 `BTS_ROOT`（默认 `<cwd>/.bts`），可用文本编辑、可版本控制、可异地备份
+- 所有状态落在 `ATS_ROOT`（默认 `<cwd>/.ats`），可用文本编辑、可版本控制、可异地备份
 - 每个命令都以 JSON 输出，便于 Agent 解析；退出码语义稳定
 
 ---
@@ -37,7 +37,7 @@ version: "2.9"
 
 ## 2. 三层模型
 
-![三层实体模型与权限闸门安检链](assets/bts-architecture.svg)
+![三层实体模型与权限闸门安检链](assets/ats-architecture.svg)
 
 | 层 | 载体 | 一句话职责 | 生命长度 |
 | --- | --- | --- | --- |
@@ -66,14 +66,14 @@ Schedule（周期/一次性）
 
 ```bash
 # 创建
-python scripts/bts.py create build1 --command "npm run build" --level L1 --timeout 900
+python scripts/ats.py create build1 --command "npm run build" --level L1 --timeout 900
 
 # 异步启动（立即返回，进程脱离对话）
-python scripts/bts.py run build1
+python scripts/ats.py run build1
 
 # 之后任意时刻同步状态
-python scripts/bts.py check build1
-python scripts/bts.py show build1 --lines 40
+python scripts/ats.py check build1
+python scripts/ats.py show build1 --lines 40
 ```
 
 ### 3.2 一次性编排
@@ -98,9 +98,9 @@ python scripts/bts.py show build1 --lines 40
 ```
 
 ```bash
-python scripts/bts_plan.py submit_plan --spec plan.json
-python scripts/bts_plan.py run_plan ci1-a1
-python scripts/bts_plan.py history ci1
+python scripts/ats_plan.py submit_plan --spec plan.json
+python scripts/ats_plan.py run_plan ci1-a1
+python scripts/ats_plan.py history ci1
 ```
 
 ### 3.3 周期任务
@@ -112,8 +112,8 @@ python scripts/bts_plan.py history ci1
 ```
 
 ```bash
-python scripts/bts_plan.py submit_schedule --spec schedule.json
-python scripts/bts_plan.py check_schedule poll1   # 每次轮询调用；到期才触发
+python scripts/ats_plan.py submit_schedule --spec schedule.json
+python scripts/ats_plan.py check_schedule poll1   # 每次轮询调用；到期才触发
 ```
 
 `check_schedule` 的返回里带 `next_poll`，按它决定下一次轮询间隔即可。
@@ -122,13 +122,13 @@ python scripts/bts_plan.py check_schedule poll1   # 每次轮询调用；到期�
 
 ```bash
 # 单个文件（带 SHA-256 校验）
-python scripts/bts.py download --url https://example.com/a.zip --out D:\dl --sha256 <hex>
+python scripts/ats.py download --url https://example.com/a.zip --out D:\dl --sha256 <hex>
 
 # 批量清单（.json / .txt / .csv），4 并发 + 限速 512 KiB/s
-python scripts/bts.py download --file urls.json --out D:\dl --concurrency 4 --rate 524288
+python scripts/ats.py download --file urls.json --out D:\dl --concurrency 4 --rate 524288
 
 # 调试时同步等完；不加 --wait 则立即返回、脱离对话
-python scripts/bts.py download --url https://example.com/a.zip --wait
+python scripts/ats.py download --url https://example.com/a.zip --wait
 ```
 
 下载任务就是一个普通 Task（`kind: "download"`），因此 `check` / `show` / `stop` / `events` 全部可用，`--level` 也走同一套审批门。
@@ -137,10 +137,10 @@ python scripts/bts.py download --url https://example.com/a.zip --wait
 
 ```bash
 # 磁力链
-python scripts/bts.py torrent --magnet "magnet:?xt=urn:btih:..." --out D:\dl
+python scripts/ats.py torrent --magnet "magnet:?xt=urn:btih:..." --out D:\dl
 
 # .torrent 文件 + 做种 30 分钟
-python scripts/bts.py torrent --torrent D:\dl\sintel.torrent --out D:\dl --seed-time 30
+python scripts/ats.py torrent --torrent D:\dl\sintel.torrent --out D:\dl --seed-time 30
 ```
 
 `torrent` 同样是普通 Task（`kind: "torrent"`）——状态、审批、日志、`stop` 全套复用，详见 §4.4。依赖 aria2c（`winget install --id aria2.aria2 -e`）。
@@ -149,10 +149,10 @@ python scripts/bts.py torrent --torrent D:\dl\sintel.torrent --out D:\dl --seed-
 
 ```bash
 # 一次登记 3 条命令（不执行）
-python scripts/bts.py pack "echo A,echo B,echo C" --pack-id pk-demo
+python scripts/ats.py pack "echo A,echo B,echo C" --pack-id pk-demo
 
 # 按包查看
-python scripts/bts.py list --pack pk-demo
+python scripts/ats.py list --pack pk-demo
 ```
 
 `pack` 只把命令**文本**写成 N 个 `pending` Task，不启动进程、不产生日志；要执行仍逐条 `run <task_id>`（审批门照旧）。
@@ -161,7 +161,7 @@ python scripts/bts.py list --pack pk-demo
 
 ## 4. 命令总表
 
-### 4.1 Task 层 `scripts/bts.py`
+### 4.1 Task 层 `scripts/ats.py`
 
 | 命令 | 作用 | 关键参数 |
 | --- | --- | --- |
@@ -182,7 +182,7 @@ python scripts/bts.py list --pack pk-demo
 | `logs` | 查看调度器日志 | `--lines N` / `--plain` / `--json` |
 | `policy` | 查看生效策略 | `--json` |
 
-### 4.2 Plan / Schedule 层 `scripts/bts_plan.py`
+### 4.2 Plan / Schedule 层 `scripts/ats_plan.py`
 
 | 命令 | 作用 | 关键参数 |
 | --- | --- | --- |
@@ -202,9 +202,9 @@ python scripts/bts.py list --pack pk-demo
 | `history` | 运行快照列表（可附日志） | `--plan` / `--logs` / `--lines` |
 | `prune` | 清理旧快照 | `--keep N` / `--dry-run` |
 
-### 4.3 下载器 `bts.py download`
+### 4.3 下载器 `ats.py download`
 
-`download` 不是独立体系：它**创建**一个 `kind="download"` 的 Task，把参数写成 `tasks/<id>/download.json`，再用 `argv` 直启 `scripts/bts_download.py`（不经过 shell，避开 Windows 引号问题）。权限、审批、事件、日志、`stop`、`check` 与普通 Task 完全一致。
+`download` 不是独立体系：它**创建**一个 `kind="download"` 的 Task，把参数写成 `tasks/<id>/download.json`，再用 `argv` 直启 `scripts/ats_download.py`（不经过 shell，避开 Windows 引号问题）。权限、审批、事件、日志、`stop`、`check` 与普通 Task 完全一致。
 
 **输入**
 
@@ -242,7 +242,7 @@ python scripts/bts.py list --pack pk-demo
 
 **stdout 协议**（`tasks/<id>/stdout.log`，JSONL）：`item_start` / `item_retry` / `item_done` / `item_error` / `summary`（最后一行，含 `total` / `succeeded` / `failed` / `bytes` / `elapsed` / `items`）。
 
-**退出码**：worker 全成功 `0`、有条目失败 `1`、spec 非法 `2`。`bts.py download --wait` 本身仍按 Task 语义返回 `0/2/4`——**下载是否全部成功看 `task.status` 或 `summary`**。
+**退出码**：worker 全成功 `0`、有条目失败 `1`、spec 非法 `2`。`ats.py download --wait` 本身仍按 Task 语义返回 `0/2/4`——**下载是否全部成功看 `task.status` 或 `summary`**。
 
 **返回结构**（默认异步）：
 
@@ -254,9 +254,9 @@ python scripts/bts.py list --pack pk-demo
 
 spec 报错枚举：`missing_url` / `bad_url` / `bad_header` / `name_requires_single_url` / `digest_requires_single_url` / `too_many_items`（上限 500）/ `name_conflict:<name>` / `manifest_not_found` / `manifest_invalid` / `manifest_empty` / `item_missing_url`。
 
-### 4.4 种子下载器 `bts.py torrent`
+### 4.4 种子下载器 `ats.py torrent`
 
-`torrent` 与 `download` 同一套路：创建一个 `kind="torrent"` 的 Task，参数写成 `tasks/<id>/torrent.json`，`argv` 直启 `scripts/bts_torrent.py`。worker 为每个任务拉起一个**只监听 `127.0.0.1`** 的 aria2c RPC 实例，下完（或到做种时长）即关；`check` / `show` / `stop` / `events` / `delete` 全部复用。
+`torrent` 与 `download` 同一套路：创建一个 `kind="torrent"` 的 Task，参数写成 `tasks/<id>/torrent.json`，`argv` 直启 `scripts/ats_torrent.py`。worker 为每个任务拉起一个**只监听 `127.0.0.1`** 的 aria2c RPC 实例，下完（或到做种时长）即关；`check` / `show` / `stop` / `events` / `delete` 全部复用。
 
 | 参数 | 说明 |
 | --- | --- |
@@ -267,7 +267,7 @@ spec 报错枚举：`missing_url` / `bad_url` / `bad_header` / `name_requires_si
 | `--timeout N` | 整个任务上限秒数，超时由 supervisor 杀进程（状态 `timeout`） |
 | `--level L0-L3` | 默认 L1，与 `download` 同一审批门 |
 
-**依赖**：aria2c。解析顺序 `BTS_ARIA2` → `PATH` → WinGet / scoop / choco 常见安装目录。安装：
+**依赖**：aria2c。解析顺序 `ATS_ARIA2` → `PATH` → WinGet / scoop / choco 常见安装目录。安装：
 
 ```bash
 winget install --id aria2.aria2 -e
@@ -295,12 +295,12 @@ winget install --id aria2.aria2 -e
              "aria2": "<aria2c-path>", "log": "tasks/tor-1a2b3c/stdout.log"}}
 ```
 
-### 4.5 指令包 `bts.py pack`
+### 4.5 指令包 `ats.py pack`
 
 `pack` 把一段**逗号分隔的文本**拆成多条命令，各建一个 `pending` Task（`kind="pack"`，共享 `pack_id`）。**它只传文本，不执行**：不写 `stdout.log`、不拉 supervisor、不解析命令内容。
 
 ```bash
-python scripts/bts.py pack "npm run build,npm test,git status" --pack-id pk-build
+python scripts/ats.py pack "npm run build,npm test,git status" --pack-id pk-build
 ```
 
 | 规则 | 说明 |
@@ -324,14 +324,14 @@ python scripts/bts.py pack "npm run build,npm test,git status" --pack-id pk-buil
 
 ### 4.6 全局参数
 
-两个脚本都支持 `--root <dir>`，优先级：`--root` > 环境变量 `BTS_ROOT` > `<cwd>/.bts`。
+两个脚本都支持 `--root <dir>`，优先级：`--root` > 环境变量 `ATS_ROOT` > `<cwd>/.ats`。
 
 ### 4.7 `@enc` 后缀钩子（命令成功后自动转码）
 
 在 `create` / `pack` 的命令文本**末尾**追加一段 `@enc <转换器参数>`，该任务就会在主命令**退出码为 0** 之后自动执行一次编码转换。`@enc` 必须是独立 token（前后为空白、行首或行尾）。
 
 ```bash
-python scripts/bts.py create enc-logs --level L1 \
+python scripts/ats.py create enc-logs --level L1 \
   --command "make build @enc --from gbk --to utf-8 build\\logs"
 ```
 
@@ -341,7 +341,7 @@ python scripts/bts.py create enc-logs --level L1 \
 | 触发条件 | 主命令 `exit_code == 0`；失败、超时、被 `stop` 时不执行钩子，也不生成钩子日志 |
 | 失败语义 | 钩子退出码非 0 → 任务整体 `failed`，任务 `exit_code` 取钩子退出码；Plan 层按既有失败传播规则处理 |
 | 日志与事件 | 钩子输出写 `tasks/<id>/hook-enc.log`；发事件 `task_post_hook`（含 `status` / `exit_code` / `error_type`） |
-| 转换器定位 | 环境变量 `BTS_ENCODER_PATH` > `<task cwd>/tools/encoding_converter.py` > `<当前目录>/tools/encoding_converter.py`；都不存在 → `encoder_not_found` |
+| 转换器定位 | 环境变量 `ATS_ENCODER_PATH` > `<task cwd>/tools/encoding_converter.py` > `<当前目录>/tools/encoding_converter.py`；都不存在 → `encoder_not_found` |
 | 参数归属 | `@enc` 之后的参数原样交给转换器（`path` 是**位置参数**，不是 `--path`） |
 | 坏语法 | `create` 报 `bad_hook`；`pack` 报 `bad_hook_item`（整包不落盘）；退出码均为 2 |
 
@@ -351,7 +351,7 @@ python scripts/bts.py create enc-logs --level L1 \
 python tools/encoding_converter.py logs --detect --to utf-8 --dry-run
 ```
 
-`--spec` 传入的 `command` 走同一套拆分逻辑；`BTS_ENCODER_PATH` 适合在转换器不在任务 `cwd` 下时显式指定。
+`--spec` 传入的 `command` 走同一套拆分逻辑；`ATS_ENCODER_PATH` 适合在转换器不在任务 `cwd` 下时显式指定。
 
 ---
 
@@ -403,29 +403,29 @@ python tools/encoding_converter.py logs --detect --to utf-8 --dry-run
 
 | 键 | 环境变量 | 说明 |
 | --- | --- | --- |
-| `max_level` | `BTS_MAX_LEVEL` | 策略硬上限 |
-| `actor_level` | `BTS_ACTOR_LEVEL` | 当前身份等级 |
-| `allow_rules` | `BTS_ALLOW_RULES` | 正则列表，用 `\|\|` 分隔 |
-| `approval_ttl_seconds` | `BTS_APPROVAL_TTL` | 审批有效期，`<=0` 表示不过期 |
-| `keep_runs_per_plan` | `BTS_KEEP_RUNS` | 每个 plan 保留快照数，`<=0` 不清理 |
-| `stall_seconds` | `BTS_STALL` | 停滞阈值，`<=0` 关闭检测 |
-| `lease_autonomy` | `BTS_LEASE_AUTONOMY` | 租约免审配置，JSON 字符串；坏值一律回落关闭 |
-| `lease_file` | `BTS_LEASE_FILE` | 租约文件路径，默认 `<root>/../temp/py_lease.json`，不存在则回落 `<root>/../.autopilot/temp/py_lease.json` |
+| `max_level` | `ATS_MAX_LEVEL` | 策略硬上限 |
+| `actor_level` | `ATS_ACTOR_LEVEL` | 当前身份等级 |
+| `allow_rules` | `ATS_ALLOW_RULES` | 正则列表，用 `\|\|` 分隔 |
+| `approval_ttl_seconds` | `ATS_APPROVAL_TTL` | 审批有效期，`<=0` 表示不过期 |
+| `keep_runs_per_plan` | `ATS_KEEP_RUNS` | 每个 plan 保留快照数，`<=0` 不清理 |
+| `stall_seconds` | `ATS_STALL` | 停滞阈值，`<=0` 关闭检测 |
+| `lease_autonomy` | `ATS_LEASE_AUTONOMY` | 租约免审配置，JSON 字符串；坏值一律回落关闭 |
+| `lease_file` | `ATS_LEASE_FILE` | 租约文件路径，默认 `<root>/../temp/py_lease.json`，不存在则回落 `<root>/../.autopilot/temp/py_lease.json` |
 
 ### 5.4 审批闭环
 
 ```bash
 # 1. 执行被拦，返回 approval_id 与 resume
-python scripts/bts.py run deploy1 --level L2
-# → {"error":"approval_required","approval_id":"ap-3f2a...","resume":"python bts.py run deploy1 --approval <approval_id>"}
+python scripts/ats.py run deploy1 --level L2
+# → {"error":"approval_required","approval_id":"ap-3f2a...","resume":"python ats.py run deploy1 --approval <approval_id>"}
 
 # 2. 人工批准（可批量）
-python scripts/bts.py approve ap-3f2a91c4
-python scripts/bts.py approve --all
-python scripts/bts.py approve ap-3f2a91c4 --reject --note "窗口期不允许"
+python scripts/ats.py approve ap-3f2a91c4
+python scripts/ats.py approve --all
+python scripts/ats.py approve ap-3f2a91c4 --reject --note "窗口期不允许"
 
 # 3. 用审批重跑
-python scripts/bts.py run deploy1 --approval ap-3f2a91c4
+python scripts/ats.py run deploy1 --approval ap-3f2a91c4
 ```
 
 审批记录字段（`approvals/<id>.json`）：
@@ -444,7 +444,7 @@ python scripts/bts.py run deploy1 --approval ap-3f2a91c4
   "source": "run",
   "schedule_id": null, "plan_id": null, "stage_id": null, "step_id": null,
   "task_id": "deploy1",
-  "resume": "python bts.py run deploy1 --approval <approval_id>"
+  "resume": "python ats.py run deploy1 --approval <approval_id>"
 }
 ```
 
@@ -462,7 +462,7 @@ python scripts/bts.py run deploy1 --approval ap-3f2a91c4
 
 ### 5.6 存活租约免审（`lease_autonomy`）
 
-当外部授权窗口（`.trae/scripts/py_consent.py`）仍在运行时，BTS 可以据此对**命中白名单的高危指令**跳过逐条审批。它是第 4 条放行路径，**不是新等级**。
+当外部授权窗口（`.trae/scripts/py_consent.py`）仍在运行时，本调度器可以据此对**命中白名单的高危指令**跳过逐条审批。它是第 4 条放行路径，**不是新等级**。
 
 五道关缺一不可，任一不满足即退回普通审批：
 
@@ -487,7 +487,7 @@ python scripts/bts.py run deploy1 --approval ap-3f2a91c4
 - **不突破策略上限**：`max_level` 仍是硬天花板，租约只能放宽「审批」这一关，不能放宽等级
 - **租约授予由用户勾选**：`py_consent.py` 第 4 题选「否 / 仅 L2 / 含 L3」，自定义文本**不构成授予**
 - **随租约消亡**：窗口关闭或心跳过期后，下一次权限门立刻回到审批流程，无需清理配置
-- **只读判定**：BTS 只读租约文件，不写、不删、不杀进程；撤销仍由用户关窗完成
+- **只读判定**：本调度器只读租约文件，不写、不删、不杀进程；撤销仍由用户关窗完成
 
 ---
 
@@ -612,7 +612,7 @@ Plan 层（`schedules/<sid>/events.jsonl`）：
 | `approval_created` / `approval_resolved` | 审批（带 `schedule_id` 时投递到此） |
 | `run_snapshot` / `prune_runs` / `steps_recovered` / `task_rerun` | 历史与恢复 |
 
-消费方式：`python scripts/bts.py events` 读取全局流并推进 `events_state.json` 游标，只返回增量。Plan 事件由 `check_schedule` 汇总在返回 JSON 的 `stalled` 字段；也可直接读文件。
+消费方式：`python scripts/ats.py events` 读取全局流并推进 `events_state.json` 游标，只返回增量。Plan 事件由 `check_schedule` 汇总在返回 JSON 的 `stalled` 字段；也可直接读文件。
 
 ---
 
@@ -623,9 +623,9 @@ Plan 层（`schedules/<sid>/events.jsonl`）：
 `<root>/scheduler.log` 是全局运行日志（JSONL），超过 2 MB 自动轮转为 `scheduler.log.1`。
 
 ```bash
-python scripts/bts.py logs --lines 20          # 人类可读
-python scripts/bts.py logs --lines 50 --json   # 机器可读
-python scripts/bts.py logs --plain             # 原样输出
+python scripts/ats.py logs --lines 20          # 人类可读
+python scripts/ats.py logs --lines 50 --json   # 机器可读
+python scripts/ats.py logs --plain             # 原样输出
 ```
 
 每条日志都带 `schedule_id` / `plan_id` / `stage_id` / `step_id`（有则记），便于按计划过滤。
@@ -643,8 +643,8 @@ runs/ci1-a1/
 ```
 
 ```bash
-python scripts/bts_plan.py history ci1
-python scripts/bts_plan.py history ci1 --plan ci1-a3 --logs --lines 30
+python scripts/ats_plan.py history ci1
+python scripts/ats_plan.py history ci1 --plan ci1-a3 --logs --lines 30
 ```
 
 ### 8.3 保留策略
@@ -673,29 +673,29 @@ python scripts/bts_plan.py history ci1 --plan ci1-a3 --logs --lines 30
 ### 10.1 长任务：创建 → 轮询 → 收集
 
 ```bash
-python scripts/bts.py create train1 --command "python train.py --epochs 30" --level L1 --timeout 7200
-python scripts/bts.py run train1              # 异步返回 supervisor_pid
+python scripts/ats.py create train1 --command "python train.py --epochs 30" --level L1 --timeout 7200
+python scripts/ats.py run train1              # 异步返回 supervisor_pid
 # 轮询
-python scripts/bts.py check train1           # next_poll 为 5 时继续轮询
-python scripts/bts.py show train1 --lines 40 # 看尾部输出
+python scripts/ats.py check train1           # next_poll 为 5 时继续轮询
+python scripts/ats.py show train1 --lines 40 # 看尾部输出
 ```
 
 ### 10.2 有审批的高危步骤
 
 ```bash
 # Plan 跑到第 3 步被拦 → status=paused，返回 approval
-python scripts/bts_plan.py run_plan rel1-a1
+python scripts/ats_plan.py run_plan rel1-a1
 # 人工批准
-python scripts/bts.py approve ap-xxxx
+python scripts/ats.py approve ap-xxxx
 # 继续（已完成的 Step 不会重跑）
-python scripts/bts_plan.py resume rel1 --approval ap-xxxx
+python scripts/ats_plan.py resume rel1 --approval ap-xxxx
 ```
 
 ### 10.3 周期巡检
 
 ```bash
-python scripts/bts_plan.py submit_schedule --spec patrol.json
-python scripts/bts_plan.py check_schedule patrol1
+python scripts/ats_plan.py submit_schedule --spec patrol.json
+python scripts/ats_plan.py check_schedule patrol1
 # 按返回的 next_poll（秒）休眠后再调
 # 返回 stalled 非空 → 计划卡住，需要人工介入或 rerun_task
 ```
@@ -703,17 +703,17 @@ python scripts/bts_plan.py check_schedule patrol1
 ### 10.4 局部重跑
 
 ```bash
-python scripts/bts_plan.py rerun_task ci1 test e2e
+python scripts/ats_plan.py rerun_task ci1 test e2e
 # 返回 rearmed_steps：被重新武装的下游
-python scripts/bts_plan.py run_plan ci1-a1
+python scripts/ats_plan.py run_plan ci1-a1
 ```
 
 ### 10.5 事故排查
 
 ```bash
-python scripts/bts_plan.py history ci1            # 有几次尝试、每次结果
-python scripts/bts.py logs --lines 50             # 时间线
-python scripts/bts.py logs --plain | Select-String "ci1-a1"   # 只看某次
+python scripts/ats_plan.py history ci1            # 有几次尝试、每次结果
+python scripts/ats.py logs --lines 50             # 时间线
+python scripts/ats.py logs --plain | Select-String "ci1-a1"   # 只看某次
 ```
 
 ---
@@ -734,7 +734,7 @@ python scripts/bts.py logs --plain | Select-String "ci1-a1"   # 只看某次
 - [orchestration-spec.md](references/orchestration-spec.md) — 编排规格、能力矩阵、事件与命令映射
 - [permissions.md](references/permissions.md) — 等级、策略、白名单、审批闭环细节
 - [data-model.md](references/data-model.md) — 所有 JSON 字段与语义
-- [storage-layout.md](references/storage-layout.md) — `.bts` 目录树与清理策略
+- [storage-layout.md](references/storage-layout.md) — `.ats` 目录树与清理策略
 - [state-machine.md](references/state-machine.md) — 状态迁移与事件对应
 - [error-taxonomy.md](references/error-taxonomy.md) — 错误分类与重试矩阵
 - [command-guide.md](references/command-guide.md) — 命令书写与调用规范
@@ -766,12 +766,12 @@ python scripts/bts.py logs --plain | Select-String "ci1-a1"   # 只看某次
 
 | 版本 | 变更 |
 | --- | --- |
-| 2.8 | 新增「存活租约免审」`lease_autonomy`：`policy.json` / `BTS_LEASE_AUTONOMY` 配置 `enabled` / `max_level` / `rules` / `deny_rules`，`lease_file` / `BTS_LEASE_FILE` 指定租约路径（默认 `<root>/../temp/py_lease.json`，不存在则回落 `<root>/../.autopilot/temp/py_lease.json`）；`permission_gate` 与 `gate_operation` 在身份判定之后、审批之前插入该路径，放行写 `status=approved` 的留痕审批（`auto_approved=true`、`resolved_by=py_lease:<令牌>`）不投待办；判定为五道关（总闸 / 等级上限 / 租约存活 / 命令白名单 / 租约自带约束），任一不满足退回审批，坏配置一律回落关闭；`policy` 命令新增 `lease` 段报告租约状态；`py_consent.py` 第 4 题把授予范围变成用户可勾选项 |
-| 2.7 | 新增 `@enc` 后缀钩子：命令文本末尾追加 `@enc <转换器参数>` 即把编码转换登记为任务的 `post_hook`，主命令退出码为 0 才执行（转换器 `tools/encoding_converter.py`，可用 `BTS_ENCODER_PATH` 覆盖）；钩子失败则任务 `failed` 且 `exit_code` 取钩子码，日志 `hook-enc.log`、事件 `task_post_hook`；`create` / `pack` 均支持，坏语法报 `bad_hook` / `bad_hook_item`；转换器仍可独立 CLI 使用 |
+| 2.8 | 新增「存活租约免审」`lease_autonomy`：`policy.json` / `ATS_LEASE_AUTONOMY` 配置 `enabled` / `max_level` / `rules` / `deny_rules`，`lease_file` / `ATS_LEASE_FILE` 指定租约路径（默认 `<root>/../temp/py_lease.json`，不存在则回落 `<root>/../.autopilot/temp/py_lease.json`）；`permission_gate` 与 `gate_operation` 在身份判定之后、审批之前插入该路径，放行写 `status=approved` 的留痕审批（`auto_approved=true`、`resolved_by=py_lease:<令牌>`）不投待办；判定为五道关（总闸 / 等级上限 / 租约存活 / 命令白名单 / 租约自带约束），任一不满足退回审批，坏配置一律回落关闭；`policy` 命令新增 `lease` 段报告租约状态；`py_consent.py` 第 4 题把授予范围变成用户可勾选项 |
+| 2.7 | 新增 `@enc` 后缀钩子：命令文本末尾追加 `@enc <转换器参数>` 即把编码转换登记为任务的 `post_hook`，主命令退出码为 0 才执行（转换器 `tools/encoding_converter.py`，可用 `ATS_ENCODER_PATH` 覆盖）；钩子失败则任务 `failed` 且 `exit_code` 取钩子码，日志 `hook-enc.log`、事件 `task_post_hook`；`create` / `pack` 均支持，坏语法报 `bad_hook` / `bad_hook_item`；转换器仍可独立 CLI 使用 |
 | 2.6 | 新增「关键任务失败即停」：Step 级 `critical: true` + Plan 级 `fail_on_critical: "stop"`，或 `run_plan` / `resume` 加 `--fail-fast`（临时视全部 Step 为 critical）；判定为**重试耗尽后仍失败**（`failed` / `timeout`），触发后立即 `taskkill /T /F` 终止同批兄弟进程树（`step.json` 记 `aborted_by="fail_fast"` + `aborted_at`，事件 `task_aborted`），当前 Stage 剩余 Step 标 `skipped(critical_failed)`、后续 Stage 标 `skipped`、`plan.status=failed`；修复 Plan 级 `fail_on_critical` 未写入 `plan.json` 与停止路径 `plan_end` 状态残留 `running` |
-| 2.5 | 新增 `bts.py pack`「指令包」：一次登记多条命令（英文逗号分隔，支持 `\,` / `\\` 转义），各建独立 `pending` Task（`kind="pack"`、共享 `pack_id`、`pack` 元数据），**只传文本不执行**；`list --pack` 按包筛选；空包 / 空项分别报 `pack_empty` / `pack_empty_item` 且整包不落盘 |
-| 2.4 | 新增 `bts.py torrent` + `scripts/bts_torrent.py`：磁力链 / `.torrent`（aria2c JSON-RPC），`*.aria2` 断点续传、做种时长、上下行限速、磁力 `followedBy` 自动换 gid；`kind="torrent"` 复用 Task 全链路；supervisor 分离启动新增 WMI 兜底（`task.json` 的 `detach_mode`） |
-| 2.3 | 新增 `bts.py download` + `scripts/bts_download.py`：HTTP(S) 单文件 / 批量清单（`.json` / `.txt` / `.csv`）、Range 断点续传（`.part`）、逐条重试与线性退避、大小与 SHA-256 校验、并发线程池、全局字节限速、代理 / 自定义 Header / 跳过证书校验；下载任务复用 Task 权限门、审批、事件、日志与 `check`/`stop`；重复条目自动合并（`deduped`），不同 URL 撞同名文件报 `name_conflict`；Task 支持原生 `argv` 派生（不经 shell） |
+| 2.5 | 新增 `ats.py pack`「指令包」：一次登记多条命令（英文逗号分隔，支持 `\,` / `\\` 转义），各建独立 `pending` Task（`kind="pack"`、共享 `pack_id`、`pack` 元数据），**只传文本不执行**；`list --pack` 按包筛选；空包 / 空项分别报 `pack_empty` / `pack_empty_item` 且整包不落盘 |
+| 2.4 | 新增 `ats.py torrent` + `scripts/ats_torrent.py`：磁力链 / `.torrent`（aria2c JSON-RPC），`*.aria2` 断点续传、做种时长、上下行限速、磁力 `followedBy` 自动换 gid；`kind="torrent"` 复用 Task 全链路；supervisor 分离启动新增 WMI 兜底（`task.json` 的 `detach_mode`） |
+| 2.3 | 新增 `ats.py download` + `scripts/ats_download.py`：HTTP(S) 单文件 / 批量清单（`.json` / `.txt` / `.csv`）、Range 断点续传（`.part`）、逐条重试与线性退避、大小与 SHA-256 校验、并发线程池、全局字节限速、代理 / 自定义 Header / 跳过证书校验；下载任务复用 Task 权限门、审批、事件、日志与 `check`/`stop`；重复条目自动合并（`deduped`），不同 URL 撞同名文件报 `name_conflict`；Task 支持原生 `argv` 派生（不经 shell） |
 | 2.2 | 修复与文档同步：`waves` 计数（收尾空轮不计、暂停轮计入、跨 `pause → resume` 累加不归零、`denied`+stop 路径落盘）；`stage_done`/`stage_failed` 事件携带 `waves`；`approve` 单条失败给出可判别退出码（`insufficient_level`→4、其余→3，`--all` 恒 0）；`next_run_iso` 不再把 `start_at: 0` 显示成 1970；示例脚本注入 `PYTHONIOENCODING=utf-8` / `PYTHONUTF8=1` 防 GBK 崩溃 |
 | 2.1 | 审批闭环（有效期/批量/事件投递/自动重发）、白名单放行、Stage 内 `depends_on`、Step 自动重试与退避、`plan_stalled` 停滞检测、运行快照与 `history`/`prune`、`scheduler.log` 与 `events`/`logs` 命令、`steps_recovered` 中断恢复 |
 | 2.0 | 三层模型（Task / Plan / Schedule）、L0-L3 权限、审批文件、`events.jsonl`、Stage 串并行 |

@@ -1,5 +1,5 @@
 {
-  "outputs": "./.bts-examples/dl",
+  "outputs": "./.ats-examples/dl",
   "items": [
     {
       "url": "https://example.com/releases/v1.0.0.zip",

@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="340" viewBox="0 0 1280 340" role="img" aria-label="Background Task Scheduler">
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="340" viewBox="0 0 1280 340" role="img" aria-label="Agent Task Scheduler">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#0d1117"/>
@@ -35,7 +35,7 @@
 
   <text x="80" y="88" fill="#58a6ff" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="600" letter-spacing="3.4">LOCAL TASK SCHEDULER FOR AI AGENTS</text>
 
-  <text x="80" y="152" fill="#e6edf3" font-family="Helvetica, Arial, sans-serif" font-size="46" font-weight="700">Background Task Scheduler</text>
+  <text x="80" y="152" fill="#e6edf3" font-family="Helvetica, Arial, sans-serif" font-size="46" font-weight="700">Agent Task Scheduler</text>
 
   <text x="80" y="190" fill="#8b949e" font-family="Helvetica, Arial, sans-serif" font-size="15">Three entity layers, L0-L3 permission gates, and a filesystem-only state store.</text>
 
@@ -54,5 +54,5 @@
     <text x="704" y="251" text-anchor="middle">@enc Hook</text>
   </g>
 
-  <text x="80" y="302" fill="#6e7681" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="12">github.com/1145AS780/background-task-scheduler</text>
+  <text x="80" y="302" fill="#6e7681" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="12">github.com/1145AS780/agent-task-scheduler</text>
 </svg>

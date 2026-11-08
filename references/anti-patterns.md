@@ -1,4 +1,4 @@
-# 常见错误用法 — background-task-scheduler v2.9
+# 常见错误用法 — agent-task-scheduler v2.9
 
 本文收集「看起来能用、实际一定会出问题」的用法。每一条都给**症状**（你在哪里看到它）、**为什么错**、**正确做法**。按主题分组，可以直接按你遇到的现象检索。
 
@@ -74,7 +74,7 @@
 
 **为什么错**：Task 层更轻、更快、`check` 的 `next_poll` 更细，且不需要 `schedules/` 那一层目录。Plan 的额外开销包括物化、Stage 状态文件、快照、保留策略。
 
-**正确做法**：单条命令用 `bts.py create` + `run`。只有当出现「多步 + 依赖/重试/汇总」时才升级到 Plan。
+**正确做法**：单条命令用 `ats.py create` + `run`。只有当出现「多步 + 依赖/重试/汇总」时才升级到 Plan。
 
 ### 1.7 依赖成环
 
@@ -146,7 +146,7 @@
 
 **症状**：写了 `"actor_level": "L0"`，认为「Agent 就再也跑不了 L2 命令了」。
 
-**为什么错**：`actor_level` 是**声明式**的。任何进程只要 `$env:BTS_ACTOR_LEVEL = "L3"` 或改 `policy.json` 就能自称高等级。`permission_gate` 读的就是这个值，它不做任何鉴权。
+**为什么错**：`actor_level` 是**声明式**的。任何进程只要 `$env:ATS_ACTOR_LEVEL = "L3"` 或改 `policy.json` 就能自称高等级。`permission_gate` 读的就是这个值，它不做任何鉴权。
 
 **正确做法**：把 `actor_level` 理解为「防误操作」而不是「防恶意」。真正的边界放在外层：CI token、操作系统账户、人工二次确认。
 
@@ -185,7 +185,7 @@
 **正确做法**：只在确认「当前 root 下所有挂起审批都属于本次操作」时用。日常用单 id。批量前先看有哪些：
 
 ```powershell
-Get-ChildItem .bts\approvals\*.json | ForEach-Object {
+Get-ChildItem .ats\approvals\*.json | ForEach-Object {
   $r = Get-Content $_ -Raw | ConvertFrom-Json
   if ($r.status -eq "pending") { "$($r.id)  $($r.command)  $($r.required_level)" }
 }
@@ -227,7 +227,7 @@ Get-ChildItem .bts\approvals\*.json | ForEach-Object {
 
 **为什么错**：`policy_denied` 不进重试、不进审批，直接终态失败，整条下游全跳过。它是最「亏」的一种失败——一次调度机会白费。
 
-**正确做法**：spec 里所有 `level` ≤ `max_level`。用 `bts.py policy --json` 先确认上限再写 spec。
+**正确做法**：spec 里所有 `level` ≤ `max_level`。用 `ats.py policy --json` 先确认上限再写 spec。
 
 ---
 
@@ -299,7 +299,7 @@ Get-ChildItem .bts\approvals\*.json | ForEach-Object {
 
 ### 3.9 输出无限增长
 
-**症状**：几个月后 `.bts` 目录几个 GB。
+**症状**：几个月后 `.ats` 目录几个 GB。
 
 **为什么错**：`stdout.log` / `stderr.log` 是纯追加，没有任何轮转。只有 `scheduler.log` 会 2 MB 轮转。
 
@@ -393,7 +393,7 @@ Get-ChildItem .bts\approvals\*.json | ForEach-Object {
 
 ## 5. 存储与运维类
 
-### 5.1 删 `.bts` 当「重置」
+### 5.1 删 `.ats` 当「重置」
 
 **症状**：不小心把正在跑的 Task 记录删了，进程还在，但再也没人收尸。
 
@@ -423,7 +423,7 @@ Get-ChildItem .bts\approvals\*.json | ForEach-Object {
 
 **为什么错**：`runs/<plan_id>-a<N>/` 只有 4 个文件（plan / schedule / steps.jsonl / summary），**不含** stdout/stderr，也不含审批。而且默认只保留最近 5 份。
 
-**正确做法**：需要归档就定期把整个 `.bts` 复制走。`runs/` 的价值是「快速看某次每步结果」，不是「恢复现场」。
+**正确做法**：需要归档就定期把整个 `.ats` 复制走。`runs/` 的价值是「快速看某次每步结果」，不是「恢复现场」。
 
 ### 5.5 `prune --keep 0` 以为删光
 
@@ -441,23 +441,23 @@ Get-ChildItem .bts\approvals\*.json | ForEach-Object {
 
 **为什么错**：`run` 派生的是 `DETACHED_PROCESS`，新会话里网络盘映射通常不存在。
 
-**正确做法**：`BTS_ROOT` 放本地盘（`C:` / `D:` 本地卷）。网络盘可以做只读备份。
+**正确做法**：`ATS_ROOT` 放本地盘（`C:` / `D:` 本地卷）。网络盘可以做只读备份。
 
 ### 5.7 多个项目共用一个 root
 
 **症状**：`list` 里混着别人的任务，`prune` 删了不该删的快照。
 
-**为什么错**：`BTS_ROOT` 是硬隔离边界。共用 root = 共用 tasks/schedules/approvals/日志。
+**为什么错**：`ATS_ROOT` 是硬隔离边界。共用 root = 共用 tasks/schedules/approvals/日志。
 
 **正确做法**：一个项目一个 root。用 `--root` 显式指定，或用环境变量在各自的会话里设。
 
-### 5.8 期望 `.bts` 能进版本控制
+### 5.8 期望 `.ats` 能进版本控制
 
-**症状**：提交了 `.bts`，每次跑任务都产生巨大 diff。
+**症状**：提交了 `.ats`，每次跑任务都产生巨大 diff。
 
 **为什么错**：里面有 pid、时间戳、日志、快照，全是易变数据。
 
-**正确做法**：`.gitignore` 掉整个 `.bts`。要版本化的是 **spec 文件**（`plan.json` / `schedule.json` / `task.json` 定义），不是状态。
+**正确做法**：`.gitignore` 掉整个 `.ats`。要版本化的是 **spec 文件**（`plan.json` / `schedule.json` / `task.json` 定义），不是状态。
 
 ---
 
@@ -497,9 +497,9 @@ Get-ChildItem .bts\approvals\*.json | ForEach-Object {
 
 ### 6.5 期望全局 `events` 能看到 Plan 事件
 
-**症状**：`bts.py events` 里看不到 `task_done`、`stage_done`。
+**症状**：`ats.py events` 里看不到 `task_done`、`stage_done`。
 
-**为什么错**：Plan 层事件投递到 `schedules/<sid>/events.jsonl`，**不**进全局流。`bts.py events` 只消费 `<root>/events.jsonl`，那里只有 Task 层事件。Plan 的审批事件因为带 `schedule_id`，也一并落在 schedule 的事件流里。
+**为什么错**：Plan 层事件投递到 `schedules/<sid>/events.jsonl`，**不**进全局流。`ats.py events` 只消费 `<root>/events.jsonl`，那里只有 Task 层事件。Plan 的审批事件因为带 `schedule_id`，也一并落在 schedule 的事件流里。
 
 **正确做法**：Plan 事件直接读 `schedules/<sid>/events.jsonl`，或看 `check_schedule` 的返回、`show` 的汇总、`history` 的快照。
 

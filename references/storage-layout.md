@@ -1,6 +1,6 @@
-# 存储布局 — background-task-scheduler v2.9
+# 存储布局 — agent-task-scheduler v2.9
 
-所有状态都在 `BTS_ROOT` 下（默认 `<cwd>/.bts`）。本文描述目录结构、文件语义、生命周期与清理策略。
+所有状态都在 `ATS_ROOT` 下（默认 `<cwd>/.ats`）。本文描述目录结构、文件语义、生命周期与清理策略。
 
 ---
 
@@ -9,21 +9,21 @@
 优先级从高到低：
 
 1. 命令行 `--root <dir>`
-2. 环境变量 `BTS_ROOT`
-3. 当前工作目录下的 `.bts`
+2. 环境变量 `ATS_ROOT`
+3. 当前工作目录下的 `.ats`
 
 ```bash
 # 显式指定
-python scripts/bts.py --root D:/state/bts list
+python scripts/ats.py --root D:/state/ats list
 
 # 环境变量（推荐长期使用）
-export BTS_ROOT=/var/lib/bts        # Linux/macOS
-$env:BTS_ROOT = "D:\state\bts"      # PowerShell
+export ATS_ROOT=/var/lib/ats        # Linux/macOS
+$env:ATS_ROOT = "D:\state\ats"      # PowerShell
 ```
 
 **为什么默认在 cwd 下**：每个项目独立一套调度状态，随项目一起被 `.gitignore` 或备份，避免全局污染。
 
-**建议**：把 `.bts/` 加进 `.gitignore`（含运行日志与临时状态）。
+**建议**：把 `.ats/` 加进 `.gitignore`（含运行日志与临时状态）。
 
 ---
 
@@ -104,9 +104,9 @@ $env:BTS_ROOT = "D:\state\bts"      # PowerShell
 | 路径 | 写者 | 读者 | 语义 |
 | --- | --- | --- | --- |
 | `policy.json` | 人 | 两个脚本 | 策略；可热改 |
-| `events.jsonl` | bts.py（Task 事件）/ bts.py（审批） | `bts.py events`、外部 | 全局事件流 |
-| `events_state.json` | `bts.py events` | 同上 | 游标（行号） |
-| `scheduler.log` | 两个脚本 | `bts.py logs`、人 | 全局时间线 |
+| `events.jsonl` | ats.py（Task 事件）/ ats.py（审批） | `ats.py events`、外部 | 全局事件流 |
+| `events_state.json` | `ats.py events` | 同上 | 游标（行号） |
+| `scheduler.log` | 两个脚本 | `ats.py logs`、人 | 全局时间线 |
 | `scheduler.log.1` | 轮转逻辑 | 人 | 上一代日志 |
 | `approvals/<id>.json` | `create_approval` / `cmd_approve` | `approval_check` | 审批记录 |
 | `tasks/<id>/task.json` | `create` / `pack` / `run` / `supervise` / `check` | 所有 Task 命令 | 任务状态 |
@@ -116,12 +116,12 @@ $env:BTS_ROOT = "D:\state\bts"      # PowerShell
 | `tasks/<id>/hook-enc.log` | supervisor（`run_post_hook`） | `show --lines`、人 | `@enc` 钩子输出；主命令失败/超时/被 stop 时不生成 |
 | `tasks/<id>/pid` | `supervise` | `stop` 兜底 | 子进程 PID |
 | `tasks/<id>/exit_code` | `finalize_task` | `check` | 退出码（跨进程兜底） |
-| `tasks/<id>/download.json` | `bts.py download` | `bts_download.py`（只读） | 下载 spec；不在 `BTS_ROOT` 之外留副本 |
-| `tasks/<id>/torrent.json` | `bts.py torrent` | `bts_torrent.py`（只读） | 种子 spec（source/outputs/seed_time/限速/aria2 路径） |
+| `tasks/<id>/download.json` | `ats.py download` | `ats_download.py`（只读） | 下载 spec；不在 `ATS_ROOT` 之外留副本 |
+| `tasks/<id>/torrent.json` | `ats.py torrent` | `ats_torrent.py`（只读） | 种子 spec（source/outputs/seed_time/限速/aria2 路径） |
 | `tasks/<id>/aria2.log` | aria2c | 人（排查） | aria2 自身日志（`--log`） |
 | `tasks/<id>/aria2.out.log` | aria2c | 人（排查） | aria2 stdout/stderr 重定向 |
 | `schedules/<sid>/schedule.json` | `submit_*` / `check_schedule` / `pause` / `cancel` | 所有 Plan 命令 | Schedule 状态 |
-| `schedules/<sid>/events.jsonl` | `bts_plan.emit` | `check_schedule`、人 | 该 Schedule 的事件 |
+| `schedules/<sid>/events.jsonl` | `ats_plan.emit` | `check_schedule`、人 | 该 Schedule 的事件 |
 | `schedules/<sid>/events_state.json` | 预留（当前未使用） | — | 局部游标（保留给外部消费者） |
 | `plans/<pid>/plan.json` | `materialize` / `run_plan` | 执行器 | Plan 状态 |
 | `plans/<pid>/run.lock` | `run_plan` / `rerun_plan` | 同上 | Plan 层互斥锁；仅执行期间存在 |
@@ -164,9 +164,9 @@ approve → approved / rejected
 ```
 
 - 审批文件**不会**自动删除
-- 手动清理：`python scripts/bts.py approval prune [--dry-run] [--older-than 秒]`
+- 手动清理：`python scripts/ats.py approval prune [--dry-run] [--older-than 秒]`
   只删 `approved`/`rejected`/`expired`；**`pending` 永不删除**，未知状态保留
-- 例：清理 30 天前的已决议记录 `python scripts/bts.py approval prune --older-than 2592000 --dry-run`
+- 例：清理 30 天前的已决议记录 `python scripts/ats.py approval prune --older-than 2592000 --dry-run`
   （`--older-than 0` = 不限时间 = 删除**所有**已决议记录，`pending` 仍保留）
 - 已被引用的审批即使删除也只会导致 `approval_check` 返回 `missing`
 
@@ -219,27 +219,27 @@ delete → 整个目录删除
 
 ```bash
 # 预览
-python scripts/bts_plan.py prune --keep 3 --dry-run
+python scripts/ats_plan.py prune --keep 3 --dry-run
 # 执行
-python scripts/bts_plan.py prune --keep 3
+python scripts/ats_plan.py prune --keep 3
 # 用策略值
-python scripts/bts_plan.py prune
+python scripts/ats_plan.py prune
 
 # 审批记录：清理 30 天前的已决议记录（pending 永不删）
-python scripts/bts.py approval prune --older-than 2592000 --dry-run
-python scripts/bts.py approval prune --older-than 2592000
+python scripts/ats.py approval prune --older-than 2592000 --dry-run
+python scripts/ats.py approval prune --older-than 2592000
 ```
 
-**两条 prune 的 `0` 语义相反**：`bts_plan.py prune --keep 0` = 不清理（保留全部快照）；
-`bts.py approval prune --older-than 0` = 不限时间 = 删除所有已决议记录（`pending` 仍保留）。
+**两条 prune 的 `0` 语义相反**：`ats_plan.py prune --keep 0` = 不清理（保留全部快照）；
+`ats.py approval prune --older-than 0` = 不限时间 = 删除所有已决议记录（`pending` 仍保留）。
 
 ### 5.3 彻底清理
 
 ```bash
 # 删除单个任务/计划/周期（受 L2 权限约束）
-python scripts/bts.py delete build1
-python scripts/bts_plan.py delete ci1-a1
-python scripts/bts_plan.py delete ci1
+python scripts/ats.py delete build1
+python scripts/ats_plan.py delete ci1-a1
+python scripts/ats_plan.py delete ci1
 
 # 整库重置（危险）
 rm -rf <root>
@@ -255,7 +255,7 @@ rm -rf <root>
 
 ```bash
 # 只备份"配置 + 计划定义 + 快照"，跳过输出日志
-tar czf bts-backup.tgz \
+tar czf ats-backup.tgz \
     --exclude='*/stdout.log' --exclude='*/stderr.log' \
     --exclude='*/supervisor.log' \
     policy.json schedules/*/schedule.json schedules/*/plans \
@@ -272,7 +272,7 @@ tar czf bts-backup.tgz \
 ### 6.3 从 v2.0 升级
 
 - 直接替换脚本即可；旧状态文件缺字段时按默认值处理
-- 建议先跑 `bts.py check` 和 `bts_plan.py list` 确认状态可读
+- 建议先跑 `ats.py check` 和 `ats_plan.py list` 确认状态可读
 - 旧 Plan 没有 `runs/` 快照，`history` 返回空列表属正常
 
 ---

@@ -4,7 +4,7 @@
 用法：
     python reference\\examples\\wait-plan.py ci-lint-test-a1
     python reference\\examples\\wait-plan.py gated --interval 2 --timeout 600
-    python reference\\examples\\wait-plan.py patrol-sample --root D:\\work\\.bts
+    python reference\\examples\\wait-plan.py patrol-sample --root D:\\work\\.ats
 
 输出：进度写 stderr，最终结论写 stdout（JSON），便于管道消费。
 退出码：0 = 已到终态（done/failed/cancelled）或 paused；3 = 找不到；1 = 超时。
@@ -19,14 +19,14 @@ import time
 from pathlib import Path
 
 SKILL_ROOT = Path(__file__).resolve().parents[2]
-BTS_PLAN = SKILL_ROOT / "scripts" / "bts_plan.py"
+ATS_PLAN = SKILL_ROOT / "scripts" / "ats_plan.py"
 
 # 对等待者而言，「暂停」也算停下来（接下来要人批审批）
 HALTED = {"done", "failed", "cancelled", "paused"}
 
 
 def call(ident, root):
-    cmd = [sys.executable, str(BTS_PLAN)]
+    cmd = [sys.executable, str(ATS_PLAN)]
     if root:
         cmd += ["--root", str(root)]
     cmd += ["show", ident, "--json"]
@@ -57,7 +57,7 @@ def current_status(data):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="轮询 Plan 直到终态")
     ap.add_argument("ident", help="plan_id（如 ci1-a1）或 schedule_id")
-    ap.add_argument("--root", default=None, help="BTS_ROOT，默认读环境变量或 <cwd>/.bts")
+    ap.add_argument("--root", default=None, help="ATS_ROOT，默认读环境变量或 <cwd>/.ats")
     ap.add_argument("--interval", type=int, default=5, help="两次轮询间隔秒数（默认 5）")
     ap.add_argument("--timeout", type=int, default=0, help="总超时秒数，0 表示不限")
     ap.add_argument("--quiet", action="store_true", help="不打印进度")
@@ -107,7 +107,7 @@ def main(argv=None):
                 plan = data.get("plan") or {}
                 payload["paused_stage"] = plan.get("paused_stage")
                 payload["paused_step"] = plan.get("paused_step")
-                payload["hint"] = "先 bts.py approve <approval_id>，再 bts_plan.py resume <id> --approval <id>"
+                payload["hint"] = "先 ats.py approve <approval_id>，再 ats_plan.py resume <id> --approval <id>"
             print(json.dumps(payload, ensure_ascii=False, indent=2))
             return 0
 

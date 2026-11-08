@@ -1,6 +1,6 @@
-# 权限与审批 — background-task-scheduler v2.9
+# 权限与审批 — agent-task-scheduler v2.9
 
-本文描述 L0-L3 分级、策略上限、白名单、审批闭环与存活租约免审。实现见 `scripts/bts.py` 的
+本文描述 L0-L3 分级、策略上限、白名单、审批闭环与存活租约免审。实现见 `scripts/ats.py` 的
 `policy()`、`whitelist_match()`、`lease_state()`、`lease_autonomy()`、`permission_gate()`、
 `gate_operation()`、`create_approval()`、`create_lease_approval()`、`approval_check()`、`cmd_approve()`。
 
@@ -83,14 +83,14 @@
 
 | 键 | 默认 | 环境变量 | 说明 |
 | --- | --- | --- | --- |
-| `max_level` | `L3` | `BTS_MAX_LEVEL` | 硬上限 |
-| `actor_level` | `L3` | `BTS_ACTOR_LEVEL` | 当前身份 |
-| `allow_rules` | `[]` | `BTS_ALLOW_RULES` | 正则，`\|\|` 分隔 |
-| `approval_ttl_seconds` | `86400` | `BTS_APPROVAL_TTL` | 审批有效期，`<=0` 不过期 |
-| `keep_runs_per_plan` | `5` | `BTS_KEEP_RUNS` | 快照保留数，`<=0` 不清理 |
-| `stall_seconds` | `300` | `BTS_STALL` | 停滞阈值，`<=0` 关闭 |
-| `lease_autonomy` | 关闭 | `BTS_LEASE_AUTONOMY` | 租约免审配置（JSON 字符串），坏值回落关闭 |
-| `lease_file` | `""` | `BTS_LEASE_FILE` | 租约路径，空 = `<root>/../temp/py_lease.json`，不存在则回落 `<root>/../.autopilot/temp/py_lease.json` |
+| `max_level` | `L3` | `ATS_MAX_LEVEL` | 硬上限 |
+| `actor_level` | `L3` | `ATS_ACTOR_LEVEL` | 当前身份 |
+| `allow_rules` | `[]` | `ATS_ALLOW_RULES` | 正则，`\|\|` 分隔 |
+| `approval_ttl_seconds` | `86400` | `ATS_APPROVAL_TTL` | 审批有效期，`<=0` 不过期 |
+| `keep_runs_per_plan` | `5` | `ATS_KEEP_RUNS` | 快照保留数，`<=0` 不清理 |
+| `stall_seconds` | `300` | `ATS_STALL` | 停滞阈值，`<=0` 关闭 |
+| `lease_autonomy` | 关闭 | `ATS_LEASE_AUTONOMY` | 租约免审配置（JSON 字符串），坏值回落关闭 |
+| `lease_file` | `""` | `ATS_LEASE_FILE` | 租约路径，空 = `<root>/../temp/py_lease.json`，不存在则回落 `<root>/../.autopilot/temp/py_lease.json` |
 
 `policy.json` 示例：
 
@@ -108,7 +108,7 @@
 查看生效值：
 
 ```bash
-python scripts/bts.py policy --json
+python scripts/ats.py policy --json
 ```
 
 **注意**：环境变量优先于文件，便于临时提升/收紧权限。生产环境应把 `actor_level` 设低（如 L1），让 L2+ 必须走审批。
@@ -201,7 +201,7 @@ python scripts/bts.py policy --json
   "task_id": "deploy1",
   "task_instance": "b8ef7c7837a8",
   "task_created_at": 1793512103,
-  "resume": "python bts.py run deploy1 --approval <approval_id>"
+  "resume": "python ats.py run deploy1 --approval <approval_id>"
 }
 ```
 
@@ -277,9 +277,9 @@ python scripts/bts.py policy --json
 ### 6.6 批量
 
 ```bash
-python scripts/bts.py approve --all              # 批准所有 pending 且未过期
-python scripts/bts.py approve --all --reject     # 全部拒绝（慎用）
-python scripts/bts.py approve a1 a2 a3          # 指定多个
+python scripts/ats.py approve --all              # 批准所有 pending 且未过期
+python scripts/ats.py approve --all --reject     # 全部拒绝（慎用）
+python scripts/ats.py approve a1 a2 a3          # 指定多个
 ```
 
 `--all` 会跳过已过期记录（顺带把它们置为 `expired`），返回实际处理结果。
@@ -366,7 +366,7 @@ check = approval_check(state.approval_id, command)
 - **不突破 `max_level`**：租约只放宽「审批」这一关，不放宽等级
 - **授予由用户勾选**：`py_consent.py` 第 4 题「否 / 仅 L2 / 含 L3」，自定义文本不构成授予
 - **随租约消亡**：窗口关闭 / 心跳过期后，下一次权限门立即回到审批，无需清理配置
-- **只读**：BTS 不写、不删租约，也不杀进程；撤销仍由用户关窗完成
+- **只读**：ATS 不写、不删租约，也不杀进程；撤销仍由用户关窗完成
 - 与 `actor_level` 同为**声明式**：能伪造租约文件或改 `policy.json` 的进程即可自证，不是敌对环境下的安全边界
 
 ---
@@ -424,7 +424,7 @@ check = approval_check(state.approval_id, command)
 | 黑名单硬拒绝 | 没有全局「这些命令永不批准」的规则（`lease_autonomy.deny_rules` 只作用于租约路径） | 用 `max_level` 限制 + 白名单只放安全命令 |
 | 审批双人复核 | 单人即可批准 | 外部流程保证（如审批人必须是另一账号） |
 | 审批委托/转交 | 无 | 人为在群里转达 |
-| 审批记录清理 / 归档 | 只有 JSON 文件与日志 | 清理用 `bts.py approval prune`（只删 `approved`/`rejected`/`expired`，`pending` 永不删）；归档仍需外部定期备份 `approvals/` 与 `scheduler.log` |
+| 审批记录清理 / 归档 | 只有 JSON 文件与日志 | 清理用 `ats.py approval prune`（只删 `approved`/`rejected`/`expired`，`pending` 永不删）；归档仍需外部定期备份 `approvals/` 与 `scheduler.log` |
 
 ---
 

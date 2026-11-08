@@ -1,27 +1,27 @@
 ﻿#!/usr/bin/env pwsh
 # 端到端演示：Task → Plan → 依赖/重试 → 审批 → 周期 Schedule
 # 用法： powershell -ExecutionPolicy Bypass -File reference\examples\run-examples.ps1
-# 说明： 所有状态写在 $env:BTS_ROOT（默认 <skill_root>\.bts-examples），不触碰项目 .bts
+# 说明： 所有状态写在 $env:ATS_ROOT（默认 <skill_root>\.ats-examples），不触碰项目 .ats
 
 $ErrorActionPreference = "Stop"
 
 $SkillRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-$Bts       = Join-Path $SkillRoot "scripts\bts.py"
-$BtsPlan   = Join-Path $SkillRoot "scripts\bts_plan.py"
+$Ats       = Join-Path $SkillRoot "scripts\ats.py"
+$AtsPlan   = Join-Path $SkillRoot "scripts\ats_plan.py"
 
-if (-not $env:BTS_ROOT) {
-    $env:BTS_ROOT = Join-Path $SkillRoot ".bts-examples"
+if (-not $env:ATS_ROOT) {
+    $env:ATS_ROOT = Join-Path $SkillRoot ".ats-examples"
 }
 
 Write-Host "skill root : $SkillRoot"
-Write-Host "BTS_ROOT   : $env:BTS_ROOT"
+Write-Host "ATS_ROOT   : $env:ATS_ROOT"
 Write-Host ""
 
 # ---------------------------------------------------------------- 工具函数
 
-function Invoke-Bts {
+function Invoke-Ats {
     param([string[]]$Arguments, [switch]$Plan)
-    $exe = if ($Plan) { $BtsPlan } else { $Bts }
+    $exe = if ($Plan) { $AtsPlan } else { $Ats }
     $raw  = & python $exe @Arguments
     $code = $LASTEXITCODE
     $data = $null
@@ -48,14 +48,14 @@ function Show-Result {
 
 # 清理上次演示留下的实体（失败忽略）
 function Reset-Example {
-    $env:BTS_ACTOR_LEVEL = "L3"
+    $env:ATS_ACTOR_LEVEL = "L3"
     foreach ($ident in @("ci-lint-test", "dep-retry", "gated", "patrol-sample")) {
-        Invoke-Bts -Arguments @("approve", "--all") | Out-Null
+        Invoke-Ats -Arguments @("approve", "--all") | Out-Null
         # 第一次 delete 落在 plan 上，第二次才落在 schedule 上
-        Invoke-Bts -Plan -Arguments @("delete", $ident) 2>$null | Out-Null
-        Invoke-Bts -Plan -Arguments @("delete", $ident) 2>$null | Out-Null
+        Invoke-Ats -Plan -Arguments @("delete", $ident) 2>$null | Out-Null
+        Invoke-Ats -Plan -Arguments @("delete", $ident) 2>$null | Out-Null
     }
-    Invoke-Bts -Arguments @("delete", "build1") 2>$null | Out-Null
+    Invoke-Ats -Arguments @("delete", "build1") 2>$null | Out-Null
 }
 
 Reset-Example
@@ -64,40 +64,40 @@ Push-Location $SkillRoot
 try {
     # ------------------------------------------------------------ 1. 策略
     Write-Section "1. 查看生效策略"
-    $r = Invoke-Bts -Arguments @("policy", "--json")
+    $r = Invoke-Ats -Arguments @("policy", "--json")
     Show-Result $r 300
 
     # ------------------------------------------------------------ 2. Task 层
     Write-Section "2. Task：create → run → check → show"
-    $r = Invoke-Bts -Arguments @("create", "--spec", "reference\examples\task-spec.json")
+    $r = Invoke-Ats -Arguments @("create", "--spec", "reference\examples\task-spec.json")
     Show-Result $r 200
 
-    $r = Invoke-Bts -Arguments @("run", "build1", "--wait")
+    $r = Invoke-Ats -Arguments @("run", "build1", "--wait")
     Write-Host ("task status = {0}, exit_code = {1}" -f $r.Data.task.status, $r.Data.task.exit_code)
 
-    $r = Invoke-Bts -Arguments @("show", "build1", "--lines", "10")
+    $r = Invoke-Ats -Arguments @("show", "build1", "--lines", "10")
     Write-Host ("stdout tail = {0}" -f $r.Data.stdout_tail)
 
     # ------------------------------------------------------------ 3. 一次性计划
     Write-Section "3. Plan：提交 + 执行（两个 Stage）"
-    $r = Invoke-Bts -Plan -Arguments @("submit_plan", "--spec", "reference\examples\plan-oneshot.json")
+    $r = Invoke-Ats -Plan -Arguments @("submit_plan", "--spec", "reference\examples\plan-oneshot.json")
     Show-Result $r 240
 
-    $r = Invoke-Bts -Plan -Arguments @("run_plan", "ci-lint-test-a1")
+    $r = Invoke-Ats -Plan -Arguments @("run_plan", "ci-lint-test-a1")
     Write-Host ("plan status = {0}" -f $r.Data.status)
     Write-Host ("counts      = {0}" -f ($r.Data.counts | ConvertTo-Json -Compress))
     Write-Host ("run_dir     = {0}" -f $r.Data.run_dir)
 
     # ------------------------------------------------------------ 4. 依赖与重试
     Write-Section "4. Plan：depends_on 失败传播 + retry"
-    $r = Invoke-Bts -Plan -Arguments @("submit_plan", "--spec", "reference\examples\plan-deps-retry.json")
+    $r = Invoke-Ats -Plan -Arguments @("submit_plan", "--spec", "reference\examples\plan-deps-retry.json")
     Show-Result $r 240
 
-    $r = Invoke-Bts -Plan -Arguments @("run_plan", "dep-retry-a1")
+    $r = Invoke-Ats -Plan -Arguments @("run_plan", "dep-retry-a1")
     Write-Host ("plan status = {0}" -f $r.Data.status)
     Write-Host ("counts      = {0}" -f ($r.Data.counts | ConvertTo-Json -Compress))
 
-    $r = Invoke-Bts -Plan -Arguments @("show", "dep-retry-a1", "--json")
+    $r = Invoke-Ats -Plan -Arguments @("show", "dep-retry-a1", "--json")
     foreach ($step in $r.Data.summary.steps) {
         Write-Host ("  {0,-12} {1,-10} attempts={2} skipped_by={3} blocked_by={4}" -f `
             $step.step_id, $step.status, $step.attempts, $step.skipped_by, $step.blocked_by)
@@ -105,12 +105,12 @@ try {
 
     # ------------------------------------------------------------ 5. 审批闭环
     Write-Section "5. 审批：L0 身份被拦 → L3 批准 → 恢复"
-    $env:BTS_ACTOR_LEVEL = "L0"
+    $env:ATS_ACTOR_LEVEL = "L0"
 
-    $r = Invoke-Bts -Plan -Arguments @("submit_plan", "--spec", "reference\examples\plan-approval-gated.json")
+    $r = Invoke-Ats -Plan -Arguments @("submit_plan", "--spec", "reference\examples\plan-approval-gated.json")
     Show-Result $r 240
 
-    $r = Invoke-Bts -Plan -Arguments @("run_plan", "gated-a1")
+    $r = Invoke-Ats -Plan -Arguments @("run_plan", "gated-a1")
     Write-Host ("plan status = {0}" -f $r.Data.status)
     $apId = $null
     if ($r.Data.approval) {
@@ -120,24 +120,24 @@ try {
     }
 
     if ($apId) {
-        $env:BTS_ACTOR_LEVEL = "L3"
-        $r = Invoke-Bts -Arguments @("approve", $apId, "--note", "示例批准")
+        $env:ATS_ACTOR_LEVEL = "L3"
+        $r = Invoke-Ats -Arguments @("approve", $apId, "--note", "示例批准")
         Write-Host ("approve -> {0}" -f $r.Data.status)
 
-        $r = Invoke-Bts -Plan -Arguments @("resume", "gated", "--approval", $apId)
+        $r = Invoke-Ats -Plan -Arguments @("resume", "gated", "--approval", $apId)
         Write-Host ("resume  -> {0}" -f $r.Data.status)
         Write-Host ("counts  = {0}" -f ($r.Data.counts | ConvertTo-Json -Compress))
     }
 
     # ------------------------------------------------------------ 6. 周期计划
     Write-Section "6. Schedule：every=5 / max_runs=3 / start_at=0"
-    $env:BTS_ACTOR_LEVEL = "L3"
+    $env:ATS_ACTOR_LEVEL = "L3"
 
-    $r = Invoke-Bts -Plan -Arguments @("submit_schedule", "--spec", "reference\examples\schedule-recurring.json")
+    $r = Invoke-Ats -Plan -Arguments @("submit_schedule", "--spec", "reference\examples\schedule-recurring.json")
     Show-Result $r 240
 
     for ($i = 1; $i -le 3; $i++) {
-        $r = Invoke-Bts -Plan -Arguments @("check_schedule", "patrol-sample")
+        $r = Invoke-Ats -Plan -Arguments @("check_schedule", "patrol-sample")
         $status    = $r.Data.status
         $triggered = ($r.Data.triggered -join ",")
         $nextPoll  = $r.Data.next_poll
@@ -148,21 +148,21 @@ try {
 
     # ------------------------------------------------------------ 7. 收尾查询
     Write-Section "7. 历史与日志"
-    $r = Invoke-Bts -Plan -Arguments @("history", "ci-lint-test", "--logs", "--lines", "5")
+    $r = Invoke-Ats -Plan -Arguments @("history", "ci-lint-test", "--logs", "--lines", "5")
     Write-Host ("runs = {0}" -f $r.Data.count)
     foreach ($run in $r.Data.runs) {
         Write-Host ("  {0,-16} status={1,-8} counts={2}" -f `
             $run.run, $run.status, ($run.counts | ConvertTo-Json -Compress))
     }
 
-    $lines = & python $Bts logs --lines 8
+    $lines = & python $Ats logs --lines 8
     $lines | ForEach-Object { Write-Host "  $_" }
 
     Write-Section "完成"
     Write-Host "全部样例已执行。清理方式："
-    Write-Host ("  Remove-Item -Recurse -Force '{0}'" -f $env:BTS_ROOT)
+    Write-Host ("  Remove-Item -Recurse -Force '{0}'" -f $env:ATS_ROOT)
 }
 finally {
     Pop-Location
-    Remove-Item Env:\BTS_ACTOR_LEVEL -ErrorAction SilentlyContinue
+    Remove-Item Env:\ATS_ACTOR_LEVEL -ErrorAction SilentlyContinue
 }

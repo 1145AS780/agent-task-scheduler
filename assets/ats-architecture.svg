@@ -1,44 +1,44 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1500 830" width="1500" height="830" class="bts-arch" font-family="'Microsoft YaHei','PingFang SC','Segoe UI',sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1500 830" width="1500" height="830" class="ats-arch" font-family="'Microsoft YaHei','PingFang SC','Segoe UI',sans-serif">
   <style>
-    .bts-arch {
-      --bts-bg: #ffffff;
-      --bts-line: #000000;
-      --bts-ink: #000000;
-      --bts-ink-2: #333333;
-      --bts-ink-3: #555555;
-      --bts-ink-4: #777777;
-      --bts-ink-5: #999999;
-      --bts-hair: #e5e5e5;
-      --bts-div: #bbbbbb;
+    .ats-arch {
+      --ats-bg: #ffffff;
+      --ats-line: #000000;
+      --ats-ink: #000000;
+      --ats-ink-2: #333333;
+      --ats-ink-3: #555555;
+      --ats-ink-4: #777777;
+      --ats-ink-5: #999999;
+      --ats-hair: #e5e5e5;
+      --ats-div: #bbbbbb;
     }
     @media (prefers-color-scheme: dark) {
-      .bts-arch {
-        --bts-bg: #0d1117;
-        --bts-line: #c9d1d9;
-        --bts-ink: #e6edf3;
-        --bts-ink-2: #adbac7;
-        --bts-ink-3: #909dab;
-        --bts-ink-4: #768390;
-        --bts-ink-5: #636e7b;
-        --bts-hair: #21262d;
-        --bts-div: #30363d;
+      .ats-arch {
+        --ats-bg: #0d1117;
+        --ats-line: #c9d1d9;
+        --ats-ink: #e6edf3;
+        --ats-ink-2: #adbac7;
+        --ats-ink-3: #909dab;
+        --ats-ink-4: #768390;
+        --ats-ink-5: #636e7b;
+        --ats-hair: #21262d;
+        --ats-div: #30363d;
       }
     }
-    .n-bg { fill: var(--bts-bg); }
-    .n-frame { fill: none; stroke: var(--bts-line); }
-    .n-st { stroke: var(--bts-line); }
-    .n-st-mute { stroke: var(--bts-ink-4); }
-    .n-st-hair { stroke: var(--bts-hair); }
-    .n-st-div { stroke: var(--bts-div); }
-    .n-ink { fill: var(--bts-ink); }
-    .n-ink2 { fill: var(--bts-ink-2); }
-    .n-ink3 { fill: var(--bts-ink-3); }
-    .n-ink4 { fill: var(--bts-ink-4); }
-    .n-ink5 { fill: var(--bts-ink-5); }
-    .n-mark { fill: var(--bts-line); }
-    .n-box { fill: none; stroke: var(--bts-line); }
-    .n-solid { fill: var(--bts-ink); stroke: var(--bts-line); }
-    .n-hollow { fill: none; stroke: var(--bts-line); }
+    .n-bg { fill: var(--ats-bg); }
+    .n-frame { fill: none; stroke: var(--ats-line); }
+    .n-st { stroke: var(--ats-line); }
+    .n-st-mute { stroke: var(--ats-ink-4); }
+    .n-st-hair { stroke: var(--ats-hair); }
+    .n-st-div { stroke: var(--ats-div); }
+    .n-ink { fill: var(--ats-ink); }
+    .n-ink2 { fill: var(--ats-ink-2); }
+    .n-ink3 { fill: var(--ats-ink-3); }
+    .n-ink4 { fill: var(--ats-ink-4); }
+    .n-ink5 { fill: var(--ats-ink-5); }
+    .n-mark { fill: var(--ats-line); }
+    .n-box { fill: none; stroke: var(--ats-line); }
+    .n-solid { fill: var(--ats-ink); stroke: var(--ats-line); }
+    .n-hollow { fill: none; stroke: var(--ats-line); }
   </style>
 
   <defs>
@@ -53,7 +53,7 @@
   <rect class="n-bg" x="0" y="0" width="1500" height="830"/>
   <rect class="n-frame" x="0.5" y="0.5" width="1499" height="829" stroke-width="1"/>
 
-  <text class="n-ink" x="60" y="64" font-size="20" font-weight="bold" letter-spacing="2">BTS · 后台任务调度器</text>
+  <text class="n-ink" x="60" y="64" font-size="20" font-weight="bold" letter-spacing="2">Agent 任务调度器</text>
   <text class="n-ink3" x="60" y="90" font-size="11">权限闸门 Permission Gate 与存活租约 Live Lease 安检模型</text>
   <text class="n-ink2" x="1440" y="64" font-size="11" text-anchor="end">Schedule → Plan → Stage → Step ≡ Task</text>
   <line class="n-st" x1="60" y1="110" x2="1440" y2="110" stroke-width="1"/>
@@ -73,7 +73,7 @@
     <circle cx="170" cy="400" r="50" stroke-width="2.6"/>
   </g>
   <circle class="n-solid" cx="170" cy="400" r="7" stroke-width="0"/>
-  <text class="n-ink" x="170" y="394" font-size="13" font-weight="bold" text-anchor="middle">BTS</text>
+  <text class="n-ink" x="170" y="394" font-size="13" font-weight="bold" text-anchor="middle">调度器</text>
   <text class="n-ink" x="170" y="412" font-size="11" text-anchor="middle">核心</text>
   <text class="n-ink" x="232" y="284" font-size="10" text-anchor="middle">策略上限 max_level · 硬边界</text>
   <text class="n-ink3" x="150" y="303" font-size="10" text-anchor="middle">存活租约 Live Lease</text>

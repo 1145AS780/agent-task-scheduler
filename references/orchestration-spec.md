@@ -1,6 +1,6 @@
-# 编排规格 — background-task-scheduler v2.9
+# 编排规格 — agent-task-scheduler v2.9
 
-本文是 Plan / Schedule 层的权威规格。实现以 `scripts/bts_plan.py` 为准；若文档与实现不一致，以脚本行为为准并修正文档。
+本文是 Plan / Schedule 层的权威规格。实现以 `scripts/ats_plan.py` 为准；若文档与实现不一致，以脚本行为为准并修正文档。
 
 ---
 
@@ -8,7 +8,7 @@
 
 | 能力 | 状态 | 版本 | 说明 |
 | --- | --- | --- | --- |
-| Task 创建/执行/停止/删除 | ✅ | 1.0 | `scripts/bts.py` |
+| Task 创建/执行/停止/删除 | ✅ | 1.0 | `scripts/ats.py` |
 | 异步启动 + 状态轮询 | ✅ | 1.0 | `run` 派生 supervise 进程；`check` 同步 |
 | 超时杀进程树 | ✅ | 1.0 | `timeout` 秒；`taskkill /T /F` |
 | L0-L3 分级 | ✅ | 2.0 | `permission_gate` |
@@ -247,7 +247,7 @@ plans/<plan_id>/stages/<stage_id>/steps/<step_id>/step.json
 | 局部重跑 | `task_rerun` | schedule |
 | 周期触发 | `schedule_triggered` | schedule |
 
-全局流通过 `bts.py events` 消费（游标存 `events_state.json`）；schedule 流可直接读文件，或看 `check_schedule` 返回。
+全局流通过 `ats.py events` 消费（游标存 `events_state.json`）；schedule 流可直接读文件，或看 `check_schedule` 返回。
 
 ---
 
@@ -255,25 +255,25 @@ plans/<plan_id>/stages/<stage_id>/steps/<step_id>/step.json
 
 | 意图 | 命令 | 返回要点 |
 | --- | --- | --- |
-| 建任务 | `bts.py create` | `task`、`created` |
-| 加载指令包 | `bts.py pack` | `pack_id`、`count`、`executed=false`、`tasks[]` |
-| 跑任务 | `bts.py run` | `supervisor_pid` 或终态；被拦时 `approval_id` |
-| 查任务 | `bts.py check/show/status` | `status`、`exit_code`、`next_poll` |
-| 停/删任务 | `bts.py stop/delete` | gate 结果、`approval_id` |
-| 批审批 | `bts.py approve` | `approvals[]`、`events[]` |
-| 看事件 | `bts.py events` | 增量事件 + `cursor` |
-| 看日志 | `bts.py logs` | 解析后的日志行 |
-| 看策略 | `bts.py policy` | 六个策略键 |
-| 提交计划 | `bts_plan.py submit_plan` | `plan_id`、`run_with` |
-| 执行计划 | `bts_plan.py run_plan` | `stages[]`、`counts`、`run_dir`；`--fail-fast` 可临时即停 |
-| 继续计划 | `bts_plan.py resume` | 同 run_plan；无审批时返回待批信息；`--fail-fast` 可临时即停 |
-| 周期驱动 | `bts_plan.py check_schedule` | `triggered`、`stalled`、`next_poll` |
-| 局部重跑 | `bts_plan.py rerun_task` | `rearmed_steps` |
-| 整体重跑 | `bts_plan.py rerun_plan` | `rearmed_steps` |
-| 恢复周期 | `bts_plan.py resume_schedule` | `next_run`、`current_plan_status` |
-| 审批清理 | `bts.py approval prune` | `removed[]` 或 `would_remove[]` |
-| 历史 | `bts_plan.py history` | `runs[]`（路径/状态/统计） |
-| 清理 | `bts_plan.py prune` | `removed[]` 或 `would_remove[]` |
+| 建任务 | `ats.py create` | `task`、`created` |
+| 加载指令包 | `ats.py pack` | `pack_id`、`count`、`executed=false`、`tasks[]` |
+| 跑任务 | `ats.py run` | `supervisor_pid` 或终态；被拦时 `approval_id` |
+| 查任务 | `ats.py check/show/status` | `status`、`exit_code`、`next_poll` |
+| 停/删任务 | `ats.py stop/delete` | gate 结果、`approval_id` |
+| 批审批 | `ats.py approve` | `approvals[]`、`events[]` |
+| 看事件 | `ats.py events` | 增量事件 + `cursor` |
+| 看日志 | `ats.py logs` | 解析后的日志行 |
+| 看策略 | `ats.py policy` | 六个策略键 |
+| 提交计划 | `ats_plan.py submit_plan` | `plan_id`、`run_with` |
+| 执行计划 | `ats_plan.py run_plan` | `stages[]`、`counts`、`run_dir`；`--fail-fast` 可临时即停 |
+| 继续计划 | `ats_plan.py resume` | 同 run_plan；无审批时返回待批信息；`--fail-fast` 可临时即停 |
+| 周期驱动 | `ats_plan.py check_schedule` | `triggered`、`stalled`、`next_poll` |
+| 局部重跑 | `ats_plan.py rerun_task` | `rearmed_steps` |
+| 整体重跑 | `ats_plan.py rerun_plan` | `rearmed_steps` |
+| 恢复周期 | `ats_plan.py resume_schedule` | `next_run`、`current_plan_status` |
+| 审批清理 | `ats.py approval prune` | `removed[]` 或 `would_remove[]` |
+| 历史 | `ats_plan.py history` | `runs[]`（路径/状态/统计） |
+| 清理 | `ats_plan.py prune` | `removed[]` 或 `would_remove[]` |
 
 ---
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""background-task-scheduler — Plan / Schedule 层执行器 (v2.7)
+"""agent-task-scheduler — Plan / Schedule 层执行器 (v2.7)
 
 命令：
   submit_plan --spec plan.json [--id ID]
@@ -56,7 +56,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import bts  # noqa: E402
+import ats  # noqa: E402
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -72,11 +72,11 @@ MAX_WAVES = 1000
 # ---------------------------------------------------------------- 通用
 
 def now_ts() -> int:
-    return bts.now_ts()
+    return ats.now_ts()
 
 
 def iso(ts=None) -> str:
-    return bts.iso(ts)
+    return ats.iso(ts)
 
 
 def iso_run(ts):
@@ -133,7 +133,7 @@ def all_plan_locations(root):
 def resolve_plan(root, ident):
     direct_sd = schedule_dir(root, ident)
     if (direct_sd / "schedule.json").exists():
-        schedule = bts.jread(direct_sd / "schedule.json", {}) or {}
+        schedule = ats.jread(direct_sd / "schedule.json", {}) or {}
         pid = schedule.get("current_plan")
         if pid:
             pdir = plan_dir(direct_sd, pid)
@@ -155,7 +155,7 @@ def resolve_schedule(root, ident):
 def emit(sdir, record):
     payload = {"ts": now_ts(), "iso": iso()}
     payload.update(record)
-    bts.append_event_line(Path(sdir) / "events.jsonl", payload)
+    ats.append_event_line(Path(sdir) / "events.jsonl", payload)
     return payload
 
 
@@ -165,7 +165,7 @@ def plan_log(root, plan, msg, **fields):
               "stage_id": fields.pop("stage_id", None),
               "step_id": fields.pop("step_id", None)}
     kwargs.update(fields)
-    return bts.log_event(root, msg, **kwargs)
+    return ats.log_event(root, msg, **kwargs)
 
 
 # ---------------------------------------------------------------- 依赖与拓扑
@@ -248,8 +248,8 @@ def validate_spec(spec):
             ids.add(step_id)
             if not step.get("command"):
                 errors.append("stage[%s].step[%s].command_required" % (stage_id, step_id))
-            level = str(step.get("level") or bts.DEFAULT_TASK_LEVEL).upper()
-            if level not in bts.LEVEL_RANK:
+            level = str(step.get("level") or ats.DEFAULT_TASK_LEVEL).upper()
+            if level not in ats.LEVEL_RANK:
                 errors.append("stage[%s].step[%s].level_invalid" % (stage_id, step_id))
             retry = step.get("retry", 0)
             if not isinstance(retry, int) or isinstance(retry, bool) or retry < 0:
@@ -290,25 +290,25 @@ def validate_spec(spec):
 # ---------------------------------------------------------------- 状态读写
 
 def load_plan(pdir):
-    return bts.jread(Path(pdir) / "plan.json")
+    return ats.jread(Path(pdir) / "plan.json")
 
 
 def save_plan(pdir, plan):
     plan["updated_at"] = now_ts()
-    return bts.jwrite(Path(pdir) / "plan.json", plan)
+    return ats.jwrite(Path(pdir) / "plan.json", plan)
 
 
 def load_stage(pdir, stage_id):
-    return bts.jread(stage_dir(pdir, stage_id) / "stage.json")
+    return ats.jread(stage_dir(pdir, stage_id) / "stage.json")
 
 
 def save_stage(pdir, stage_id, state):
     state["updated_at"] = now_ts()
-    return bts.jwrite(stage_dir(pdir, stage_id) / "stage.json", state)
+    return ats.jwrite(stage_dir(pdir, stage_id) / "stage.json", state)
 
 
 def load_step(pdir, stage_id, step_id):
-    data = bts.jread(step_dir(pdir, stage_id, step_id) / "step.json")
+    data = ats.jread(step_dir(pdir, stage_id, step_id) / "step.json")
     if data is None:
         return {"id": step_id, "status": "pending", "attempts": 0,
                 "stall_delivered": False, "approval_id": None}
@@ -317,7 +317,7 @@ def load_step(pdir, stage_id, step_id):
 
 def save_step(pdir, stage_id, step_id, state):
     state["updated_at"] = now_ts()
-    return bts.jwrite(step_dir(pdir, stage_id, step_id) / "step.json", state)
+    return ats.jwrite(step_dir(pdir, stage_id, step_id) / "step.json", state)
 
 
 def default_step_state(step):
@@ -345,7 +345,7 @@ def materialize_plan(root, sdir, spec, plan_id=None, attempt=1):
     pid = plan_id or spec.get("id") or ("p-" + uuid.uuid4().hex[:6])
     pdir = plan_dir(sdir, pid)
     pdir.mkdir(parents=True, exist_ok=True)
-    existing = bts.jread(pdir / "plan.json")
+    existing = ats.jread(pdir / "plan.json")
     if existing:
         stages = spec.get("stages") or existing.get("stages") or []
         plan = existing
@@ -369,7 +369,7 @@ def materialize_plan(root, sdir, spec, plan_id=None, attempt=1):
         save_plan(pdir, plan)
         emit(sdir, {"type": "plan_materialized", "plan_id": pid,
                     "attempt": int(attempt), "stages": [s.get("id") for s in plan["stages"]]})
-        bts.log_event(root, "plan_materialized", schedule_id=Path(sdir).name,
+        ats.log_event(root, "plan_materialized", schedule_id=Path(sdir).name,
                       plan_id=pid, attempt=int(attempt))
 
     for stage in plan.get("stages") or []:
@@ -377,7 +377,7 @@ def materialize_plan(root, sdir, spec, plan_id=None, attempt=1):
         st_dir = stage_dir(pdir, sid)
         st_dir.mkdir(parents=True, exist_ok=True)
         if not (st_dir / "stage.json").exists():
-            bts.jwrite(st_dir / "stage.json", {
+            ats.jwrite(st_dir / "stage.json", {
                 "id": sid,
                 "mode": stage.get("mode", "serial"),
                 "status": "pending",
@@ -389,7 +389,7 @@ def materialize_plan(root, sdir, spec, plan_id=None, attempt=1):
             sd = step_dir(pdir, sid, step.get("id"))
             sd.mkdir(parents=True, exist_ok=True)
             if not (sd / "step.json").exists():
-                bts.jwrite(sd / "step.json", default_step_state(step))
+                ats.jwrite(sd / "step.json", default_step_state(step))
     return pdir, plan
 
 
@@ -504,7 +504,7 @@ def finish_step(root, sdir, plan, handle):
         code = proc.wait(timeout=timeout if timeout > 0 else None)
     except subprocess.TimeoutExpired:
         timed_out = True
-        bts.kill_pid(proc.pid)
+        ats.kill_pid(proc.pid)
         try:
             code = proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -627,7 +627,7 @@ def finish_batch_fail_fast(root, sdir, plan, stage, batch, handles, fail_fast_al
                 pid = state.get("pid")
                 if not pid:
                     continue
-                bts.kill_pid(pid)
+                ats.kill_pid(pid)
                 _annotate(other_step.get("id"), pid)
 
     return results, abort.is_set()
@@ -641,7 +641,7 @@ def ensure_step_permission(root, plan, sdir, stage, step, approval):
     state = load_step(pdir, stage.get("id"), step.get("id"))
     command = step.get("command")
     context = {
-        "required_level": str(step.get("level") or bts.DEFAULT_TASK_LEVEL).upper(),
+        "required_level": str(step.get("level") or ats.DEFAULT_TASK_LEVEL).upper(),
         "source": "plan",
         "schedule_id": Path(sdir).name,
         "plan_id": plan.get("id"),
@@ -649,7 +649,7 @@ def ensure_step_permission(root, plan, sdir, stage, step, approval):
         "step_id": step.get("id"),
     }
     approval_id = state.get("approval_id") or approval
-    gate = bts.permission_gate(root, command, approval_id, context)
+    gate = ats.permission_gate(root, command, approval_id, context)
 
     if gate["allowed"]:
         if approval and not state.get("approval_id"):
@@ -673,13 +673,13 @@ def ensure_step_permission(root, plan, sdir, stage, step, approval):
         return "denied", gate
 
     # approval_required：缺失/过期时创建审批；pending 不重发（避免刷屏）
-    check = bts.approval_check(root, state.get("approval_id"), command)
+    check = ats.approval_check(root, state.get("approval_id"), command)
     if check["error"] in ("missing", "expired"):
         old = check.get("record")
         replaced = bool(old)
-        record = bts.create_approval(
+        record = ats.create_approval(
             root, command, gate["required_level"], context,
-            resume=("python bts_plan.py resume %s --approval <approval_id>"
+            resume=("python ats_plan.py resume %s --approval <approval_id>"
                     % Path(sdir).name),
         )
         state["approval_id"] = record["id"]
@@ -905,10 +905,10 @@ def write_run_snapshot(root, sdir, plan):
     run_dir = Path(sdir) / "runs" / name
     run_dir.mkdir(parents=True, exist_ok=True)
     summary = summarize_plan(pdir, plan)
-    bts.jwrite(run_dir / "summary.json", summary)
-    bts.jwrite(run_dir / "plan.json", plan)
-    schedule = bts.jread(Path(sdir) / "schedule.json", {}) or {}
-    bts.jwrite(run_dir / "schedule.json", schedule)
+    ats.jwrite(run_dir / "summary.json", summary)
+    ats.jwrite(run_dir / "plan.json", plan)
+    schedule = ats.jread(Path(sdir) / "schedule.json", {}) or {}
+    ats.jwrite(run_dir / "schedule.json", schedule)
     step_lines = []
     for record in summary["steps"]:
         step_lines.append(json.dumps(record, ensure_ascii=False))
@@ -920,7 +920,7 @@ def write_run_snapshot(root, sdir, plan):
                 "counts": summary["counts"]})
     plan_log(root, plan, "run_snapshot", attempt=attempt, path=str(run_dir),
              status=plan.get("status"))
-    keep = int(bts.policy(root).get("keep_runs_per_plan") or 0)
+    keep = int(ats.policy(root).get("keep_runs_per_plan") or 0)
     pruned = prune_runs(root, sdir, keep)
     return run_dir, summary, pruned
 
@@ -933,7 +933,7 @@ def group_runs(sdir):
     for run_dir in sorted(runs_dir.iterdir()):
         if not run_dir.is_dir():
             continue
-        summary = bts.jread(run_dir / "summary.json", {}) or {}
+        summary = ats.jread(run_dir / "summary.json", {}) or {}
         pid = summary.get("plan_id") or run_dir.name.rsplit("-a", 1)[0]
         groups.setdefault(pid, []).append((run_dir, summary))
     return groups
@@ -970,7 +970,7 @@ def prune_runs(root, sdir, keep):
     if removed:
         emit(sdir, {"type": "prune_runs", "schedule_id": Path(sdir).name,
                     "keep": int(keep), "removed": removed})
-        bts.log_event(root, "prune_runs", schedule_id=Path(sdir).name,
+        ats.log_event(root, "prune_runs", schedule_id=Path(sdir).name,
                       keep=int(keep), removed=len(removed))
     return removed
 
@@ -982,7 +982,7 @@ def log_quiet_seconds(root, plan, sdir):
     path = Path(root) / "scheduler.log"
     last = int(plan.get("started_at") or plan.get("created_at") or now_ts())
     if path.exists():
-        for rec in bts.read_jsonl(path):
+        for rec in ats.read_jsonl(path):
             if rec.get("plan_id") != plan.get("id"):
                 continue
             if rec.get("schedule_id") != Path(sdir).name:
@@ -1000,7 +1000,7 @@ def detect_plan_stalls(root, sdir, plan):
     两类都只发一次（step 用 stall_delivered，plan 用 plan_stall_delivered），
     避免轮询时反复投递同一事件。
     """
-    threshold = int(bts.policy(root).get("stall_seconds") or 0)
+    threshold = int(ats.policy(root).get("stall_seconds") or 0)
     if threshold <= 0:
         return []
     pdir = plan_dir(sdir, plan["id"])
@@ -1095,7 +1095,7 @@ def acquire_plan_lock(pdir):
             holder_pid = holder.get("pid")
             # 内容尚未写完（无 pid）按存活处理；只看持有者是否已死，锁龄不授权抢锁，
             # 否则长任务（>5min）会被第二个驱动者误判为崩溃残留
-            if not holder_pid or bts.pid_alive(holder_pid) or attempt == 2:
+            if not holder_pid or ats.pid_alive(holder_pid) or attempt == 2:
                 return None, {"reason": "run_lock_busy", "holder": holder, "age": age}
             try:
                 lock_path.unlink()          # 持有者已死：清理残留后重试一次
@@ -1121,11 +1121,11 @@ def run_plan(root, plan_id, approval=None, fail_fast=False):
     try:
         return _run_plan_locked(root, sdir, pdir, approval, fail_fast)
     finally:
-        bts.release_run_lock(lock_path)
+        ats.release_run_lock(lock_path)
 
 
 def _run_plan_locked(root, sdir, pdir, approval=None, fail_fast=False):
-    plan = bts.jread(pdir / "plan.json")
+    plan = ats.jread(pdir / "plan.json")
     prev = plan.get("status")
     if prev in ("done", "failed", "cancelled"):
         # 终态 Plan 不再执行：否则所有 Stage 返回 skipped，入口处的 running 会被收尾改写成 done
@@ -1161,7 +1161,7 @@ def _run_plan_locked(root, sdir, pdir, approval=None, fail_fast=False):
         if outcome == "paused":
             result["status"] = "paused"
             result["approval"] = extra.get("approval") if isinstance(extra, dict) else None
-            plan = bts.jread(pdir / "plan.json") or plan
+            plan = ats.jread(pdir / "plan.json") or plan
             return result, EXIT_OK
         if outcome == "failed":
             stop_all = (plan.get("on_stage_failure", "continue") == "stop"
@@ -1183,7 +1183,7 @@ def _run_plan_locked(root, sdir, pdir, approval=None, fail_fast=False):
                 break
             result["status"] = "partial"
 
-    plan = bts.jread(pdir / "plan.json") or plan
+    plan = ats.jread(pdir / "plan.json") or plan
     if result["status"] in ("partial", "failed"):
         plan["status"] = "failed"
     elif result["status"] == "running":
@@ -1210,7 +1210,7 @@ def _load_spec(path):
     p = Path(path)
     if not p.exists():
         return None, "spec_not_found"
-    data = bts.jread(p)
+    data = ats.jread(p)
     if not isinstance(data, dict):
         return None, "spec_invalid"
     return data, None
@@ -1219,15 +1219,15 @@ def _load_spec(path):
 def cmd_submit_plan(root, args):
     spec, err = _load_spec(args.spec)
     if err:
-        return bts.print_json({"error": err, "spec": args.spec}, EXIT_USAGE)
+        return ats.print_json({"error": err, "spec": args.spec}, EXIT_USAGE)
     errors = validate_spec(spec)
     if errors:
-        return bts.print_json({"error": "spec_invalid", "errors": errors}, EXIT_USAGE)
+        return ats.print_json({"error": "spec_invalid", "errors": errors}, EXIT_USAGE)
 
     sid = args.id or spec.get("id") or ("s-" + uuid.uuid4().hex[:6])
     sdir = schedule_dir(root, sid)
     if (sdir / "schedule.json").exists():
-        return bts.print_json({"error": "schedule_exists", "schedule_id": sid}, EXIT_CONFLICT)
+        return ats.print_json({"error": "schedule_exists", "schedule_id": sid}, EXIT_CONFLICT)
     sdir.mkdir(parents=True, exist_ok=True)
     schedule = {
         "id": sid,
@@ -1244,51 +1244,51 @@ def cmd_submit_plan(root, args):
         "created_at": now_ts(),
         "created_iso": iso(),
     }
-    bts.jwrite(sdir / "schedule.json", schedule)
+    ats.jwrite(sdir / "schedule.json", schedule)
     emit(sdir, {"type": "schedule_created", "schedule_id": sid,
                 "kind": "oneshot", "title": spec.get("title")})
-    bts.log_event(root, "schedule_created", schedule_id=sid, kind="oneshot")
+    ats.log_event(root, "schedule_created", schedule_id=sid, kind="oneshot")
 
     pid = "%s-a1" % sid
     pdir, plan = materialize_plan(root, sdir, spec, plan_id=pid, attempt=1)
     schedule["current_plan"] = pid
     schedule["runs"] = 1
-    bts.jwrite(sdir / "schedule.json", schedule)
-    return bts.print_json({"schedule_id": sid, "plan_id": pid, "plan_dir": str(pdir),
+    ats.jwrite(sdir / "schedule.json", schedule)
+    return ats.print_json({"schedule_id": sid, "plan_id": pid, "plan_dir": str(pdir),
                            "status": "pending",
-                           "run_with": "python bts_plan.py run_plan %s" % pid})
+                           "run_with": "python ats_plan.py run_plan %s" % pid})
 
 
 def cmd_submit_schedule(root, args):
     spec, err = _load_spec(args.spec)
     if err:
-        return bts.print_json({"error": err, "spec": args.spec}, EXIT_USAGE)
+        return ats.print_json({"error": err, "spec": args.spec}, EXIT_USAGE)
     plan_ref = spec.get("plan")
     if not plan_ref:
-        return bts.print_json({"error": "missing_plan_spec"}, EXIT_USAGE)
+        return ats.print_json({"error": "missing_plan_spec"}, EXIT_USAGE)
     plan_spec, perr = _load_spec(plan_ref)
     if perr:
-        return bts.print_json({"error": "plan_%s" % perr, "plan": plan_ref}, EXIT_USAGE)
+        return ats.print_json({"error": "plan_%s" % perr, "plan": plan_ref}, EXIT_USAGE)
     errors = validate_spec(plan_spec)
     if errors:
-        return bts.print_json({"error": "spec_invalid", "errors": errors}, EXIT_USAGE)
+        return ats.print_json({"error": "spec_invalid", "errors": errors}, EXIT_USAGE)
     every = spec.get("every")
     if not isinstance(every, int) or isinstance(every, bool) or every <= 0:
-        return bts.print_json({"error": "every_invalid"}, EXIT_USAGE)
+        return ats.print_json({"error": "every_invalid"}, EXIT_USAGE)
     max_runs = spec.get("max_runs")
     if max_runs is not None and (not isinstance(max_runs, int) or max_runs <= 0):
-        return bts.print_json({"error": "max_runs_invalid"}, EXIT_USAGE)
+        return ats.print_json({"error": "max_runs_invalid"}, EXIT_USAGE)
 
     sid = args.id or spec.get("id") or ("s-" + uuid.uuid4().hex[:6])
     sdir = schedule_dir(root, sid)
     if (sdir / "schedule.json").exists():
-        return bts.print_json({"error": "schedule_exists", "schedule_id": sid}, EXIT_CONFLICT)
+        return ats.print_json({"error": "schedule_exists", "schedule_id": sid}, EXIT_CONFLICT)
     sdir.mkdir(parents=True, exist_ok=True)
     start_at = spec.get("start_at")
     try:
         next_run = int(start_at) if start_at is not None else now_ts() + every
     except (TypeError, ValueError):
-        return bts.print_json({"error": "start_at_invalid"}, EXIT_USAGE)
+        return ats.print_json({"error": "start_at_invalid"}, EXIT_USAGE)
     schedule = {
         "id": sid,
         "type": "recurring",
@@ -1307,14 +1307,14 @@ def cmd_submit_schedule(root, args):
         "created_iso": iso(),
         "next_run_iso": iso_run(next_run),
     }
-    bts.jwrite(sdir / "schedule.json", schedule)
+    ats.jwrite(sdir / "schedule.json", schedule)
     emit(sdir, {"type": "schedule_created", "schedule_id": sid, "kind": "recurring",
                 "every": every, "next_run": next_run})
-    bts.log_event(root, "schedule_created", schedule_id=sid, kind="recurring",
+    ats.log_event(root, "schedule_created", schedule_id=sid, kind="recurring",
                   every=every)
-    return bts.print_json({"schedule_id": sid, "every": every,
+    return ats.print_json({"schedule_id": sid, "every": every,
                            "next_run": next_run, "next_run_iso": iso_run(next_run),
-                           "drive_with": "python bts_plan.py check_schedule %s" % sid})
+                           "drive_with": "python ats_plan.py check_schedule %s" % sid})
 
 
 def _trigger_schedule(root, sdir, schedule):
@@ -1334,20 +1334,20 @@ def _trigger_schedule(root, sdir, schedule):
         schedule["status"] = "done"
         schedule["next_run"] = None
         schedule["next_run_iso"] = None
-    bts.jwrite(sdir / "schedule.json", schedule)
+    ats.jwrite(sdir / "schedule.json", schedule)
     try:
         pdir, plan = materialize_plan(root, sdir, spec, plan_id=pid, attempt=attempt)
     except Exception as exc:
         schedule.clear()
         schedule.update(prev)             # 回滚，避免 runs 比实际执行次数多 1
-        bts.jwrite(sdir / "schedule.json", schedule)
-        bts.log_event(root, "schedule_materialize_failed", schedule_id=schedule.get("id"),
+        ats.jwrite(sdir / "schedule.json", schedule)
+        ats.log_event(root, "schedule_materialize_failed", schedule_id=schedule.get("id"),
                       attempt=attempt, error=str(exc))
         raise
     emit(sdir, {"type": "schedule_triggered", "schedule_id": schedule["id"],
                 "plan_id": pid, "attempt": attempt,
                 "next_run": schedule.get("next_run")})
-    bts.log_event(root, "schedule_triggered", schedule_id=schedule["id"],
+    ats.log_event(root, "schedule_triggered", schedule_id=schedule["id"],
                   plan_id=pid, attempt=attempt)
     return pid
 
@@ -1355,20 +1355,20 @@ def _trigger_schedule(root, sdir, schedule):
 def cmd_run_plan(root, args):
     result, code = run_plan(root, args.plan_id, args.approval,
                             fail_fast=getattr(args, "fail_fast", False))
-    return bts.print_json(result, code)
+    return ats.print_json(result, code)
 
 
 def cmd_resume(root, args):
     sdir, pdir = resolve_plan(root, args.ident)
     if not sdir:
-        return bts.print_json({"error": "not_found", "ident": args.ident}, EXIT_CONFLICT)
-    plan = bts.jread(pdir / "plan.json")
+        return ats.print_json({"error": "not_found", "ident": args.ident}, EXIT_CONFLICT)
+    plan = ats.jread(pdir / "plan.json")
     if plan.get("status") == "done":
-        return bts.print_json({"error": "plan_done", "plan_id": plan["id"]}, EXIT_CONFLICT)
+        return ats.print_json({"error": "plan_done", "plan_id": plan["id"]}, EXIT_CONFLICT)
     if plan.get("status") == "paused" and not args.approval:
-        state = bts.jread(pdir / "stages" / plan.get("paused_stage") / "steps"
+        state = ats.jread(pdir / "stages" / plan.get("paused_stage") / "steps"
                           / plan.get("paused_step") / "step.json", {}) or {}
-        return bts.print_json({
+        return ats.print_json({
             "status": "paused",
             "plan_id": plan["id"],
             "stage_id": plan.get("paused_stage"),
@@ -1378,15 +1378,15 @@ def cmd_resume(root, args):
         })
     result, code = run_plan(root, plan["id"], args.approval,
                             fail_fast=getattr(args, "fail_fast", False))
-    return bts.print_json(result, code)
+    return ats.print_json(result, code)
 
 
 def cmd_check_schedule(root, args):
     sdir = resolve_schedule(root, args.schedule_id)
     if not sdir:
-        return bts.print_json({"error": "not_found", "schedule_id": args.schedule_id},
+        return ats.print_json({"error": "not_found", "schedule_id": args.schedule_id},
                               EXIT_CONFLICT)
-    schedule = bts.jread(sdir / "schedule.json", {}) or {}
+    schedule = ats.jread(sdir / "schedule.json", {}) or {}
     payload = {"schedule_id": schedule.get("id"), "status": schedule.get("status"),
                "runs": schedule.get("runs"), "next_run": schedule.get("next_run"),
                "next_run_iso": iso_run(schedule.get("next_run")),
@@ -1395,7 +1395,7 @@ def cmd_check_schedule(root, args):
     if schedule.get("status") == "active" and schedule.get("next_run") is not None \
             and now_ts() >= int(schedule["next_run"]):
         pid = _trigger_schedule(root, sdir, schedule)
-        schedule = bts.jread(sdir / "schedule.json", {}) or schedule
+        schedule = ats.jread(sdir / "schedule.json", {}) or schedule
         payload["triggered"].append(pid)
         payload["runs"] = schedule.get("runs")
         payload["next_run"] = schedule.get("next_run")
@@ -1404,19 +1404,19 @@ def cmd_check_schedule(root, args):
         payload["plan"] = result
         if result.get("status") == "paused":
             schedule["status"] = "paused"
-            bts.jwrite(sdir / "schedule.json", schedule)
+            ats.jwrite(sdir / "schedule.json", schedule)
             payload["status"] = "paused"
-        schedule = bts.jread(sdir / "schedule.json", {}) or schedule
+        schedule = ats.jread(sdir / "schedule.json", {}) or schedule
 
     stalls = []
     for pdir in sorted((sdir / "plans").glob("*")) if (sdir / "plans").exists() else []:
-        plan = bts.jread(pdir / "plan.json")
+        plan = ats.jread(pdir / "plan.json")
         if not plan:
             continue
         stalls.extend(detect_plan_stalls(root, sdir, plan))
     payload["stalled"] = stalls
 
-    schedule = bts.jread(sdir / "schedule.json", {}) or schedule
+    schedule = ats.jread(sdir / "schedule.json", {}) or schedule
     if schedule.get("status") == "active":
         nxt = schedule.get("next_run")
         if nxt is None:
@@ -1433,49 +1433,49 @@ def cmd_check_schedule(root, args):
         payload["next_poll"] = 0
     if stalls:
         payload["next_poll"] = POLL_STALLED
-    return bts.print_json(payload)
+    return ats.print_json(payload)
 
 
 def cmd_pause(root, args):
     sdir = resolve_schedule(root, args.schedule_id)
     if not sdir:
-        return bts.print_json({"error": "not_found", "schedule_id": args.schedule_id},
+        return ats.print_json({"error": "not_found", "schedule_id": args.schedule_id},
                               EXIT_CONFLICT)
-    schedule = bts.jread(sdir / "schedule.json", {}) or {}
+    schedule = ats.jread(sdir / "schedule.json", {}) or {}
     if schedule.get("status") != "active":
-        return bts.print_json({"error": "state_conflict", "status": schedule.get("status")},
+        return ats.print_json({"error": "state_conflict", "status": schedule.get("status")},
                               EXIT_CONFLICT)
-    gate = bts.gate_operation(root, "L1", "pause %s" % schedule["id"], args.approval,
+    gate = ats.gate_operation(root, "L1", "pause %s" % schedule["id"], args.approval,
                               {"schedule_id": schedule["id"], "source": "pause",
-                               "resume": "python bts_plan.py pause %s --approval <approval_id>"
+                               "resume": "python ats_plan.py pause %s --approval <approval_id>"
                                          % schedule["id"]})
     if not gate.get("allowed"):
-        return bts.print_json(gate, EXIT_DENIED)
+        return ats.print_json(gate, EXIT_DENIED)
     schedule["status"] = "paused"
     schedule["paused_at"] = now_ts()
-    bts.jwrite(sdir / "schedule.json", schedule)
+    ats.jwrite(sdir / "schedule.json", schedule)
     emit(sdir, {"type": "schedule_paused", "schedule_id": schedule["id"]})
-    bts.log_event(root, "schedule_paused", schedule_id=schedule["id"])
-    return bts.print_json({"schedule_id": schedule["id"], "status": "paused"})
+    ats.log_event(root, "schedule_paused", schedule_id=schedule["id"])
+    return ats.print_json({"schedule_id": schedule["id"], "status": "paused"})
 
 
 def cmd_resume_schedule(root, args):
     sdir = resolve_schedule(root, args.schedule_id)
     if not sdir:
-        return bts.print_json({"error": "not_found", "schedule_id": args.schedule_id},
+        return ats.print_json({"error": "not_found", "schedule_id": args.schedule_id},
                               EXIT_CONFLICT)
-    schedule = bts.jread(sdir / "schedule.json", {}) or {}
+    schedule = ats.jread(sdir / "schedule.json", {}) or {}
     if schedule.get("status") != "paused":
-        return bts.print_json({"error": "state_conflict", "schedule_id": schedule.get("id"),
+        return ats.print_json({"error": "state_conflict", "schedule_id": schedule.get("id"),
                                "status": schedule.get("status"),
                                "hint": "只有 paused 的 Schedule 可以 resume_schedule"},
                               EXIT_CONFLICT)
-    gate = bts.gate_operation(root, "L1", "resume_schedule %s" % schedule["id"], args.approval,
+    gate = ats.gate_operation(root, "L1", "resume_schedule %s" % schedule["id"], args.approval,
                               {"schedule_id": schedule["id"], "source": "resume_schedule",
-                               "resume": "python bts_plan.py resume_schedule %s --approval <approval_id>"
+                               "resume": "python ats_plan.py resume_schedule %s --approval <approval_id>"
                                          % schedule["id"]})
     if not gate.get("allowed"):
-        return bts.print_json(gate, EXIT_DENIED)
+        return ats.print_json(gate, EXIT_DENIED)
 
     now = now_ts()
     schedule["status"] = "active"
@@ -1484,14 +1484,14 @@ def cmd_resume_schedule(root, args):
         # 暂停期间 next_run 可能已被清空；按周期补一个，避免恢复后永不触发
         schedule["next_run"] = now + int(schedule.get("every") or 0)
         schedule["next_run_iso"] = iso_run(schedule["next_run"])
-    bts.jwrite(sdir / "schedule.json", schedule)
+    ats.jwrite(sdir / "schedule.json", schedule)
 
     current = {}
     if schedule.get("current_plan"):
-        current = bts.jread(plan_dir(sdir, schedule["current_plan"]) / "plan.json", {}) or {}
+        current = ats.jread(plan_dir(sdir, schedule["current_plan"]) / "plan.json", {}) or {}
     emit(sdir, {"type": "schedule_resumed", "schedule_id": schedule["id"],
                 "next_run": schedule.get("next_run")})
-    bts.log_event(root, "schedule_resumed", schedule_id=schedule["id"],
+    ats.log_event(root, "schedule_resumed", schedule_id=schedule["id"],
                   next_run=schedule.get("next_run"))
     payload = {"schedule_id": schedule["id"], "status": "active",
                "next_run": schedule.get("next_run"),
@@ -1501,27 +1501,27 @@ def cmd_resume_schedule(root, args):
                "gate": gate.get("reason")}
     if current.get("status") == "paused":
         payload["warning"] = "current_plan 仍 paused：需先 approve 并 resume 该 Plan，或 rerun_plan 重置"
-    return bts.print_json(payload)
+    return ats.print_json(payload)
 
 
 def cmd_cancel(root, args):
     sdir = resolve_schedule(root, args.schedule_id)
     if not sdir:
-        return bts.print_json({"error": "not_found", "schedule_id": args.schedule_id},
+        return ats.print_json({"error": "not_found", "schedule_id": args.schedule_id},
                               EXIT_CONFLICT)
-    schedule = bts.jread(sdir / "schedule.json", {}) or {}
+    schedule = ats.jread(sdir / "schedule.json", {}) or {}
     if schedule.get("status") == "cancelled":
-        return bts.print_json({"error": "already_cancelled"}, EXIT_CONFLICT)
-    gate = bts.gate_operation(root, "L2", "cancel %s" % schedule["id"], args.approval,
+        return ats.print_json({"error": "already_cancelled"}, EXIT_CONFLICT)
+    gate = ats.gate_operation(root, "L2", "cancel %s" % schedule["id"], args.approval,
                               {"schedule_id": schedule["id"], "source": "cancel",
-                               "resume": "python bts_plan.py cancel %s --approval <approval_id>"
+                               "resume": "python ats_plan.py cancel %s --approval <approval_id>"
                                          % schedule["id"]})
     if not gate.get("allowed"):
-        return bts.print_json(gate, EXIT_DENIED)
+        return ats.print_json(gate, EXIT_DENIED)
 
     cancelled_steps = []
     for pdir in sorted((sdir / "plans").glob("*")) if (sdir / "plans").exists() else []:
-        plan = bts.jread(pdir / "plan.json")
+        plan = ats.jread(pdir / "plan.json")
         if not plan or plan.get("status") in ("done", "failed"):
             continue
         for stage in plan.get("stages") or []:
@@ -1541,44 +1541,44 @@ def cmd_cancel(root, args):
     schedule["status"] = "cancelled"
     schedule["cancelled_at"] = now_ts()
     schedule["next_run"] = None
-    bts.jwrite(sdir / "schedule.json", schedule)
+    ats.jwrite(sdir / "schedule.json", schedule)
     emit(sdir, {"type": "schedule_cancelled", "schedule_id": schedule["id"],
                 "skipped_steps": cancelled_steps})
-    bts.log_event(root, "schedule_cancelled", schedule_id=schedule["id"],
+    ats.log_event(root, "schedule_cancelled", schedule_id=schedule["id"],
                   skipped_steps=len(cancelled_steps))
-    return bts.print_json({"schedule_id": schedule["id"], "status": "cancelled",
+    return ats.print_json({"schedule_id": schedule["id"], "status": "cancelled",
                            "skipped_steps": cancelled_steps, "gate": gate.get("reason")})
 
 
 def cmd_rerun_task(root, args):
     sdir = resolve_schedule(root, args.schedule_id)
     if not sdir:
-        return bts.print_json({"error": "not_found", "schedule_id": args.schedule_id},
+        return ats.print_json({"error": "not_found", "schedule_id": args.schedule_id},
                               EXIT_CONFLICT)
-    schedule = bts.jread(sdir / "schedule.json", {}) or {}
-    plan = bts.jread(plan_dir(sdir, schedule.get("current_plan")) / "plan.json")
+    schedule = ats.jread(sdir / "schedule.json", {}) or {}
+    plan = ats.jread(plan_dir(sdir, schedule.get("current_plan")) / "plan.json")
     if not plan:
-        return bts.print_json({"error": "no_current_plan"}, EXIT_CONFLICT)
+        return ats.print_json({"error": "no_current_plan"}, EXIT_CONFLICT)
     stage = next((s for s in plan.get("stages") or [] if s.get("id") == args.stage_id), None)
     if not stage:
-        return bts.print_json({"error": "stage_not_found", "stage_id": args.stage_id},
+        return ats.print_json({"error": "stage_not_found", "stage_id": args.stage_id},
                               EXIT_CONFLICT)
     step = find_step(stage, args.step_id)
     if not step:
-        return bts.print_json({"error": "step_not_found", "step_id": args.step_id},
+        return ats.print_json({"error": "step_not_found", "step_id": args.step_id},
                               EXIT_CONFLICT)
 
-    gate = bts.gate_operation(root, "L1",
+    gate = ats.gate_operation(root, "L1",
                               "rerun %s/%s/%s" % (schedule["id"], args.stage_id,
                                                   args.step_id),
                               args.approval,
                               {"schedule_id": schedule["id"], "plan_id": plan["id"],
                                "stage_id": args.stage_id, "step_id": args.step_id,
                                "source": "rerun",
-                               "resume": "python bts_plan.py rerun_task %s %s %s --approval <approval_id>"
+                               "resume": "python ats_plan.py rerun_task %s %s %s --approval <approval_id>"
                                          % (schedule["id"], args.stage_id, args.step_id)})
     if not gate.get("allowed"):
-        return bts.print_json(gate, EXIT_DENIED)
+        return ats.print_json(gate, EXIT_DENIED)
 
     pdir = plan_dir(sdir, plan["id"])
     state = load_step(pdir, args.stage_id, args.step_id)
@@ -1611,9 +1611,9 @@ def cmd_rerun_task(root, args):
     emit(sdir, {"type": "task_rerun", "schedule_id": schedule["id"],
                 "plan_id": plan["id"], "stage_id": args.stage_id,
                 "step_id": args.step_id, "rearmed_steps": rearmed})
-    bts.log_event(root, "task_rerun", schedule_id=schedule["id"], plan_id=plan["id"],
+    ats.log_event(root, "task_rerun", schedule_id=schedule["id"], plan_id=plan["id"],
                   stage_id=args.stage_id, step_id=args.step_id)
-    return bts.print_json({"schedule_id": schedule["id"], "plan_id": plan["id"],
+    return ats.print_json({"schedule_id": schedule["id"], "plan_id": plan["id"],
                            "stage_id": args.stage_id, "step_id": args.step_id,
                            "status": "pending", "rearmed_steps": rearmed})
 
@@ -1621,25 +1621,25 @@ def cmd_rerun_task(root, args):
 def cmd_rerun_plan(root, args):
     sdir, pdir = resolve_plan(root, args.plan_id)
     if not sdir:
-        return bts.print_json({"error": "not_found", "plan_id": args.plan_id},
+        return ats.print_json({"error": "not_found", "plan_id": args.plan_id},
                               EXIT_CONFLICT)
-    plan = bts.jread(pdir / "plan.json")
+    plan = ats.jread(pdir / "plan.json")
     if not plan:
-        return bts.print_json({"error": "not_found", "plan_id": args.plan_id},
+        return ats.print_json({"error": "not_found", "plan_id": args.plan_id},
                               EXIT_CONFLICT)
     lock_path, lock_err = acquire_plan_lock(pdir)
     if lock_err:
-        return bts.print_json({"error": "run_lock_busy", "plan_id": plan.get("id"),
+        return ats.print_json({"error": "run_lock_busy", "plan_id": plan.get("id"),
                                "lock": lock_err,
                                "hint": "该 Plan 正在执行，等待结束后再重置"}, EXIT_CONFLICT)
     try:
-        gate = bts.gate_operation(root, "L1", "rerun_plan %s" % plan["id"], args.approval,
+        gate = ats.gate_operation(root, "L1", "rerun_plan %s" % plan["id"], args.approval,
                                   {"schedule_id": Path(sdir).name, "plan_id": plan["id"],
                                    "source": "rerun_plan",
-                                   "resume": "python bts_plan.py rerun_plan %s --approval <approval_id>"
+                                   "resume": "python ats_plan.py rerun_plan %s --approval <approval_id>"
                                              % plan["id"]})
         if not gate.get("allowed"):
-            return bts.print_json(gate, EXIT_DENIED)
+            return ats.print_json(gate, EXIT_DENIED)
 
         plan["status"] = "pending"
         plan["started_at"] = None
@@ -1668,10 +1668,10 @@ def cmd_rerun_plan(root, args):
                 save_step(pdir, stage.get("id"), step.get("id"), state)
                 rearmed += 1
 
-        schedule = bts.jread(Path(sdir) / "schedule.json", {}) or {}
+        schedule = ats.jread(Path(sdir) / "schedule.json", {}) or {}
         emit(sdir, {"type": "plan_rerun", "schedule_id": Path(sdir).name,
                     "plan_id": plan["id"], "rearmed_steps": rearmed})
-        bts.log_event(root, "plan_rerun", schedule_id=Path(sdir).name,
+        ats.log_event(root, "plan_rerun", schedule_id=Path(sdir).name,
                       plan_id=plan["id"], rearmed_steps=rearmed)
         payload = {"schedule_id": Path(sdir).name, "plan_id": plan["id"],
                    "status": "pending", "rearmed_steps": rearmed,
@@ -1680,9 +1680,9 @@ def cmd_rerun_plan(root, args):
         if schedule.get("status") not in (None, "active"):
             payload["warning"] = "schedule 状态为 %s；周期触发需先 resume_schedule %s" \
                                  % (schedule.get("status"), Path(sdir).name)
-        return bts.print_json(payload)
+        return ats.print_json(payload)
     finally:
-        bts.release_run_lock(lock_path)
+        ats.release_run_lock(lock_path)
 
 
 # ---------------------------------------------------------------- 查看与维护
@@ -1690,10 +1690,10 @@ def cmd_rerun_plan(root, args):
 def cmd_list(root, args):
     rows = []
     for sdir in sorted(schedules_dir(root).glob("*")) if schedules_dir(root).exists() else []:
-        schedule = bts.jread(sdir / "schedule.json")
+        schedule = ats.jread(sdir / "schedule.json")
         if not schedule:
             continue
-        plan = bts.jread(plan_dir(sdir, schedule.get("current_plan")) / "plan.json", {}) or {}
+        plan = ats.jread(plan_dir(sdir, schedule.get("current_plan")) / "plan.json", {}) or {}
         counts = {}
         if plan:
             pdir = plan_dir(sdir, plan.get("id"))
@@ -1714,7 +1714,7 @@ def cmd_list(root, args):
             "counts": counts,
         })
     if args.json:
-        return bts.print_json({"schedules": rows, "count": len(rows)})
+        return ats.print_json({"schedules": rows, "count": len(rows)})
     if not rows:
         print("no schedules")
         return EXIT_OK
@@ -1733,18 +1733,18 @@ def cmd_show(root, args):
     if not sdir:
         sdir = resolve_schedule(root, args.ident)
         if not sdir:
-            return bts.print_json({"error": "not_found", "ident": args.ident}, EXIT_CONFLICT)
-    schedule = bts.jread(sdir / "schedule.json", {}) or {}
+            return ats.print_json({"error": "not_found", "ident": args.ident}, EXIT_CONFLICT)
+    schedule = ats.jread(sdir / "schedule.json", {}) or {}
     if not pdir or args.ident == schedule.get("id"):
         pid = schedule.get("current_plan")
         pdir = plan_dir(sdir, pid) if pid else None
     payload = {"schedule": schedule}
     if pdir and (pdir / "plan.json").exists():
-        plan = bts.jread(pdir / "plan.json")
+        plan = ats.jread(pdir / "plan.json")
         payload["plan"] = plan
         payload["summary"] = summarize_plan(pdir, plan)
     if args.json:
-        return bts.print_json(payload)
+        return ats.print_json(payload)
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return EXIT_OK
 
@@ -1756,20 +1756,20 @@ def cmd_delete(root, args):
         sdir = resolve_schedule(root, args.ident)
         target_kind = "schedule"
     if not sdir:
-        return bts.print_json({"error": "not_found", "ident": args.ident}, EXIT_CONFLICT)
+        return ats.print_json({"error": "not_found", "ident": args.ident}, EXIT_CONFLICT)
 
-    schedule = bts.jread(sdir / "schedule.json", {}) or {}
-    gate = bts.gate_operation(root, "L2", "delete %s" % args.ident, args.approval,
+    schedule = ats.jread(sdir / "schedule.json", {}) or {}
+    gate = ats.gate_operation(root, "L2", "delete %s" % args.ident, args.approval,
                               {"schedule_id": schedule.get("id"), "source": "delete",
-                               "resume": "python bts_plan.py delete %s --approval <approval_id>"
+                               "resume": "python ats_plan.py delete %s --approval <approval_id>"
                                          % args.ident})
     if not gate.get("allowed"):
-        return bts.print_json(gate, EXIT_DENIED)
+        return ats.print_json(gate, EXIT_DENIED)
 
     if target_kind == "plan" and pdir:
-        plan = bts.jread(pdir / "plan.json", {}) or {}
+        plan = ats.jread(pdir / "plan.json", {}) or {}
         if plan.get("status") == "running":
-            return bts.print_json({"error": "state_conflict", "status": "running"},
+            return ats.print_json({"error": "state_conflict", "status": "running"},
                                   EXIT_CONFLICT)
         for child in sorted(Path(pdir).rglob("*"), reverse=True):
             try:
@@ -1780,14 +1780,14 @@ def cmd_delete(root, args):
             Path(pdir).rmdir()
         except OSError:
             pass
-        bts.log_event(root, "plan_deleted", schedule_id=schedule.get("id"),
+        ats.log_event(root, "plan_deleted", schedule_id=schedule.get("id"),
                       plan_id=args.ident)
-        return bts.print_json({"deleted": True, "kind": "plan", "plan_id": args.ident})
+        return ats.print_json({"deleted": True, "kind": "plan", "plan_id": args.ident})
 
     if schedule.get("status") in ("active", "paused"):
         schedule["status"] = "cancelled"
         schedule["next_run"] = None
-        bts.jwrite(sdir / "schedule.json", schedule)
+        ats.jwrite(sdir / "schedule.json", schedule)
     for child in sorted(Path(sdir).rglob("*"), reverse=True):
         try:
             child.rmdir() if child.is_dir() else child.unlink()
@@ -1797,17 +1797,17 @@ def cmd_delete(root, args):
         Path(sdir).rmdir()
     except OSError:
         pass
-    bts.log_event(root, "schedule_deleted", schedule_id=args.ident)
-    return bts.print_json({"deleted": True, "kind": "schedule",
+    ats.log_event(root, "schedule_deleted", schedule_id=args.ident)
+    return ats.print_json({"deleted": True, "kind": "schedule",
                            "schedule_id": args.ident})
 
 
 def cmd_history(root, args):
     sdir = resolve_schedule(root, args.schedule_id)
     if not sdir:
-        return bts.print_json({"error": "not_found", "schedule_id": args.schedule_id},
+        return ats.print_json({"error": "not_found", "schedule_id": args.schedule_id},
                               EXIT_CONFLICT)
-    keep = int(bts.policy(root).get("keep_runs_per_plan") or 0)
+    keep = int(ats.policy(root).get("keep_runs_per_plan") or 0)
     runs = []
     for pid, entries in group_runs(sdir).items():
         if args.plan and pid != args.plan:
@@ -1827,15 +1827,15 @@ def cmd_history(root, args):
                "keep_runs_per_plan": keep}
     if args.logs:
         path = Path(root) / "scheduler.log"
-        records = [r for r in bts.read_jsonl(path)
+        records = [r for r in ats.read_jsonl(path)
                    if r.get("schedule_id") == args.schedule_id]
         payload["logs"] = records[-args.lines:] if args.lines > 0 else records
-    return bts.print_json(payload)
+    return ats.print_json(payload)
 
 
 def cmd_prune(root, args):
     keep = args.keep if args.keep is not None \
-        else int(bts.policy(root).get("keep_runs_per_plan") or 0)
+        else int(ats.policy(root).get("keep_runs_per_plan") or 0)
     targets = []
     for sdir in sorted(schedules_dir(root).glob("*")) if schedules_dir(root).exists() else []:
         if not (sdir / "schedule.json").exists():
@@ -1845,14 +1845,14 @@ def cmd_prune(root, args):
                         "would_remove": [str(p) for p in pending]})
     if args.dry_run:
         total = sum(len(t["would_remove"]) for t in targets)
-        return bts.print_json({"dry_run": True, "keep": keep,
+        return ats.print_json({"dry_run": True, "keep": keep,
                                "schedules": targets, "count": total})
     removed = []
     for sdir in sorted(schedules_dir(root).glob("*")) if schedules_dir(root).exists() else []:
         if not (sdir / "schedule.json").exists():
             continue
         removed.extend(prune_runs(root, sdir, keep))
-    return bts.print_json({"dry_run": False, "keep": keep, "removed": removed,
+    return ats.print_json({"dry_run": False, "keep": keep, "removed": removed,
                            "count": len(removed)})
 
 
@@ -1860,10 +1860,10 @@ def cmd_prune(root, args):
 
 def build_parser():
     ap = argparse.ArgumentParser(
-        prog="bts_plan.py",
-        description="background-task-scheduler — Plan / Schedule 层执行器 (v2.7)",
+        prog="ats_plan.py",
+        description="agent-task-scheduler — Plan / Schedule 层执行器 (v2.7)",
     )
-    ap.add_argument("--root", default=None, help="BTS_ROOT，默认 <cwd>/.bts")
+    ap.add_argument("--root", default=None, help="ATS_ROOT，默认 <cwd>/.ats")
     sub = ap.add_subparsers(dest="command_name")
 
     p = sub.add_parser("submit_plan", help="提交一次性计划")
@@ -1960,7 +1960,7 @@ def main(argv=None):
     if not args.command_name:
         parser.print_help()
         return EXIT_USAGE
-    root = bts.bts_root(args.root)
+    root = ats.ats_root(args.root)
     handler = HANDLERS[args.command_name]
     return handler(root, args) or EXIT_OK
 

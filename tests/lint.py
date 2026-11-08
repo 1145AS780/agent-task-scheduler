@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BTS 静态检查：只做零误报的约定校验，零第三方依赖。
+"""ATS 静态检查：只做零误报的约定校验，零第三方依赖。
 
 检查项：
   1. 所有 Python 文件可编译（语法错误直接拦下）
@@ -33,7 +33,7 @@ def py_files():
 
 
 def check_compiles(files):
-    with tempfile.TemporaryDirectory(prefix="bts-lint-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="ats-lint-") as tmp:
         for f in files:
             cfile = Path(tmp) / (f.stem + ".pyc")
             try:

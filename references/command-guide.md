@@ -1,4 +1,4 @@
-# 命令书写与调用规范 — background-task-scheduler v2.9
+# 命令书写与调用规范 — agent-task-scheduler v2.9
 
 本文面向「由 Agent 调用调度器脚本」这一使用场景，规定**怎么把命令传进去、怎么把结果读出来、怎么避免被 shell 吃掉引号**。几乎所有「调度器行为诡异」的事故都源于本文某一条被违反。
 
@@ -12,12 +12,12 @@
 
 ```powershell
 # 正确：拿住 stdout，按 JSON 解析
-$out = python scripts/bts.py status build1 --json | ConvertFrom-Json
+$out = python scripts/ats.py status build1 --json | ConvertFrom-Json
 ```
 
 ```powershell
 # 错误：把 stdout 直接丢弃，然后猜状态
-python scripts/bts.py run build1 | Out-Null
+python scripts/ats.py run build1 | Out-Null
 ```
 
 例外：`create` 的返回值只含 `task` 与 `created` 两个键，如果你不需要 id（id 已指定），可以丢弃。但**不要**在 `run` / `pause` / `approve` 上丢弃，因为它们的返回值里含继续执行所需的关键字段（`approval_id`、`resume`、`status`）。
@@ -33,9 +33,9 @@ python scripts/bts.py run build1 | Out-Null
 所以下面三种写法会产生**三个不同**的审批键：
 
 ```powershell
-python scripts/bts.py create a --command "npm run build"
-python scripts/bts.py create b --command "npm  run build"     # 两个空格 → 不同
-python scripts/bts.py create c --command "npm run build "      # 尾随空格 → 不同
+python scripts/ats.py create a --command "npm run build"
+python scripts/ats.py create b --command "npm  run build"     # 两个空格 → 不同
+python scripts/ats.py create c --command "npm run build "      # 尾随空格 → 不同
 ```
 
 **推论**：审批通过后，执行时必须用**完全一致**的字符串。不要在执行阶段动态拼接变量（`$env:VERSION`、时间戳、路径）。变量会变，字符串会变，审批会 `mismatch`。
@@ -44,26 +44,26 @@ python scripts/bts.py create c --command "npm run build "      # 尾随空格 �
 
 ```powershell
 # 好：命令文本不变，变化走 env
-python scripts/bts.py create deploy1 --command "bash deploy.sh" --env STAGE=prod --env TAG=20261101
+python scripts/ats.py create deploy1 --command "bash deploy.sh" --env STAGE=prod --env TAG=20261101
 ```
 
 ---
 
 ## 2. `--root`：状态目录定位
 
-优先级：`--root <dir>` > 环境变量 `BTS_ROOT` > `<当前工作目录>/.bts`。
+优先级：`--root <dir>` > 环境变量 `ATS_ROOT` > `<当前工作目录>/.ats`。
 
 `--root` 是**两个脚本的全局参数**，必须写在子命令**之前**：
 
 ```bash
-python scripts/bts.py --root D:\run\state run build1          # 正确
-python scripts/bts.py run build1 --root D:\run\state          # 报错：run 没有 --root 参数
+python scripts/ats.py --root D:\run\state run build1          # 正确
+python scripts/ats.py run build1 --root D:\run\state          # 报错：run 没有 --root 参数
 ```
 
-同理 `bts_plan.py`：
+同理 `ats_plan.py`：
 
 ```bash
-python scripts/bts_plan.py --root D:\run\state run_plan ci1-a1
+python scripts/ats_plan.py --root D:\run\state run_plan ci1-a1
 ```
 
 三个实践建议：
@@ -72,8 +72,8 @@ python scripts/bts_plan.py --root D:\run\state run_plan ci1-a1
 2. 长期项目把 root 固化进环境变量，避免每条命令都写：
 
 ```powershell
-$env:BTS_ROOT = "D:\work\proj\.bts"
-python scripts/bts_plan.py list --json
+$env:ATS_ROOT = "D:\work\proj\.ats"
+python scripts/ats_plan.py list --json
 ```
 
 3. 并行多个项目时优先用 `--root`（显式），因为环境变量在子进程里可能被继承或覆盖，容易串味。
@@ -95,8 +95,8 @@ python scripts/bts_plan.py list --json
 
 | 实体 | shell 行为 | 可控 |
 | --- | --- | --- |
-| Task（`bts.py`） | 默认 `shell=True`（走 `cmd.exe`），可用 `--no-shell` 关掉 | 有开关 |
-| Step（`bts_plan.py`） | **恒为 `shell=True`** | 无开关（spec 里写 `shell: false` 无效） |
+| Task（`ats.py`） | 默认 `shell=True`（走 `cmd.exe`），可用 `--no-shell` 关掉 | 有开关 |
+| Step（`ats_plan.py`） | **恒为 `shell=True`** | 无开关（spec 里写 `shell: false` 无效） |
 
 Task 用 `--no-shell` 时，`command` 会被当成**单个可执行文件路径**（`Popen(command, shell=False)` 传的是字符串，Windows 下等价于把整串当程序名）。所以 `--no-shell` 只适合「纯可执行文件 + 不需要参数」的极少数场景，实际上很少用。
 
@@ -105,7 +105,7 @@ Task 用 `--no-shell` 时，`command` 会被当成**单个可执行文件路径*
 **写法 A：单引号包整条命令（推荐，最少转义）**
 
 ```powershell
-python scripts/bts.py create b1 --command 'npm run build -- --mode production'
+python scripts/ats.py create b1 --command 'npm run build -- --mode production'
 ```
 
 PowerShell 单引号内**不**做变量展开，所以 `$`、`%` 原样保留。缺点是字符串里不能出现单引号。
@@ -113,7 +113,7 @@ PowerShell 单引号内**不**做变量展开，所以 `$`、`%` 原样保留。
 **写法 B：双引号（需要变量展开时）**
 
 ```powershell
-python scripts/bts.py create b1 --command "npm run build -- --define VERSION=$env:VERSION"
+python scripts/ats.py create b1 --command "npm run build -- --define VERSION=$env:VERSION"
 ```
 
 注意这是**在提交时**展开变量，不是执行时。这意味着审批绑定的是展开后的文本——如果之后 `$env:VERSION` 变了，重跑时文本不同，审批 `mismatch`。
@@ -121,7 +121,7 @@ python scripts/bts.py create b1 --command "npm run build -- --define VERSION=$en
 **写法 C：用 spec 文件（命令复杂时的唯一可靠方式）**
 
 ```powershell
-python scripts/bts.py create b1 --spec task.json
+python scripts/ats.py create b1 --spec task.json
 ```
 
 `task.json`：
@@ -146,13 +146,13 @@ node -e "console.log('hi')"
 
 ```powershell
 # 1) 外层单引号，内层双引号
-python scripts/bts.py create e1 --command 'node -e "console.log(''hi'')"'
+python scripts/ats.py create e1 --command 'node -e "console.log(''hi'')"'
 
 # 2) 用 spec 文件（最省心）
-python scripts/bts.py create e1 --spec e1.json
+python scripts/ats.py create e1 --spec e1.json
 
 # 3) 把复杂逻辑落到脚本文件，命令只调脚本
-python scripts/bts.py create e1 --command 'node scripts\hello.js'
+python scripts/ats.py create e1 --command 'node scripts\hello.js'
 ```
 
 第 3 种是最好的工程实践：**命令保持一行、无内嵌引号、可复现**。
@@ -178,7 +178,7 @@ Windows 路径在 JSON 里必须转义：
 在 PowerShell 命令行里则**不需要**双写：
 
 ```powershell
-python scripts/bts.py create b1 --command 'C:\tools\bin\build.exe --fast'
+python scripts/ats.py create b1 --command 'C:\tools\bin\build.exe --fast'
 ```
 
 ### 3.6 管道与重定向
@@ -186,7 +186,7 @@ python scripts/bts.py create b1 --command 'C:\tools\bin\build.exe --fast'
 `|`、`>`、`<` 会被**第三层** shell 解释，这在 Task 里是你想要的：
 
 ```powershell
-python scripts/bts.py create l1 --command 'pytest -q > reports\out.txt 2>&1'
+python scripts/ats.py create l1 --command 'pytest -q > reports\out.txt 2>&1'
 ```
 
 但注意：
@@ -201,10 +201,10 @@ python scripts/bts.py create l1 --command 'pytest -q > reports\out.txt 2>&1'
 
 ```powershell
 # 外层单引号，主命令与钩子整条传入
-python scripts/bts.py create enc1 --level L1 --command 'build.bat @enc --from gbk --to utf-8 logs'
+python scripts/ats.py create enc1 --level L1 --command 'build.bat @enc --from gbk --to utf-8 logs'
 
 # 参数多、路径含空格 → spec
-python scripts/bts.py create --spec enc.json
+python scripts/ats.py create --spec enc.json
 ```
 
 - `@enc` 必须**独立成 token**（前后为空白、行首或行尾）：`--from gbk @enc --to utf-8` 这种放中间的写法不会被拆分，而是原样进主命令
@@ -246,7 +246,7 @@ python scripts/bts.py create --spec enc.json
 
 ```powershell
 # Task：命令行用 --env，可重复
-python scripts/bts.py create b1 --command "npm run build" --env CI=1 --env NODE_ENV=production
+python scripts/ats.py create b1 --command "npm run build" --env CI=1 --env NODE_ENV=production
 ```
 
 ```json
@@ -275,8 +275,8 @@ python scripts/bts.py create b1 --command "npm run build" --env CI=1 --env NODE_
 读取方式：
 
 ```powershell
-python scripts/bts.py show build1 --lines 40        # 两个 tail 都在 JSON 里
-Get-Content .bts\tasks\build1\stderr.log -Tail 40    # 直接读
+python scripts/ats.py show build1 --lines 40        # 两个 tail 都在 JSON 里
+Get-Content .ats\tasks\build1\stderr.log -Tail 40    # 直接读
 ```
 
 ### 6.2 编码
@@ -298,9 +298,9 @@ Get-Content .bts\tasks\build1\stderr.log -Tail 40    # 直接读
 
 ```powershell
 # 强制非交互
-python scripts/bts.py create i1 --command "npm ci --yes --no-audit --no-fund" --env CI=true
-python scripts/bts.py create i2 --command "pip install -r requirements.txt --no-input"
-python scripts/bts.py create i3 --command "apt-get install -y pkg"
+python scripts/ats.py create i1 --command "npm ci --yes --no-audit --no-fund" --env CI=true
+python scripts/ats.py create i2 --command "pip install -r requirements.txt --no-input"
+python scripts/ats.py create i3 --command "apt-get install -y pkg"
 ```
 
 ```json
@@ -317,16 +317,16 @@ python scripts/bts.py create i3 --command "apt-get install -y pkg"
 
 ```powershell
 # 第 1 段：尝试执行，被拦则拿到 approval_id
-$run = python scripts/bts.py run deploy1 | ConvertFrom-Json
+$run = python scripts/ats.py run deploy1 | ConvertFrom-Json
 if ($run.error -eq "approval_required") {
     $apId = $run.approval_id
 }
 
 # 第 2 段：批准（人类动作，或高等级身份进程）
-python scripts/bts.py approve $apId
+python scripts/ats.py approve $apId
 
 # 第 3 段：带审批执行，命令文本必须与第 1 段完全一致
-python scripts/bts.py run deploy1 --approval $apId --wait
+python scripts/ats.py run deploy1 --approval $apId --wait
 ```
 
 要点：
@@ -337,10 +337,10 @@ python scripts/bts.py run deploy1 --approval $apId --wait
 - 拒绝时务必留 `--note`：
 
 ```powershell
-python scripts/bts.py approve $apId --reject --note "生产窗口期，延后到 22:00"
+python scripts/ats.py approve $apId --reject --note "生产窗口期，延后到 22:00"
 ```
 
-- **批准者身份必须 ≥ 审批要求等级**。用 L1 批 L2 会返回 `ok=false` + `insufficient_level`，且退出码为 `4`。此时不要重试同一条命令，先把 `BTS_ACTOR_LEVEL` 提到 L2/L3 再批。
+- **批准者身份必须 ≥ 审批要求等级**。用 L1 批 L2 会返回 `ok=false` + `insufficient_level`，且退出码为 `4`。此时不要重试同一条命令，先把 `ATS_ACTOR_LEVEL` 提到 L2/L3 再批。
 - `approve` 的退出码：单条失败时 `insufficient_level` → `4`，`missing` / `expired` / `already_*` → `3`；`approve --all` 恒为 `0`（批量语义，逐项看 `approvals[].ok`）。判断成败优先看 `ok`。
 
 - 操作型命令（`stop` / `delete` / `pause` / `cancel` / `rerun_task`）被拦时，返回的是 `approval_required` + `approval_id`，其「命令文本」是固定模板（如 `delete build1`）。批准后带 `--approval` 重发同一命令。
@@ -349,11 +349,11 @@ Plan 层的审批书写：
 
 ```powershell
 # run_plan 返回 status=paused + approval
-$r = python scripts/bts_plan.py run_plan rel1-a1 | ConvertFrom-Json
+$r = python scripts/ats_plan.py run_plan rel1-a1 | ConvertFrom-Json
 $apId = $r.approval.id
 
-python scripts/bts.py approve $apId
-python scripts/bts_plan.py resume rel1 --approval $apId
+python scripts/ats.py approve $apId
+python scripts/ats_plan.py resume rel1 --approval $apId
 ```
 
 `resume` 接受 **schedule_id 或 plan_id**（会先按 schedule 解析 `current_plan`，再按 plan 目录名找），比记 `-a<N>` 后缀更省事。
@@ -373,7 +373,7 @@ python scripts/bts_plan.py resume rel1 --approval $apId
 
 ```powershell
 do {
-  $r = python scripts/bts.py check build1 | ConvertFrom-Json
+  $r = python scripts/ats.py check build1 | ConvertFrom-Json
   if ($r.next_poll -gt 0) { Start-Sleep -Seconds $r.next_poll }
 } while ($r.next_poll -gt 0)
 ```
@@ -386,7 +386,7 @@ do {
 - 或者把长步骤拆成独立 Task，让 Plan 只做编排
 
 ```powershell
-Start-Process -FilePath python -ArgumentList "scripts/bts_plan.py run_plan ci1-a1" -WindowStyle Hidden
+Start-Process -FilePath python -ArgumentList "scripts/ats_plan.py run_plan ci1-a1" -WindowStyle Hidden
 ```
 
 ### 8.3 停滞告警的处理节奏
@@ -411,7 +411,7 @@ Start-Process -FilePath python -ArgumentList "scripts/bts_plan.py run_plan ci1-a
 | Schedule | `submit_*` 的 `--id`，或 spec 的 `id`，或自动生成 `s-<6hex>` | `poll1` |
 | Approval | `ap-<8hex>` | `ap-3f2a91c4` |
 
-**关键推论**：`oneshot` 的 schedule id 与 plan id 基名相同。所以 `bts_plan.py show ci1` 与 `show ci1-a1` 都能解析到同一个 plan（前者走 schedule 的 `current_plan`，后者走目录名匹配）。
+**关键推论**：`oneshot` 的 schedule id 与 plan id 基名相同。所以 `ats_plan.py show ci1` 与 `show ci1-a1` 都能解析到同一个 plan（前者走 schedule 的 `current_plan`，后者走目录名匹配）。
 
 ### 9.2 命名建议
 
@@ -423,7 +423,7 @@ Start-Process -FilePath python -ArgumentList "scripts/bts_plan.py run_plan ci1-a
 ### 9.3 `rerun_task` 的三段定位
 
 ```bash
-python scripts/bts_plan.py rerun_task ci1 test e2e
+python scripts/ats_plan.py rerun_task ci1 test e2e
 #                                   ^^^ ^^^^ ^^^
 #                              schedule  stage  step
 ```
@@ -450,10 +450,10 @@ python scripts/bts_plan.py rerun_task ci1 test e2e
 ### 11.1 「跑一个可能很慢的命令，之后我还要看结果」
 
 ```powershell
-python scripts/bts.py create job1 --command 'bash run.sh' --level L1 --timeout 3600
-python scripts/bts.py run job1            # 立刻返回 supervisor_pid
-python scripts/bts.py check job1          # 按 next_poll 轮询
-python scripts/bts.py show job1 --lines 60
+python scripts/ats.py create job1 --command 'bash run.sh' --level L1 --timeout 3600
+python scripts/ats.py run job1            # 立刻返回 supervisor_pid
+python scripts/ats.py check job1          # 按 next_poll 轮询
+python scripts/ats.py show job1 --lines 60
 ```
 
 ### 11.2 「两条命令依次执行（前一条挂了后一条照跑）」
@@ -499,16 +499,16 @@ serial Stage 的语义：一个 step 结束（无论成败）才启动下一个�
 ```
 
 ```powershell
-python scripts/bts_plan.py submit_schedule --spec patrol.json
-python scripts/bts_plan.py check_schedule patrol1     # 按 next_poll 循环调用
+python scripts/ats_plan.py submit_schedule --spec patrol.json
+python scripts/ats_plan.py check_schedule patrol1     # 按 next_poll 循环调用
 ```
 
 ### 11.6 「审批挂起后怎么继续」
 
 ```powershell
-python scripts/bts.py approve --all                   # 批量批准
-python scripts/bts_plan.py resume <schedule_id>       # 恢复 Plan（自动找 current_plan）
-python scripts/bts_plan.py resume_schedule <schedule_id>   # Schedule 改回 active（保留 next_run）
+python scripts/ats.py approve --all                   # 批量批准
+python scripts/ats_plan.py resume <schedule_id>       # 恢复 Plan（自动找 current_plan）
+python scripts/ats_plan.py resume_schedule <schedule_id>   # Schedule 改回 active（保留 next_run）
 ```
 
 **注意**：`resume` 只恢复 Plan；`schedule.json` 的 `status` 仍是 `paused`，`check_schedule` 不会继续触发。
@@ -517,10 +517,10 @@ python scripts/bts_plan.py resume_schedule <schedule_id>   # Schedule 改回 act
 ### 11.7 「只想重跑失败的那一步」
 
 ```powershell
-python scripts/bts_plan.py show ci1-a1                # 找失败 step
-python scripts/bts_plan.py rerun_task ci1 test e2e
-python scripts/bts_plan.py run_plan ci1-a1
-python scripts/bts_plan.py rerun_plan ci1-a1          # 或：整个 Plan 全部重置后重跑
+python scripts/ats_plan.py show ci1-a1                # 找失败 step
+python scripts/ats_plan.py rerun_task ci1 test e2e
+python scripts/ats_plan.py run_plan ci1-a1
+python scripts/ats_plan.py rerun_plan ci1-a1          # 或：整个 Plan 全部重置后重跑
 ```
 
 ### 11.7.1 「关键这一步失败就整停」
@@ -528,11 +528,11 @@ python scripts/bts_plan.py rerun_plan ci1-a1          # 或：整个 Plan 全部
 ```powershell
 # 方式一：写进 spec（可长期生效）——给关键 step 加 critical，Plan 加 fail_on_critical
 # {"fail_on_critical": "stop", "stages": [... {"id": "lint", "critical": true} ...]}
-python scripts/bts_plan.py run_plan ci1-a1
+python scripts/ats_plan.py run_plan ci1-a1
 
 # 方式二：不改 spec，本次运行临时全量即停（所有 step 都当作 critical）
-python scripts/bts_plan.py run_plan ci1-a1 --fail-fast
-python scripts/bts_plan.py resume ci1-a1 --fail-fast      # 恢复时同样可带
+python scripts/ats_plan.py run_plan ci1-a1 --fail-fast
+python scripts/ats_plan.py resume ci1-a1 --fail-fast      # 恢复时同样可带
 ```
 
 - 判定只看**退出码**（重试耗尽后仍 `failed` / `timeout`），不扫描日志文本
@@ -542,17 +542,17 @@ python scripts/bts_plan.py resume ci1-a1 --fail-fast      # 恢复时同样可�
 ### 11.8 「事后复盘某次运行」
 
 ```powershell
-python scripts/bts_plan.py history ci1
-python scripts/bts_plan.py history ci1 --plan ci1-a2 --logs --lines 40
-python scripts/bts.py logs --lines 100 --json | ConvertFrom-Json
+python scripts/ats_plan.py history ci1
+python scripts/ats_plan.py history ci1 --plan ci1-a2 --logs --lines 40
+python scripts/ats.py logs --lines 100 --json | ConvertFrom-Json
 ```
 
 ### 11.9 「批量下载一批文件，断了能续传」
 
 ```powershell
 # 清单可以是 .json / .txt（URL<TAB>文件名）/ .csv（url,文件名）
-python scripts/bts.py download --file urls.txt --out D:\dl --concurrency 4 --rate 524288
-python scripts/bts.py check dl-1a2b3c          # 按 next_poll 轮询
+python scripts/ats.py download --file urls.txt --out D:\dl --concurrency 4 --rate 524288
+python scripts/ats.py check dl-1a2b3c          # 按 next_poll 轮询
 Get-Content "$root\tasks\dl-1a2b3c\stdout.log" -Encoding UTF8 | Select-Object -Last 1
 ```
 
@@ -564,13 +564,13 @@ Get-Content "$root\tasks\dl-1a2b3c\stdout.log" -Encoding UTF8 | Select-Object -L
 ### 11.10 「下载一个种子（磁力或 .torrent）」
 
 ```powershell
-python scripts/bts.py torrent --magnet "magnet:?xt=urn:btih:..." --out D:\dl
-python scripts/bts.py torrent --torrent D:\dl\sintel.torrent --out D:\dl --seed-time 30
-python scripts/bts.py status tor-1a2b3c --json
+python scripts/ats.py torrent --magnet "magnet:?xt=urn:btih:..." --out D:\dl
+python scripts/ats.py torrent --torrent D:\dl\sintel.torrent --out D:\dl --seed-time 30
+python scripts/ats.py status tor-1a2b3c --json
 Get-Content "$root\tasks\tor-1a2b3c\stdout.log" -Encoding UTF8 | Select-Object -Last 2
 ```
 
-- 依赖 aria2c：`winget install --id aria2.aria2 -e`；装好后新开一个 shell 才认 PATH，BTS 也会去 WinGet 目录里找，所以当前 shell 直接可用
+- 依赖 aria2c：`winget install --id aria2.aria2 -e`；装好后新开一个 shell 才认 PATH，ATS 也会去 WinGet 目录里找，所以当前 shell 直接可用
 - `--seed-time` 单位是**分钟**，`0`（默认）表示下完即停；做种期间进度行带 `seeding: true`
 - 磁力链先下元数据：进度行 `percent` 一直是 0、`name` 形如 `[METADATA]xxx`，元数据到手后才换成真实 gid（日志里会多一条 `torrent_metadata`）
 - `stop` 是硬杀进程树：靠 `*.aria2` 控制文件续传（`--auto-save-interval=10`），`run --force` 从上次保存点接着下
@@ -579,20 +579,20 @@ Get-Content "$root\tasks\tor-1a2b3c\stdout.log" -Encoding UTF8 | Select-Object -
 ### 11.11 「审批记录堆积了怎么清」
 
 ```powershell
-python scripts/bts.py approval prune --dry-run --older-than 2592000   # 先看会删哪些
-python scripts/bts.py approval prune --older-than 2592000           # 删 30 天前的已决议记录
+python scripts/ats.py approval prune --dry-run --older-than 2592000   # 先看会删哪些
+python scripts/ats.py approval prune --older-than 2592000           # 删 30 天前的已决议记录
 ```
 
 - 只删 `approved` / `rejected` / `expired`；**`pending` 永不删除**
 - `--older-than` 按 `resolved_at`（缺失时 `created_at`）判断；`0` = 不限时间 = 全删已决议
-- 与 `bts_plan.py prune --keep 0` 的 `0` 语义相反（后者是「不清理」）
+- 与 `ats_plan.py prune --keep 0` 的 `0` 语义相反（后者是「不清理」）
 
 ### 11.12 「一次登记多条命令（指令包）」
 
 ```powershell
-python scripts/bts.py pack "npm run build,npm test,git status" --pack-id pk-build
-python scripts/bts.py list --pack pk-build
-python scripts/bts.py run t-1a2b3c        # 要跑哪条再单独 run
+python scripts/ats.py pack "npm run build,npm test,git status" --pack-id pk-build
+python scripts/ats.py list --pack pk-build
+python scripts/ats.py run t-1a2b3c        # 要跑哪条再单独 run
 ```
 
 - **只登记文本**：N 条命令各建一个 `pending` Task（`kind="pack"`），不执行、不写日志、不解析内容
@@ -607,7 +607,7 @@ python scripts/bts.py run t-1a2b3c        # 要跑哪条再单独 run
 
 ### 12.1 异步派生的实现
 
-`bts.py run` 不是用 `Start-Process`，而是在 Python 内部：
+`ats.py run` 不是用 `Start-Process`，而是在 Python 内部：
 
 ```python
 subprocess.Popen([sys.executable, __file__, "supervise", task_id],
@@ -663,16 +663,16 @@ $env:PYTHONUTF8 = "1"
 ### 13.1 PowerShell：提交并等待，带错误分类
 
 ```powershell
-function Invoke-Bts {
+function Invoke-Ats {
   param([string[]]$Args)
-  $raw = python scripts/bts.py @Args
+  $raw = python scripts/ats.py @Args
   $code = $LASTEXITCODE
   $obj = $null
   try { $obj = $raw | ConvertFrom-Json } catch { }
   [pscustomobject]@{ code = $code; data = $obj; raw = $raw }
 }
 
-$r = Invoke-Bts @("run", "build1", "--wait")
+$r = Invoke-Ats @("run", "build1", "--wait")
 switch ($r.code) {
   0 { $r.data.task.status }              # succeeded / failed / timeout
   2 { "参数错误: $($r.data.error)" }
@@ -690,8 +690,8 @@ switch ($r.code) {
 ```python
 import json, subprocess, sys
 
-def bts(*args):
-    p = subprocess.run([sys.executable, "scripts/bts_plan.py", *args],
+def ats(*args):
+    p = subprocess.run([sys.executable, "scripts/ats_plan.py", *args],
                        capture_output=True, text=True, encoding="utf-8")
     try:
         data = json.loads(p.stdout or "{}")
@@ -699,7 +699,7 @@ def bts(*args):
         data = {"raw": p.stdout}
     return p.returncode, data
 
-code, out = bts("run_plan", "ci1-a1")
+code, out = ats("run_plan", "ci1-a1")
 if out.get("status") == "paused":
     ap = out["approval"]["id"]
     print("需要审批", ap)
@@ -735,7 +735,7 @@ Agent 的典型循环：
 | 事故 | 真实原因 | 修法 |
 | --- | --- | --- |
 | 命令报 `unexpected argument '--root'` | `--root` 写在子命令后 | 移到子命令前 |
-| `not_found` 但明明刚提交 | 两次调用用了不同 `BTS_ROOT` / 不同 cwd | `--root` 显式统一 |
+| `not_found` 但明明刚提交 | 两次调用用了不同 `ATS_ROOT` / 不同 cwd | `--root` 显式统一 |
 | 审批永远 `mismatch` | 命令文本在两次调用间被 shell 展开成不同值 | 用 spec + 环境变量，固定命令文本 |
 | 命令里 `%VAR%` 不生效 | 第三层是 `cmd.exe`，但 PowerShell 已把 `%VAR%` 当字面量（这是对的）；若写成 `$env:VAR` 则被 PowerShell 先展开 | 明确你想在哪一层展开：提交时（PowerShell）还是执行时（cmd） |
 | 中文乱码 | 子命令输出 GBK，日志按 UTF-8 读 | 让子命令输出 UTF-8，或看原文时用 `-Encoding Default` |

@@ -6,7 +6,7 @@ __pycache__/
 venv/
 
 # Scheduler runtime state: task history, event stream, logs
-.bts/
+.ats/
 .autopilot/
 
 # Logs

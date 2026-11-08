@@ -1,4 +1,4 @@
-# 错误分类与重试矩阵 — background-task-scheduler v2.9
+# 错误分类与重试矩阵 — agent-task-scheduler v2.9
 
 本文把调度器可能产生的一切「不正常」拆成可判别的类别，给出**判别依据**（退出码 / JSON 字段 / 事件 / 文件）、**含义**与**处置动作**，并说明哪些错误可以交给 `retry` 自动消化、哪些必须人工改代码。
 
@@ -20,7 +20,7 @@
 
 ```bash
 # 命令失败，但调度器正常返回 0
-python scripts/bts.py run --wait tests1
+python scripts/ats.py run --wait tests1
 # exit code of this python process = 0
 # 而 JSON 里：{"task": {"status": "failed", "exit_code": 1, ...}}
 ```
@@ -28,14 +28,14 @@ python scripts/bts.py run --wait tests1
 **反例（错误做法）**：用 `$LASTEXITCODE` 判断任务成败。
 
 ```powershell
-python scripts/bts.py run --wait tests1
+python scripts/ats.py run --wait tests1
 if ($LASTEXITCODE -ne 0) { Write-Host "任务失败" }   # 永远是 false 分支
 ```
 
 正确做法：解析 JSON 的 `status`。
 
 ```powershell
-$out = python scripts/bts.py run --wait tests1 | ConvertFrom-Json
+$out = python scripts/ats.py run --wait tests1 | ConvertFrom-Json
 if ($out.task.status -ne "succeeded") { Write-Host "任务失败: $($out.task.status)" }
 ```
 
@@ -68,8 +68,8 @@ if ($out.task.status -ne "succeeded") { Write-Host "任务失败: $($out.task.st
 
 | `error` | 触发命令 | 含义 | 处置 |
 | --- | --- | --- | --- |
-| `spec_not_found` | `create --spec` / `submit_plan` / `submit_schedule` | spec 文件路径不存在 | 检查路径；注意相对路径按**当前工作目录**解析，不是按 `BTS_ROOT` |
-| `spec_invalid` | `create --spec` / `bts_plan` 两个 `submit_*` | spec 不是 JSON 对象（数组/字符串/空文件/null） | 用 `Get-Content spec.json \| ConvertFrom-Json` 先自检 |
+| `spec_not_found` | `create --spec` / `submit_plan` / `submit_schedule` | spec 文件路径不存在 | 检查路径；注意相对路径按**当前工作目录**解析，不是按 `ATS_ROOT` |
+| `spec_invalid` | `create --spec` / `ats_plan` 两个 `submit_*` | spec 不是 JSON 对象（数组/字符串/空文件/null） | 用 `Get-Content spec.json \| ConvertFrom-Json` 先自检 |
 | `missing_command` | `create` | 既没 `--command` 也没 spec 的 `command` | 补 `--command` |
 | `bad_env` | `create --env` | `--env` 的值不含 `=` | 写成 `--env K=V`；值里可以有 `=`（按第一个 `=` 切分） |
 | `bad_level` | `create --level` | 等级不在 `L0..L3`（argparse 会先拦，但 spec 里的 `level` 会走到这里） | 用大写 `L0`-`L3` |
@@ -100,7 +100,7 @@ if ($out.task.status -ne "succeeded") { Write-Host "任务失败: $($out.task.st
 | `item_missing_url` | `download --file` | 清单里某条缺 `url` | 补 `url` 字段/列 |
 | `magnet_invalid` | `torrent --magnet` | 链接不以 `magnet:` 开头 | 补全磁力链 |
 | `torrent_not_found` | `torrent --torrent` | `.torrent` 文件不存在 | 检查路径；相对路径按**当前工作目录**解析 |
-| `aria2_not_found` | `torrent` | 创建时在 `BTS_ARIA2` / `PATH` / 常见安装目录都没找到 aria2c | 安装 aria2 或设 `BTS_ARIA2`（见 [SKILL.md](../SKILL.md) §4.4） |
+| `aria2_not_found` | `torrent` | 创建时在 `ATS_ARIA2` / `PATH` / 常见安装目录都没找到 aria2c | 安装 aria2 或设 `ATS_ARIA2`（见 [SKILL.md](../SKILL.md) §4.4） |
 
 ### 3.2 `spec_invalid` 的 `errors[]` 取值（Plan 校验规则）
 
@@ -167,7 +167,7 @@ if ($out.task.status -ne "succeeded") { Write-Host "任务失败: $($out.task.st
 | --- | --- | --- | --- |
 | `denied_policy` | 命令等级 > `max_level`，**审批不可绕过** | `level`、`policy_max` | 改 `policy.json` 的 `max_level`，或降低 step/task 的 `level` |
 | `approval_required` | 等级 > `actor_level`，且没有有效审批 | `approval_id`、`resume`、`approval_error` | 走 `approve <id>` 后再执行 |
-| `insufficient_level` | `approve` 时批准者身份低于审批要求等级 | `approval_id`、`required_level`、`actor_level` | 用更高 `BTS_ACTOR_LEVEL` 的进程批准 |
+| `insufficient_level` | `approve` 时批准者身份低于审批要求等级 | `approval_id`、`required_level`、`actor_level` | 用更高 `ATS_ACTOR_LEVEL` 的进程批准 |
 | `already_approved` | `approve` 一条已批准的记录 | `approval_id` | 直接执行，无需再批 |
 | `already_rejected` | `approve` 一条已拒绝的记录 | `approval_id` | 拒绝不可翻案，重新发起 |
 | `already_expired` | `approve` 一条已过期的记录 | `approval_id` | Plan 层会自动重发；Task 层需重新 `run` 触发新审批 |
@@ -222,7 +222,7 @@ if ($out.task.status -ne "succeeded") { Write-Host "任务失败: $($out.task.st
 
 | 值 | 含义 | 处置 |
 | --- | --- | --- |
-| `encoder_not_found` | `BTS_ENCODER_PATH`、`<cwd>/tools/`、`<当前目录>/tools/` 都没找到 `encoding_converter.py` | 设 `BTS_ENCODER_PATH` 或把转换器放到任务 `cwd` 的 `tools/` 下 |
+| `encoder_not_found` | `ATS_ENCODER_PATH`、`<cwd>/tools/`、`<当前目录>/tools/` 都没找到 `encoding_converter.py` | 设 `ATS_ENCODER_PATH` 或把转换器放到任务 `cwd` 的 `tools/` 下 |
 | `hook_timeout` | 钩子执行超过任务的 `timeout` 被强杀 | 放宽 `--timeout` 或缩小转换范围 |
 | `hook_spawn_failed` | 启动转换器进程抛 `OSError` | 检查 Python 解释器与转换器路径 |
 
@@ -263,7 +263,7 @@ Step 没有 `note` 字段，用 `error_type` 与 `skipped_by` 表达原因。
 
 `download` / `torrent` 的失败原因写在 `tasks/<id>/stdout.log` 的 JSONL 里，`task.json` 只有 `exit_code` 与 `status`。判别顺序：先看最后一行 `summary.error`，再看 `torrent_error` / `item_error` 的 `detail`。
 
-Torrent worker（`bts_torrent.py`）的退出码与 `summary.error`：
+Torrent worker（`ats_torrent.py`）的退出码与 `summary.error`：
 
 | exit | `error` | 含义 | 处置 |
 | --- | --- | --- | --- |
@@ -273,10 +273,10 @@ Torrent worker（`bts_torrent.py`）的退出码与 `summary.error`：
 | 1 | `aria2_error_<code>` | 下载中途 aria2 报错，`code` 原样取自 `errorCode` | 按 `detail` 处理；常见 3=资源不存在、9=磁盘空间不足、6=网络错误 |
 | 1 | `download_removed` | 任务在 aria2 里被移除 | 通常是外部操作；`run --force` 重来 |
 | 1 | `internal_error` | worker 自身异常 | 看 `traceback` |
-| 2 | `spec_error`（`magnet_invalid` / `torrent_not_found` / `source_type_invalid` / `spec_missing_source`） | `torrent.json` 非法 | 正常不会发生（`bts.py torrent` 已先校验）；手工改 spec 才会 |
+| 2 | `spec_error`（`magnet_invalid` / `torrent_not_found` / `source_type_invalid` / `spec_missing_source`） | `torrent.json` 非法 | 正常不会发生（`ats.py torrent` 已先校验）；手工改 spec 才会 |
 | 3 | `aria2_not_found` | 任务创建后 aria2c 被卸载/移走，重新解析也失败 | 重新安装，或在 `torrent.json` 里钉住存在的 `aria2`；`run --force` |
 
-**注意**：这里的 `3` 是 **worker 退出码**（写进 `task.exit_code`），与调度器的 `EXIT_CONFLICT=3` 无关。判断调用本身是否成功，看 `bts.py` 返回的 JSON 与调度器退出码；`aria2_not_found` 若发生在**创建阶段**，`bts.py` 会直接返回 `exit 2`，不会生成任务。
+**注意**：这里的 `3` 是 **worker 退出码**（写进 `task.exit_code`），与调度器的 `EXIT_CONFLICT=3` 无关。判断调用本身是否成功，看 `ats.py` 返回的 JSON 与调度器退出码；`aria2_not_found` 若发生在**创建阶段**，`ats.py` 会直接返回 `exit 2`，不会生成任务。
 
 ---
 
@@ -284,18 +284,18 @@ Torrent worker（`bts_torrent.py`）的退出码与 `summary.error`：
 
 | 想知道 | 查哪里 | 命令 |
 | --- | --- | --- |
-| Task 的最终状态与退出码 | `tasks/<id>/task.json` | `bts.py show <id>` |
-| 命令的实际报错文本 | `tasks/<id>/stderr.log` | `bts.py show <id> --lines 80` |
-| 种子下载失败原因 | `tasks/<id>/stdout.log` 末行 `summary` + `torrent_error` | `bts.py show <id> --lines 40` |
-| 指令包条目为什么没跑 | 条目 `task.json` 的 `status`（`pack` 只登记文本，恒为 `pending`） | `bts.py list --pack <pack_id>` |
-| Step 的退出码与尝试次数 | `step.json` 的 `exit_code` / `attempts` | `bts_plan.py show <plan_id>` |
+| Task 的最终状态与退出码 | `tasks/<id>/task.json` | `ats.py show <id>` |
+| 命令的实际报错文本 | `tasks/<id>/stderr.log` | `ats.py show <id> --lines 80` |
+| 种子下载失败原因 | `tasks/<id>/stdout.log` 末行 `summary` + `torrent_error` | `ats.py show <id> --lines 40` |
+| 指令包条目为什么没跑 | 条目 `task.json` 的 `status`（`pack` 只登记文本，恒为 `pending`） | `ats.py list --pack <pack_id>` |
+| Step 的退出码与尝试次数 | `step.json` 的 `exit_code` / `attempts` | `ats_plan.py show <plan_id>` |
 | Step 的 stdout / stderr | `step 目录/stdout.log`、`stderr.log` | 直接读文件 |
-| 为什么被跳过 | `step.json` 的 `blocked_by` / `dependency_status` | `bts_plan.py show` |
-| 哪些审批还挂着 | `approvals/*.json` 中 `status=pending` | `bts.py approve --all` 会列出；也可直接读目录 |
-| 某个 plan 的完整时间线 | `scheduler.log`（按 `plan_id` 过滤） | `bts.py logs --lines 100 --json` |
-| 历史尝试汇总 | `runs/<plan_id>-a<N>/summary.json` | `bts_plan.py history <sid>` |
-| 是否卡住 | `plan_stalled` 事件 | `bts_plan.py check_schedule <sid>` 的 `stalled` 字段 |
-| 权限判定细节 | `task_start` 事件的 `gate` 字段；`policy` 命令 | `bts.py policy --json` |
+| 为什么被跳过 | `step.json` 的 `blocked_by` / `dependency_status` | `ats_plan.py show` |
+| 哪些审批还挂着 | `approvals/*.json` 中 `status=pending` | `ats.py approve --all` 会列出；也可直接读目录 |
+| 某个 plan 的完整时间线 | `scheduler.log`（按 `plan_id` 过滤） | `ats.py logs --lines 100 --json` |
+| 历史尝试汇总 | `runs/<plan_id>-a<N>/summary.json` | `ats_plan.py history <sid>` |
+| 是否卡住 | `plan_stalled` 事件 | `ats_plan.py check_schedule <sid>` 的 `stalled` 字段 |
+| 权限判定细节 | `task_start` 事件的 `gate` 字段；`policy` 命令 | `ats.py policy --json` |
 
 `task_start` 事件的 `gate` 取值直接说明了放行原因：`whitelist` / `level` / `approval`。这三个值就是「为什么它被允许跑」的答案。
 
@@ -350,8 +350,8 @@ Task 没有 `retry`，需要外部循环：
 ```powershell
 $max = 3
 for ($i = 1; $i -le $max; $i++) {
-  python scripts/bts.py create job1 --command "npm run build" --level L1 --timeout 900 --force | Out-Null
-  $out = python scripts/bts.py run job1 --wait --force | ConvertFrom-Json
+  python scripts/ats.py create job1 --command "npm run build" --level L1 --timeout 900 --force | Out-Null
+  $out = python scripts/ats.py run job1 --wait --force | ConvertFrom-Json
   if ($out.task.status -eq "succeeded") { break }
   if ($i -eq $max) { Write-Host "3 次均失败" ; exit 0 }
   Start-Sleep -Seconds (10 * $i)

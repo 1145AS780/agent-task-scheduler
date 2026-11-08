@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""把一次 bts / bts_plan 调用解析成「可分支的结论」。
+"""把一次 ats / ats_plan 调用解析成「可分支的结论」。
 
 用法：
     python reference\\examples\\parse-result.py task run build1 --wait
     python reference\\examples\\parse-result.py plan run_plan ci-lint-test-a1
-    python reference\\examples\\parse-result.py --root D:\\work\\.bts plan show gated
+    python reference\\examples\\parse-result.py --root D:\\work\\.ats plan show gated
 
 输出 JSON：
     {"layer", "verdict", "next", "exit_code", "details", "raw"}
@@ -34,8 +34,8 @@ from pathlib import Path
 
 SKILL_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = {
-    "task": SKILL_ROOT / "scripts" / "bts.py",
-    "plan": SKILL_ROOT / "scripts" / "bts_plan.py",
+    "task": SKILL_ROOT / "scripts" / "ats.py",
+    "plan": SKILL_ROOT / "scripts" / "ats_plan.py",
 }
 
 QUERY_COMMANDS = {
@@ -102,14 +102,14 @@ def classify(code, data, layer):
                 "policy_max": data.get("policy_max"),
             }
         if err == "approval_required":
-            return "need_approval", "bts.py approve <approval_id> 后带 --approval 重发同一命令", {
+            return "need_approval", "ats.py approve <approval_id> 后带 --approval 重发同一命令", {
                 "error": err,
                 "approval_id": data.get("approval_id"),
                 "approval_error": data.get("approval_error"),
                 "resume": data.get("resume"),
             }
         if err == "insufficient_level":
-            return "denied", "批准者身份需 ≥ 该审批的要求等级：提高 BTS_ACTOR_LEVEL 后再批", {
+            return "denied", "批准者身份需 ≥ 该审批的要求等级：提高 ATS_ACTOR_LEVEL 后再批", {
                 "error": err,
                 "approval_id": data.get("approval_id"),
                 "required_level": data.get("required_level"),
@@ -163,7 +163,7 @@ def classify(code, data, layer):
         }
     if status == "paused":
         ap = data.get("approval") or {}
-        return "ok_plan_paused", "bts.py approve <id> 后 resume --approval <id>", {
+        return "ok_plan_paused", "ats.py approve <id> 后 resume --approval <id>", {
             "approval_id": ap.get("id"),
             "required_level": ap.get("required_level"),
             "approval_error": data.get("approval_error"),
@@ -197,7 +197,7 @@ def conflict_hint(err, data):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="解析 bts / bts_plan 的调用结果")
+    ap = argparse.ArgumentParser(description="解析 ats / ats_plan 的调用结果")
     ap.add_argument("--root", default=None)
     ap.add_argument("layer", choices=["task", "plan"])
     ap.add_argument("argv", nargs=argparse.REMAINDER)

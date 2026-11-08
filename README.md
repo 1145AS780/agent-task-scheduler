@@ -1,7 +1,9 @@
-# Background Task Scheduler
+# Agent Task Scheduler
+
+*the scheduler your agent can steer*
 
 <p align="center">
-  <img src=".github/assets/banner.svg" alt="Background Task Scheduler" width="100%">
+  <img src=".github/assets/banner.svg" alt="Agent Task Scheduler" width="100%">
 </p>
 
 **English** | [中文](README.zh-CN.md)
@@ -9,21 +11,26 @@
 A purely local, daemon-free task scheduler for AI agents. Commands are split into three entity layers, the filesystem is the single source of truth, and the agent advances state between turns.
 
 - No external services, no third-party libraries — Python 3 standard library only
-- All state lives in `BTS_ROOT` (default `<cwd>/.bts`): plain text, editable by hand, versionable, backup-friendly
+- All state lives in `ATS_ROOT` (default `<cwd>/.ats`): plain text, editable by hand, versionable, backup-friendly
 - Every command prints JSON so an agent can parse it; exit codes are stable
 - Zero background processes. Nothing runs unless the agent (or a human) asks it to
+
+## Why not a cron job
+
+| | cron / systemd timer | Agent Task Scheduler |
+| --- | --- | --- |
+| Who starts it | A human edits crontab | The agent, inside a conversation turn |
+| Who can steer it mid-flight | Nobody; wait or kill | The agent polls status each turn and re-decides |
+| Output shape | Log text | JSON, stable exit codes |
+| High-risk commands | No gate | L0-L3 with expiring approvals |
 
 ## When to use it
 
 **Fits**
 
 - Long commands that should not hold the conversation turn: training runs, builds, batch transcoding, long test suites
-- Repeating the same command set on a cadence: patrols, polling, scheduled scraping
-- Ordered command chains where a failed step should skip its downstream
-- Flaky work that needs automatic retry with backoff
 - High-risk commands (deletes, releases, touching production data) that need a human to approve first
-- Post-hoc review of what ran, in what order, with what exit code
-- Batch downloads with resume and rate limiting; torrents and magnets via aria2c
+- Also a good fit: repeated patrols or polling, ordered chains that skip downstream on failure, flaky work needing retry with backoff, post-hoc review of what ran and with what exit code, and batch downloads with resume/rate limiting (torrents via aria2c)
 
 **Does not fit**
 
@@ -55,7 +62,7 @@ Schedule (periodic or one-shot)
 Every step is a task behind a permission gate, so it reuses the task layer's approval, events, and logging.
 
 <p align="center">
-  <img src="assets/bts-architecture.svg" alt="Three entity layers and the permission-gate checkpoint chain" width="100%">
+  <img src="assets/ats-architecture.svg" alt="Three entity layers and the permission-gate checkpoint chain" width="100%">
 </p>
 
 ## Requirements
@@ -67,23 +74,38 @@ Every step is a task behind a permission gate, so it reuses the task layer's app
 
 ```bash
 # Create a task (permission level defaults to L0)
-python scripts/bts.py create build --command "gradle build" --level L1
+python scripts/ats.py create build --command "gradle build" --level L1
 
 # Run it and wait
-python scripts/bts.py run build --wait
+python scripts/ats.py run build --wait
 
 # Inspect
-python scripts/bts.py status build --json
-python scripts/bts.py show build --lines 50
+python scripts/ats.py status build --json
+python scripts/ats.py show build --lines 50
+```
+
+Real output of `status build --json` after the run above:
+
+```json
+{
+  "task_id": "build",
+  "status": "succeeded",
+  "level": "L1",
+  "exit_code": 0,
+  "pid": 3744,
+  "started_at": 1794112325,
+  "ended_at": 1794112325,
+  "approval_id": null
+}
 ```
 
 Plans, schedules, and downloads:
 
 ```bash
-python scripts/bts_plan.py create --spec references/examples/plan-deps-retry.json
-python scripts/bts_plan.py run <plan-id> --wait
-python scripts/bts.py download --url https://example.com/file.bin --out ./dl --wait
-python scripts/bts.py torrent --magnet "magnet:?xt=urn:btih:..." --out ./dl --wait
+python scripts/ats_plan.py create --spec references/examples/plan-deps-retry.json
+python scripts/ats_plan.py run <plan-id> --wait
+python scripts/ats.py download --url https://example.com/file.bin --out ./dl --wait
+python scripts/ats.py torrent --magnet "magnet:?xt=urn:btih:..." --out ./dl --wait
 ```
 
 ## Permission tiers
@@ -107,17 +129,17 @@ references/                 Specs loaded on demand
 ├── orchestration-spec.md   Stages, steps, dependencies, failure propagation
 ├── permissions.md          L0-L3 tiers, approval flow, whitelist
 ├── data-model.md           Every field of task/plan/schedule records
-├── storage-layout.md       Directory tree under BTS_ROOT
+├── storage-layout.md       Directory tree under ATS_ROOT
 ├── state-machine.md        State transitions and terminal states
 ├── error-taxonomy.md       Error classes and the retry matrix
 ├── command-guide.md        How to write and invoke commands
 ├── anti-patterns.md        Common misuse and why it breaks
 └── examples/               Runnable minimal samples
 scripts/                    The scheduler itself
-├── bts.py                  Task layer: create, run, download, torrent, approvals
-├── bts_plan.py             Plan and schedule layer
-├── bts_download.py         HTTP downloader with resume and integrity check
-└── bts_torrent.py          aria2c wrapper for torrents and magnets
+├── ats.py                  Task layer: create, run, download, torrent, approvals
+├── ats_plan.py             Plan and schedule layer
+├── ats_download.py         HTTP downloader with resume and integrity check
+└── ats_torrent.py          aria2c wrapper for torrents and magnets
 tests/                      Checks that CI and contributors both run
 ├── lint.py                 Compile, indentation, whitespace, final newline
 └── selftest.py             Behavioural cases for tasks, plans, gates, recovery
@@ -129,11 +151,11 @@ tests/                      Checks that CI and contributors both run
 - `references/` is plural and flat — topic files sit directly beneath it, no further nesting
 - `scripts/` holds executables only, no prose; scripts resolve their own paths and never hardcode absolute ones
 - Samples live under `references/examples/` because they are documentation, not tooling
-- No build artifacts: `__pycache__/`, `.bts/`, logs, and caches stay out
+- No build artifacts: `__pycache__/`, `.ats/`, logs, and caches stay out
 
 ## Notes
 
-- The scheduler writes nothing outside `BTS_ROOT`. Deleting that directory resets all state.
+- The scheduler writes nothing outside `ATS_ROOT`. Deleting that directory resets all state.
 - State is plain files by design: you can inspect, edit, diff, and back it up without special tooling.
 - Paths in the documents use placeholders such as `<cwd>`; they do not correspond to any specific project.
 
@@ -147,7 +169,7 @@ python tests/selftest.py   # tasks, plans, permission gates, supervisor recovery
 ```
 
 Both scripts are standard library only, so there is nothing to install. Each test
-case runs in its own temporary `BTS_ROOT` and cleans up after itself.
+case runs in its own temporary `ATS_ROOT` and cleans up after itself.
 
 CI runs these same two commands on Linux, macOS, and Windows across Python 3.9 and
 3.13. The `lint` job gates the `test` matrix, so a syntax or style failure stops the

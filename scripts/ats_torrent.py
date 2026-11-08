@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""bts_torrent.py — background-task-scheduler 的 BitTorrent worker (v2.7)。
+"""ats_torrent.py — agent-task-scheduler 的 BitTorrent worker (v2.7)。
 
-由 `bts.py torrent` 自动派生，**不面向人直接使用**。它读取一份 torrent spec
+由 `ats.py torrent` 自动派生，**不面向人直接使用**。它读取一份 torrent spec
 （JSON），拉起一个只监听 127.0.0.1 的 aria2c RPC 实例，把种子下到目标目录，
 并把进度以 JSONL 打到 stdout（由 supervisor 收集）。
 
 依赖
-- aria2c：优先读环境变量 BTS_ARIA2，其次 PATH，再次 WinGet / scoop / choco 常见目录
+- aria2c：优先读环境变量 ATS_ARIA2，其次 PATH，再次 WinGet / scoop / choco 常见目录
 
 退出码
 - 0 下载完成
@@ -62,7 +62,7 @@ def log(obj):
 
 def find_aria2c():
     """按 环境变量 -> PATH -> 常见安装目录 的顺序解析 aria2c 可执行文件。"""
-    env = os.environ.get("BTS_ARIA2")
+    env = os.environ.get("ATS_ARIA2")
     if env and Path(env).is_file():
         return str(Path(env))
     for name in ("aria2c.exe", "aria2c"):
@@ -110,7 +110,7 @@ class RpcError(Exception):
 def rpc_call(port, secret, method, params=None, timeout=RPC_TIMEOUT):
     payload = {
         "jsonrpc": "2.0",
-        "id": "bts",
+        "id": "ats",
         "method": method,
         "params": ["token:" + secret] + list(params or []),
     }
@@ -374,7 +374,7 @@ def run(spec):
     if not aria2:
         log({"type": "torrent_error", "error": "aria2_not_found",
              "hint": "安装 aria2（winget install --id aria2.aria2 -e），"
-                     "或用环境变量 BTS_ARIA2 指向 aria2c.exe"})
+                     "或用环境变量 ATS_ARIA2 指向 aria2c.exe"})
         log({"type": "summary", "status": "failed", "error": "aria2_not_found"})
         return 3
 
@@ -448,7 +448,7 @@ def main(argv=None):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except (AttributeError, ValueError):
         pass
-    parser = argparse.ArgumentParser(prog="bts_torrent.py")
+    parser = argparse.ArgumentParser(prog="ats_torrent.py")
     parser.add_argument("--spec", required=True)
     args = parser.parse_args(argv)
     try:

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""background-task-scheduler — Task 层执行器 (v2.7)
+"""agent-task-scheduler — Task 层执行器 (v2.7)
 
 命令：
   create <id> --command "..." [--cwd DIR] [--level L0..L3] [--timeout SEC]
@@ -28,9 +28,9 @@
 退出码：0 正常 / 2 参数或确认缺失 / 3 不存在或状态冲突 / 4 权限不足
 
 设计约束：
-  * 所有状态落在 BTS_ROOT（默认 <cwd>/.bts），可用环境变量覆盖。
+  * 所有状态落在 ATS_ROOT（默认 <cwd>/.ats），可用环境变量覆盖。
   * Task 层事件统一写 <root>/events.jsonl；Plan 层事件写
-    <root>/schedules/<schedule_id>/events.jsonl（由 bts_plan.py 触发）。
+    <root>/schedules/<schedule_id>/events.jsonl（由 ats_plan.py 触发）。
   * 审批记录 <root>/approvals/<approval_id>.json，命令原文绑定 + 有效期。
 """
 
@@ -86,14 +86,14 @@ POLICY_DEFAULTS = {
 }
 
 POLICY_ENV = {
-    "max_level": "BTS_MAX_LEVEL",
-    "actor_level": "BTS_ACTOR_LEVEL",
-    "allow_rules": "BTS_ALLOW_RULES",
-    "approval_ttl_seconds": "BTS_APPROVAL_TTL",
-    "keep_runs_per_plan": "BTS_KEEP_RUNS",
-    "stall_seconds": "BTS_STALL",
-    "lease_autonomy": "BTS_LEASE_AUTONOMY",
-    "lease_file": "BTS_LEASE_FILE",
+    "max_level": "ATS_MAX_LEVEL",
+    "actor_level": "ATS_ACTOR_LEVEL",
+    "allow_rules": "ATS_ALLOW_RULES",
+    "approval_ttl_seconds": "ATS_APPROVAL_TTL",
+    "keep_runs_per_plan": "ATS_KEEP_RUNS",
+    "stall_seconds": "ATS_STALL",
+    "lease_autonomy": "ATS_LEASE_AUTONOMY",
+    "lease_file": "ATS_LEASE_FILE",
 }
 
 INT_POLICY_KEYS = ("approval_ttl_seconds", "keep_runs_per_plan", "stall_seconds")
@@ -101,13 +101,13 @@ INT_POLICY_KEYS = ("approval_ttl_seconds", "keep_runs_per_plan", "stall_seconds"
 
 # ---------------------------------------------------------------- 基础 IO
 
-def bts_root(root: str | None = None) -> Path:
+def ats_root(root: str | None = None) -> Path:
     if root:
         return Path(root)
-    env = os.environ.get("BTS_ROOT")
+    env = os.environ.get("ATS_ROOT")
     if env:
         return Path(env)
-    return Path.cwd() / ".bts"
+    return Path.cwd() / ".ats"
 
 
 def now_ts() -> int:
@@ -505,9 +505,9 @@ def regex_match(rules, text):
 
 
 def lease_path(root, pol=None) -> Path:
-    """租约文件位置：默认取 BTS 根目录同级的 temp/py_lease.json。
+    """租约文件位置：默认取 ATS 根目录同级的 temp/py_lease.json。
 
-    BTS_ROOT 可能指向 <repo>/.bts，也可能指向 <repo>/.autopilot/.bts；后者的同级
+    ATS_ROOT 可能指向 <repo>/.ats，也可能指向 <repo>/.autopilot/.ats；后者的同级
     temp 才是 py_consent 的落点。未显式指定时按候选顺序取第一个存在的，避免
     「配置没错却永远读不到租约」。候选都不存在则返回首个（判为 lease_absent）。
     """
@@ -654,7 +654,7 @@ def lease_autonomy(root, required_level, text, context=None):
     record, state = lease_state(root, pol)
     if record is None:
         return None
-    granted = record.get("bts_autonomy") or {}
+    granted = record.get("ats_autonomy") or {}
     if not granted.get("granted"):
         return None
     cap = lower_level(str(cfg.get("max_level")).upper(),
@@ -880,7 +880,7 @@ def kill_pid(pid):
         return False
     if os.name == "nt":
         subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                       capture_output=True, text=True)
+                       capture_output=True)
         return True
     try:
         os.killpg(os.getpgid(pid), signal.SIGKILL)
@@ -901,8 +901,8 @@ def pid_alive(pid) -> bool:
         return False
     if os.name == "nt":
         out = subprocess.run(["tasklist", "/FI", "PID eq %s" % pid, "/NH"],
-                             capture_output=True, text=True)
-        return str(pid) in (out.stdout or "")
+                             capture_output=True)
+        return str(pid).encode() in (out.stdout or b"")
     try:
         os.kill(pid, 0)
         return True
@@ -1141,8 +1141,8 @@ def split_post_hook(command):
 
 
 def resolve_encoder(task):
-    """定位 encoding_converter.py：BTS_ENCODER_PATH > <cwd>/tools > 当前目录/tools。"""
-    env_path = os.environ.get("BTS_ENCODER_PATH")
+    """定位 encoding_converter.py：ATS_ENCODER_PATH > <cwd>/tools > 当前目录/tools。"""
+    env_path = os.environ.get("ATS_ENCODER_PATH")
     if env_path and Path(env_path).is_file():
         return Path(env_path)
     bases = [Path(task["cwd"])] if task.get("cwd") else []
@@ -1167,7 +1167,7 @@ def run_post_hook(root, tdir, task, hook):
         try:
             log_path.write_text(
                 "encoder_not_found: 未找到 tools/encoding_converter.py；"
-                "可用环境变量 BTS_ENCODER_PATH 指定转换器路径\n", encoding="utf-8")
+                "可用环境变量 ATS_ENCODER_PATH 指定转换器路径\n", encoding="utf-8")
         except OSError:
             pass
     else:
@@ -1378,7 +1378,7 @@ def _start_task(root, task_id, approval=None, wait=False, force=False):
         return {"task": task, "waited": True}, EXIT_OK
 
     log_path = tdir / "supervisor.log"
-    # 必须显式带 --root：子进程 cwd 也是 root，缺省会把 BTS_ROOT 解析成 <root>/.bts
+    # 必须显式带 --root：子进程 cwd 也是 root，缺省会把 ATS_ROOT 解析成 <root>/.ats
     sup_argv = [sys.executable, str(Path(__file__).resolve()),
                 "--root", str(root), "supervise", task["id"]]
     sup_pid, mode = _spawn_supervisor(sup_argv, root, log_path)
@@ -1428,14 +1428,14 @@ def _spawn_via_wmi(argv, cwd):
     命令行走环境变量传入，避免把用户路径拼进 PowerShell 字符串。
     """
     env = os.environ.copy()
-    env["BTS_SPAWN_CMD"] = subprocess.list2cmdline([str(x) for x in argv])
-    env["BTS_SPAWN_CWD"] = str(cwd)
+    env["ATS_SPAWN_CMD"] = subprocess.list2cmdline([str(x) for x in argv])
+    env["ATS_SPAWN_CWD"] = str(cwd)
     script = (
         "$ErrorActionPreference='Stop';"
         "$r=Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
-        "-Arguments @{CommandLine=$env:BTS_SPAWN_CMD;CurrentDirectory=$env:BTS_SPAWN_CWD};"
-        "if($r.ReturnValue -eq 0){Write-Output ('BTS_PID=' + $r.ProcessId)}"
-        "else{Write-Output ('BTS_RC=' + $r.ReturnValue)}"
+        "-Arguments @{CommandLine=$env:ATS_SPAWN_CMD;CurrentDirectory=$env:ATS_SPAWN_CWD};"
+        "if($r.ReturnValue -eq 0){Write-Output ('ATS_PID=' + $r.ProcessId)}"
+        "else{Write-Output ('ATS_RC=' + $r.ReturnValue)}"
     )
     try:
         done = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
@@ -1443,7 +1443,7 @@ def _spawn_via_wmi(argv, cwd):
                               creationflags=0x08000000)   # CREATE_NO_WINDOW
     except (OSError, subprocess.TimeoutExpired):
         return None
-    found = re.search(r"BTS_PID=(\d+)", done.stdout or "")
+    found = re.search(r"ATS_PID=(\d+)", done.stdout or "")
     return int(found.group(1)) if found else None
 
 
@@ -1705,7 +1705,7 @@ def cmd_download(root, args):
         "approval_id": None,
         "finalized": False,
         "argv": [sys.executable,
-                 str(Path(__file__).resolve().parent / "bts_download.py"),
+                 str(Path(__file__).resolve().parent / "ats_download.py"),
                  "--spec", str(spec_path)],
         "download": {"spec": str(spec_path), "outputs": spec["outputs"],
                      "items": len(spec["items"]),
@@ -1744,7 +1744,7 @@ def _resolve_aria2():
     if scripts_dir not in sys.path:
         sys.path.insert(0, scripts_dir)
     try:
-        from bts_torrent import find_aria2c
+        from ats_torrent import find_aria2c
     except ImportError:
         return None
     return find_aria2c()
@@ -1769,7 +1769,7 @@ def cmd_torrent(root, args):
     if not aria2:
         return print_json({"error": "aria2_not_found",
                            "hint": "winget install --id aria2.aria2 -e，"
-                                   "或设置 BTS_ARIA2 指向 aria2c.exe"}, EXIT_USAGE)
+                                   "或设置 ATS_ARIA2 指向 aria2c.exe"}, EXIT_USAGE)
 
     task_id = args.id or ("tor-" + uuid.uuid4().hex[:6])
     tdir = task_dir(root, task_id)
@@ -1817,7 +1817,7 @@ def cmd_torrent(root, args):
         "approval_id": None,
         "finalized": False,
         "argv": [sys.executable,
-                 str(Path(__file__).resolve().parent / "bts_torrent.py"),
+                 str(Path(__file__).resolve().parent / "ats_torrent.py"),
                  "--spec", str(spec_path)],
         "torrent": {"spec": str(spec_path), "source": source["type"],
                     "outputs": out_dir, "seed_time": seed_time,
@@ -2216,7 +2216,7 @@ def cmd_policy(root, args):
         "pid": (record or {}).get("pid"),
         "heartbeat_at": (record or {}).get("heartbeat_at"),
         "scope": (record or {}).get("scope"),
-        "bts_autonomy": (record or {}).get("bts_autonomy"),
+        "ats_autonomy": (record or {}).get("ats_autonomy"),
     }
     if args.json:
         return print_json(pol)
@@ -2233,10 +2233,10 @@ def print_json(data, code=EXIT_OK):
 
 def build_parser():
     ap = argparse.ArgumentParser(
-        prog="bts.py",
-        description="background-task-scheduler — Task 层执行器 (v2.7)",
+        prog="ats.py",
+        description="agent-task-scheduler — Task 层执行器 (v2.7)",
     )
-    ap.add_argument("--root", default=None, help="BTS_ROOT，默认 <cwd>/.bts")
+    ap.add_argument("--root", default=None, help="ATS_ROOT，默认 <cwd>/.ats")
     sub = ap.add_subparsers(dest="command_name")
 
     p = sub.add_parser("create", help="创建任务")
@@ -2393,7 +2393,7 @@ def main(argv=None):
         print(json.dumps({"error": "missing_approval_id",
                           "hint": "使用 approve <id>... 或 --all"}, ensure_ascii=False))
         return EXIT_USAGE
-    root = bts_root(args.root)
+    root = ats_root(args.root)
     handler = HANDLERS[args.command_name]
     return handler(root, args) or EXIT_OK
 

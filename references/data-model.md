@@ -1,4 +1,4 @@
-# 数据模型 — background-task-scheduler v2.9
+# 数据模型 — agent-task-scheduler v2.9
 
 本文列出所有落盘 JSON 结构的字段、类型与语义。字段以实际脚本为准。
 
@@ -53,7 +53,7 @@ scheduler.log（全局）
 | `id` | string | 任务 ID，`t-xxxxxx` / `dl-xxxxxx` / `tor-xxxxxx` 或用户指定 |
 | `kind` | string \| 缺省 | 任务种类；缺省（普通命令）时无此字段，下载任务为 `"download"`，种子任务为 `"torrent"`，指令包条目为 `"pack"` |
 | `command` | string | 命令原文（审批与重跑都以它为准）；下载任务是 `download N item(s) -> <out>`，种子任务是 `torrent <btih 前 16 位或文件名> -> <out>`，指令包条目是切分后 `strip()` 的单条命令；带 `@enc` 钩子时这里只存**主命令** |
-| `argv` | string[] \| null | 原生 argv（不经 shell）；下载任务直启 `bts_download.py`，种子任务直启 `bts_torrent.py` |
+| `argv` | string[] \| null | 原生 argv（不经 shell）；下载任务直启 `ats_download.py`，种子任务直启 `ats_torrent.py` |
 | `download` | object \| null | 下载元数据：`spec` / `outputs` / `items` / `concurrency` / `rate_limit` / `retry` |
 | `torrent` | object \| null | 种子元数据：`spec` / `source`（`"magnet"` 或 `"torrent"`）/ `outputs` / `seed_time` / `max_download` / `max_upload` / `aria2` |
 | `pack` | object \| null | 指令包元数据：`pack_id` / `index`（1 起）/ `total`；仅 `kind="pack"` 出现 |
@@ -98,7 +98,7 @@ scheduler.log（全局）
 
 ### 3.3 `tasks/<task_id>/download.json`（`kind="download"`）
 
-由 `bts.py download` 写出，`bts_download.py` 只读。
+由 `ats.py download` 写出，`ats_download.py` 只读。
 
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
@@ -118,7 +118,7 @@ scheduler.log（全局）
 
 ### 3.4 `tasks/<task_id>/torrent.json`（`kind="torrent"`）
 
-由 `bts.py torrent` 写出，`bts_torrent.py` 只读。
+由 `ats.py torrent` 写出，`ats_torrent.py` 只读。
 
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
@@ -128,11 +128,11 @@ scheduler.log（全局）
 | `max_download` / `max_upload` | int | 0 | 全局上下行限速（字节/秒），0 不限 |
 | `log` | string | — | aria2 自身日志路径（`tasks/<id>/aria2.log`） |
 | `aria2` | string | — | 创建时解析到的 aria2c 绝对路径；worker 发现该文件已不存在时会重新解析 |
-| `poll` | number | 2 | RPC 轮询间隔秒数；`bts.py torrent` 不写，仅手工 spec 可加 |
+| `poll` | number | 2 | RPC 轮询间隔秒数；`ats.py torrent` 不写，仅手工 spec 可加 |
 
 ### 3.5 指令包任务（`kind="pack"`）
 
-`bts.py pack` 只写 `task.json`：**不写** `download.json` / `torrent.json` / `stdout.log` / `stderr.log` / `pid` / `exit_code`，任务停在 `pending`。
+`ats.py pack` 只写 `task.json`：**不写** `download.json` / `torrent.json` / `stdout.log` / `stderr.log` / `pid` / `exit_code`，任务停在 `pending`。
 
 - 同包条目共享 `pack_id`，但**彼此独立**：没有依赖、没有顺序保证；`index` 只表示它在原文本中的位置
 - 任意一条可直接 `run`，不影响同包其他任务（`run` 后与普通 Task 完全一致）
@@ -332,7 +332,7 @@ scheduler.log（全局）
 {"cursor": 128, "updated_at": 1793512103, "iso": "2026-11-01T13:48:23"}
 ```
 
-`bts.py events` 默认读取 `cursor` 之后的行并推进；`--lines N` 只看尾部且**不**推进游标。
+`ats.py events` 默认读取 `cursor` 之后的行并推进；`--lines N` 只看尾部且**不**推进游标。
 
 ---
 

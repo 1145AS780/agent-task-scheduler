@@ -10,18 +10,18 @@
 
 ```powershell
 # 进入技能根目录（examples 的上两级）
-cd <skills-root>/background-task-scheduler
+cd <skills-root>/agent-task-scheduler
 
-# 用独立的状态目录，避免污染项目里的 .bts
-$env:BTS_ROOT = "$PWD\.bts-examples"
+# 用独立的状态目录，避免污染项目里的 .ats
+$env:ATS_ROOT = "$PWD\.ats-examples"
 
-python scripts\bts.py policy --json
+python scripts\ats.py policy --json
 ```
 
 如果你在项目里使用，直接用 `--root`：
 
 ```powershell
-python <skill>\scripts\bts.py --root D:\work\.bts run build1
+python <skill>\scripts\ats.py --root D:\work\.ats run build1
 ```
 
 ---
@@ -47,10 +47,10 @@ python <skill>\scripts\bts.py --root D:\work\.bts run build1
 ## 2. 单条任务
 
 ```powershell
-python scripts\bts.py create build1 --spec reference\examples\task-spec.json
-python scripts\bts.py run build1
-python scripts\bts.py check build1
-python scripts\bts.py show build1 --lines 20
+python scripts\ats.py create build1 --spec reference\examples\task-spec.json
+python scripts\ats.py run build1
+python scripts\ats.py check build1
+python scripts\ats.py show build1 --lines 20
 ```
 
 `task-spec.json` 里 `id` 与命令行参数重复时，**命令行优先**（`--spec` 的 `id` 只在没给位置参数时生效）。
@@ -60,9 +60,9 @@ python scripts\bts.py show build1 --lines 20
 ## 3. 一次性计划
 
 ```powershell
-python scripts\bts_plan.py submit_plan --spec reference\examples\plan-oneshot.json
-python scripts\bts_plan.py run_plan ci-lint-test-a1
-python scripts\bts_plan.py history ci-lint-test
+python scripts\ats_plan.py submit_plan --spec reference\examples\plan-oneshot.json
+python scripts\ats_plan.py run_plan ci-lint-test-a1
+python scripts\ats_plan.py history ci-lint-test
 ```
 
 预期：`status=done`，`counts` 里 3 个 `succeeded`。
@@ -72,9 +72,9 @@ python scripts\bts_plan.py history ci-lint-test
 ## 4. 依赖与重试
 
 ```powershell
-python scripts\bts_plan.py submit_plan --spec reference\examples\plan-deps-retry.json
-python scripts\bts_plan.py run_plan dep-retry-a1
-python scripts\bts_plan.py show dep-retry-a1
+python scripts\ats_plan.py submit_plan --spec reference\examples\plan-deps-retry.json
+python scripts\ats_plan.py run_plan dep-retry-a1
+python scripts\ats_plan.py show dep-retry-a1
 ```
 
 预期：
@@ -93,13 +93,13 @@ python scripts\bts_plan.py show dep-retry-a1
 看事件流验证重试：
 
 ```powershell
-Get-Content .bts-examples\schedules\dep-retry\events.jsonl -Encoding UTF8 | Select-String "task_retry"
+Get-Content .ats-examples\schedules\dep-retry\events.jsonl -Encoding UTF8 | Select-String "task_retry"
 ```
 
 必须带 `-Encoding UTF8`：`events.jsonl` 是 UTF-8，PowerShell 5.1 的 `Get-Content` 默认按 ANSI 解码，中文会变乱码，甚至把 JSON 字符串截断导致 `ConvertFrom-Json` 报「未终止的字符串」。想完全避开编码问题，用 Python 读：
 
 ```powershell
-python -c "import io;[print(l.rstrip()) for l in io.open(r'.bts-examples\schedules\dep-retry\events.jsonl', encoding='utf-8') if 'task_retry' in l]"
+python -c "import io;[print(l.rstrip()) for l in io.open(r'.ats-examples\schedules\dep-retry\events.jsonl', encoding='utf-8') if 'task_retry' in l]"
 ```
 
 应能看到两条 `task_retry`（attempt=1、attempt=2），以及一条最终的 `task_failed`。
@@ -110,21 +110,21 @@ python -c "import io;[print(l.rstrip()) for l in io.open(r'.bts-examples\schedul
 
 ```powershell
 # 1) 跑计划，遇到 L2 步骤会暂停
-python scripts\bts_plan.py submit_plan --spec reference\examples\plan-approval-gated.json
-python scripts\bts_plan.py run_plan gated-a1
+python scripts\ats_plan.py submit_plan --spec reference\examples\plan-approval-gated.json
+python scripts\ats_plan.py run_plan gated-a1
 # → status: paused，approval.id 存在
 
 # 2) 批准：批准者的身份必须 ≥ 该审批要求的等级
 #    deploy 是 L2 → 当前身份必须是 L2 或 L3
 #    用 L1 批准 L2 审批会直接 insufficient_level（退出码 4），不是审批失败，而是身份不足
-$env:BTS_ACTOR_LEVEL = "L3"      # 观察成功路径
-python scripts\bts.py approve <approval_id>
+$env:ATS_ACTOR_LEVEL = "L3"      # 观察成功路径
+python scripts\ats.py approve <approval_id>
 
 # 3) 恢复
-python scripts\bts_plan.py resume gated --approval <approval_id>
+python scripts\ats_plan.py resume gated --approval <approval_id>
 ```
 
-审批的「要求等级」由**被拦的步骤**决定（本样例 `deploy` 是 L2、`purge` 是 L3）。批准者身份来自 `BTS_ACTOR_LEVEL`（或 `policy.json` 的 `actor_level`），它必须 ≥ 该步骤等级。所以：
+审批的「要求等级」由**被拦的步骤**决定（本样例 `deploy` 是 L2、`purge` 是 L3）。批准者身份来自 `ATS_ACTOR_LEVEL`（或 `policy.json` 的 `actor_level`），它必须 ≥ 该步骤等级。所以：
 
 | 被拦步骤 | 需要的最低批准者身份 |
 | --- | --- |
@@ -132,15 +132,15 @@ python scripts\bts_plan.py resume gated --approval <approval_id>
 | L2 | L2 |
 | L3 | L3 |
 
-如果你把 `BTS_ACTOR_LEVEL` 设成 `L3`，`run_plan` 会一路跑通不停——审批只在身份不足时才出现。
+如果你把 `ATS_ACTOR_LEVEL` 设成 `L3`，`run_plan` 会一路跑通不停——审批只在身份不足时才出现。
 
 恢复后 `stages/release/stage.json` 的 `waves` 应为 **3**：`deploy` 被拦那次已消耗第 1 波，`deploy` 自己占第 2 波，`purge` 占第 3 波。暂停不重置计数（暂停时 `waves` 已落盘）。
 
 （若按 §7 复制了 `policy-sample.json`，`max_level=L2` 会让 `purge` 直接 `denied_policy` 而不是执行；`denied` 发生在 `waves += 1` 之后，波次仍是 3。）
 
 ```powershell
-$env:BTS_ACTOR_LEVEL = "L0"    # 模拟受限身份，便于观察审批流程
-Remove-Item Env:\BTS_ACTOR_LEVEL   # 观察完清掉
+$env:ATS_ACTOR_LEVEL = "L0"    # 模拟受限身份，便于观察审批流程
+Remove-Item Env:\ATS_ACTOR_LEVEL   # 观察完清掉
 ```
 
 ---
@@ -148,12 +148,12 @@ Remove-Item Env:\BTS_ACTOR_LEVEL   # 观察完清掉
 ## 6. 周期计划
 
 ```powershell
-python scripts\bts_plan.py submit_schedule --spec reference\examples\schedule-recurring.json
-python scripts\bts_plan.py check_schedule patrol-sample   # 首次立即触发 a1（start_at=0 只影响首轮）
+python scripts\ats_plan.py submit_schedule --spec reference\examples\schedule-recurring.json
+python scripts\ats_plan.py check_schedule patrol-sample   # 首次立即触发 a1（start_at=0 只影响首轮）
 Start-Sleep -Seconds 6
-python scripts\bts_plan.py check_schedule patrol-sample   # 等满 every 后才触发 a2
+python scripts\ats_plan.py check_schedule patrol-sample   # 等满 every 后才触发 a2
 Start-Sleep -Seconds 6
-python scripts\bts_plan.py check_schedule patrol-sample   # 再等满 every 后触发 a3 → status=done
+python scripts\ats_plan.py check_schedule patrol-sample   # 再等满 every 后触发 a3 → status=done
 ```
 
 预期：`every: 5`、`max_runs: 3`，三次触发后 `status=done`、`next_poll=0`。
@@ -183,15 +183,15 @@ python scripts\bts_plan.py check_schedule patrol-sample   # 再等满 every 后�
 复制到状态根目录：
 
 ```powershell
-Copy-Item reference\examples\policy-sample.json .bts-examples\policy.json
-python scripts\bts.py policy --json
+Copy-Item reference\examples\policy-sample.json .ats-examples\policy.json
+python scripts\ats.py policy --json
 ```
 
 注意：`policy.json` 只在**读取时**生效，无需重启任何东西。环境变量优先级更高，临时调试时可以直接覆盖：
 
 ```powershell
-$env:BTS_MAX_LEVEL = "L2"
-$env:BTS_STALL = "10"
+$env:ATS_MAX_LEVEL = "L2"
+$env:ATS_STALL = "10"
 ```
 
 样例策略把 `max_level` 设为 `L2`：因此 `plan-approval-gated.json` 里的 L3 `purge` 会返回 `denied_policy`（`stage_failed` + `error_type=policy_denied`）——这正是「策略上限不可被审批绕过」的现场演示。想看 L3 通过，把 `max_level` 改回 `L3`。
@@ -211,7 +211,7 @@ python reference\examples\parse-result.py run build1 --wait
 python reference\examples\wait-plan.py ci-lint-test-a1
 ```
 
-三个脚本都以 `--root` / `BTS_ROOT` 为准，行为与手工命令完全一致。
+三个脚本都以 `--root` / `ATS_ROOT` 为准，行为与手工命令完全一致。
 
 ---
 
@@ -220,24 +220,24 @@ python reference\examples\wait-plan.py ci-lint-test-a1
 `download-spec.json` 演示清单的全部常用字段。`outputs` 只在**没给 `--out`** 时生效。
 
 ```powershell
-$root = ".bts-examples"
+$root = ".ats-examples"
 
 # 用清单（并发 2、限速 1 MiB/s）
-python scripts\bts.py download --file reference\examples\download-spec.json --root $root
+python scripts\ats.py download --file reference\examples\download-spec.json --root $root
 
 # 单文件 + 完整性校验（sha256/size 只允许单条目）
-python scripts\bts.py download --url https://example.com/a.zip --out .bts-examples\dl `
+python scripts\ats.py download --url https://example.com/a.zip --out .ats-examples\dl `
         --sha256 <hex> --size 10485760 --header "Referer: https://example.com/"
 
 # 调试：同步等完（退出码仍是 Task 语义，成败看 status）
-python scripts\bts.py download --url https://example.com/a.zip --out .bts-examples\dl --wait
+python scripts\ats.py download --url https://example.com/a.zip --out .ats-examples\dl --wait
 ```
 
 看结果：
 
 ```powershell
-python scripts\bts.py check dl-1a2b3c
-Get-Content ".bts-examples\tasks\dl-1a2b3c\stdout.log" -Encoding UTF8 | Select-Object -Last 1 | ConvertFrom-Json
+python scripts\ats.py check dl-1a2b3c
+Get-Content ".ats-examples\tasks\dl-1a2b3c\stdout.log" -Encoding UTF8 | Select-Object -Last 1 | ConvertFrom-Json
 ```
 
 最后一行是 `summary`：`total` / `succeeded` / `failed` / `bytes` / `elapsed` / `items`（逐条含 `attempts` 与 `error`）。
@@ -250,10 +250,10 @@ Get-Content ".bts-examples\tasks\dl-1a2b3c\stdout.log" -Encoding UTF8 | Select-O
 
 ```powershell
 # 磁力链：下完即停（--seed-time 默认 0）
-python scripts\bts.py torrent --magnet "<magnet:?xt=urn:btih:...>" --out .bts-examples\tor --root $root
+python scripts\ats.py torrent --magnet "<magnet:?xt=urn:btih:...>" --out .ats-examples\tor --root $root
 
 # .torrent + 做种 5 分钟 + 上行限速 512 KiB/s
-python scripts\bts.py torrent --torrent D:\dl\debian.torrent --out .bts-examples\tor `
+python scripts\ats.py torrent --torrent D:\dl\debian.torrent --out .ats-examples\tor `
         --seed-time 5 --max-upload 524288 --root $root
 ```
 
@@ -263,14 +263,14 @@ python scripts\bts.py torrent --torrent D:\dl\debian.torrent --out .bts-examples
 
 ```powershell
 # 3 条命令 → 3 个 pending Task；只登记文本
-python scripts\bts.py pack "echo A,echo B,echo C" --pack-id pk-demo --root $root
+python scripts\ats.py pack "echo A,echo B,echo C" --pack-id pk-demo --root $root
 
 # 命令内部含英文逗号：写成 \,
-python scripts\bts.py pack "echo a\,b,echo c" --pack-id pk-esc --root $root
+python scripts\ats.py pack "echo a\,b,echo c" --pack-id pk-esc --root $root
 
 # 按包查看；要跑哪条再单独 run
-python scripts\bts.py list --pack pk-demo --root $root
-python scripts\bts.py run <task_id> --root $root
+python scripts\ats.py list --pack pk-demo --root $root
+python scripts\ats.py run <task_id> --root $root
 ```
 
 返回 `{"pack_id", "count", "executed": false, "tasks": [...]}`——`executed: false` 是设计，不是失败。空包 / 空项分别报 `pack_empty` / `pack_empty_item`（exit 2），整包不落盘。
@@ -281,11 +281,11 @@ python scripts\bts.py run <task_id> --root $root
 
 ```powershell
 # 看还剩什么
-python scripts\bts.py list
-python scripts\bts_plan.py list
+python scripts\ats.py list
+python scripts\ats_plan.py list
 
 # 清空样例状态（不影响项目其它 root）
-Remove-Item -Recurse -Force .bts-examples
+Remove-Item -Recurse -Force .ats-examples
 ```
 
 删除前确认没有 `running` 的任务；否则先 `stop`。
