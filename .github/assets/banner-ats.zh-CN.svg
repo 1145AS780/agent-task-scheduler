@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="340" viewBox="0 0 1280 340" role="img" aria-label="Agent 任务调度器">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d1117"/>
+      <stop offset="1" stop-color="#161b22"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#58a6ff"/>
+      <stop offset="1" stop-color="#3fb950"/>
+    </linearGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#8b949e" stroke-opacity="0.07" stroke-width="1"/>
+    </pattern>
+  </defs>
+
+  <rect width="1280" height="340" fill="url(#bg)"/>
+  <rect width="1280" height="340" fill="url(#grid)"/>
+  <rect width="1280" height="3" fill="url(#accent)"/>
+
+  <g fill="none" stroke="#58a6ff" stroke-width="1.5">
+    <path d="M1090,50 V254" stroke-opacity="0.10" stroke-dasharray="5 7"/>
+
+    <polygon points="1090,62 1128,80 1090,98 1052,80" fill="#58a6ff" fill-opacity="0.08" stroke-opacity="0.34"/>
+    <polygon points="1052,80 1090,98 1090,106 1052,88" fill="#3fb950" fill-opacity="0.05" stroke-opacity="0.22"/>
+    <polygon points="1090,98 1128,80 1128,88 1090,106" fill="#8b949e" fill-opacity="0.05" stroke-opacity="0.22"/>
+
+    <polygon points="1090,124 1148,146 1090,168 1032,146" fill="#58a6ff" fill-opacity="0.06" stroke-opacity="0.30"/>
+    <polygon points="1032,146 1090,168 1090,176 1032,154" fill="#3fb950" fill-opacity="0.05" stroke-opacity="0.24"/>
+    <polygon points="1090,168 1148,146 1148,154 1090,176" fill="#8b949e" fill-opacity="0.05" stroke-opacity="0.24"/>
+
+    <polygon points="1090,190 1166,214 1090,238 1014,214" fill="#58a6ff" fill-opacity="0.06" stroke-opacity="0.30"/>
+    <polygon points="1014,214 1090,238 1090,246 1014,222" fill="#3fb950" fill-opacity="0.05" stroke-opacity="0.24"/>
+    <polygon points="1090,238 1166,214 1166,222 1090,246" fill="#8b949e" fill-opacity="0.05" stroke-opacity="0.24"/>
+  </g>
+
+  <text x="80" y="88" fill="#58a6ff" font-family="'Microsoft YaHei', 'PingFang SC', 'Noto Sans SC', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" letter-spacing="2">面向 AI AGENT 的本地任务调度器</text>
+
+  <text x="80" y="152" fill="#e6edf3" font-family="'Microsoft YaHei', 'PingFang SC', 'Noto Sans SC', Helvetica, Arial, sans-serif" font-size="46" font-weight="700">Agent 任务调度器</text>
+
+  <text x="80" y="190" fill="#8b949e" font-family="'Microsoft YaHei', 'PingFang SC', 'Noto Sans SC', Helvetica, Arial, sans-serif" font-size="15">三层实体、L0-L3 权限闸门，纯文件系统的状态存储。</text>
+
+  <g font-family="ui-monospace, SFMono-Regular, Consolas, 'Microsoft YaHei', monospace" font-size="12" fill="#c9d1d9">
+    <rect x="80" y="232" width="148" height="30" rx="6" fill="#1f2937" fill-opacity="0.55" stroke="#30363d"/>
+    <text x="154" y="251" text-anchor="middle">Python 3 标准库</text>
+    <rect x="236" y="232" width="108" height="30" rx="6" fill="#1f2937" fill-opacity="0.55" stroke="#30363d"/>
+    <text x="290" y="251" text-anchor="middle">L0-L3 闸门</text>
+    <rect x="352" y="232" width="108" height="30" rx="6" fill="#1f2937" fill-opacity="0.55" stroke="#30363d"/>
+    <text x="406" y="251" text-anchor="middle">无守护进程</text>
+    <rect x="468" y="232" width="128" height="30" rx="6" fill="#1f2937" fill-opacity="0.55" stroke="#30363d"/>
+    <text x="532" y="251" text-anchor="middle">HTTP 断点续传</text>
+    <rect x="604" y="232" width="92" height="30" rx="6" fill="#1f2937" fill-opacity="0.55" stroke="#30363d"/>
+    <text x="650" y="251" text-anchor="middle">种子下载</text>
+    <rect x="704" y="232" width="96" height="30" rx="6" fill="#1f2937" fill-opacity="0.55" stroke="#30363d"/>
+    <text x="752" y="251" text-anchor="middle">@enc 钩子</text>
+  </g>
+
+  <text x="80" y="302" fill="#6e7681" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="12">github.com/1145AS780/agent-task-scheduler</text>
+</svg>

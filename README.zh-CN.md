@@ -3,7 +3,7 @@
 *你的 Agent 能中途转向的调度器*
 
 <p align="center">
-  <img src=".github/assets/banner-ats.svg" alt="Agent 任务调度器" width="100%">
+  <img src=".github/assets/banner-ats.zh-CN.svg" alt="Agent 任务调度器" width="100%">
 </p>
 
 [English](README.md) | **中文**
