@@ -108,6 +108,80 @@ python scripts/ats.py download --url https://example.com/file.bin --out ./dl --w
 python scripts/ats.py torrent --magnet "magnet:?xt=urn:btih:..." --out ./dl --wait
 ```
 
+Local console and MCP:
+
+```bash
+# Web console on http://127.0.0.1:8765 (monitor, run, approvals, create)
+python scripts/ats_ui.py --open
+
+# Windows one-click: start in the background if needed, then open the browser
+scripts\ats_ui.cmd <ATS_ROOT>
+```
+
+Both MCP transports are described in [MCP](#mcp) below.
+
+## MCP
+
+There are two ways to connect an MCP client. They share the same 16-tool table defined in `scripts/ats_mcp.py`; the HTTP endpoint imports it rather than duplicating it.
+
+### stdio — the client launches the server
+
+```bash
+python scripts/ats_mcp.py [--root DIR]
+```
+
+stdio uses one JSON-RPC 2.0 message per line. stdout carries protocol traffic only; logs and tracebacks go to stderr. The adapter never imports the CLI modules — every tool call runs `ats.py` / `ats_plan.py` as a subprocess, so the filesystem stays the single source of truth. If either CLI file is missing, it exits with code `2`.
+
+```json
+{
+  "mcpServers": {
+    "agent-task-scheduler": {
+      "command": "python",
+      "args": ["<repo>/scripts/ats_mcp.py", "--root", "<ATS_ROOT>"]
+    }
+  }
+}
+```
+
+### HTTP — built into the console, off by default
+
+The console can host a Streamable HTTP endpoint (`POST /mcp`) inside its own process. It does **not** listen until you enable it:
+
+```bash
+# Console on 127.0.0.1:8765; the MCP endpoint defaults to console port + 1 (8766)
+python scripts/ats_ui.py --open
+
+# Override the MCP port explicitly
+python scripts/ats_ui.py --port 8765 --mcp-port 8766 --open
+```
+
+- Default port: console port + 1; `--mcp-port` overrides it (`--port` remains the console port)
+- Endpoint: `http://127.0.0.1:<mcp-port>/mcp`
+- Enable from the console UI, or `POST /api/action` with `{"action":"mcp.start","confirm":true}`; without `confirm:true` the API returns HTTP 400. **Enabling it grants any local process the ability to execute commands**
+- States: `stopped` / `running` / `failed` (the UI shows the failure reason, e.g. port already in use)
+- `initialize` returns an `Mcp-Session-Id` response header; `DELETE /mcp` ends a session; idle sessions are pruned after 30 minutes
+- `GET /mcp` returns 405 (no fake SSE stream); `GET /health` reports endpoint state; notifications return 202 with an empty body
+- Disabling it stops listening and releases the port; exiting the console does the same
+
+```json
+{
+  "mcpServers": {
+    "agent-task-scheduler": {
+      "type": "http",
+      "url": "http://127.0.0.1:8766/mcp"
+    }
+  }
+}
+```
+
+**Protocol**: the server supports `2025-06-18`, `2025-03-26`, and `2024-11-05`; `initialize` echoes the requested version when supported, otherwise the newest (`2025-06-18`). The HTTP endpoint reports `2025-06-18`.
+
+**Tools (16)**: `task_create`, `task_run`, `task_status`, `task_list`, `task_logs`, `task_stop`, `task_check`, `approval_resolve`, `plan_list`, `plan_show`, `plan_run`, `plan_resume`, `schedule_check`, `schedule_pause`, `schedule_resume`, `schedule_cancel`.
+
+**Errors**: JSON-RPC `-32700` parse error, `-32600` invalid request, `-32601` unknown method, `-32602` unknown tool or bad/missing params. Tool-level failures (unknown task, non-zero CLI exit) are returned as a normal result with `isError: true` — not as a protocol error — and internal handling exceptions become an `isError: true` result with `{"error":"internal_error"}` (traceback goes to stderr). HTTP adds `403` (bad Host or Origin), `415` (wrong Content-Type), `406` (unacceptable Accept), `413` (body over 8 MB), `404` (bad path or expired session), `405` (`GET /mcp`), `503` (endpoint not running).
+
+**Security**: binds `127.0.0.1` only, regardless of the console `--host`; accepts only `127.0.0.1:<port>` or `localhost:<port>` in `Host`; requires a same-origin `Origin` when the header is present; sends no CORS headers. There is no token or account authentication — the loopback bind and explicit confirmation are the only guards.
+
 ## Permission tiers
 
 | Level | Meaning | Approval |
@@ -139,7 +213,11 @@ scripts/                    The scheduler itself
 ├── ats.py                  Task layer: create, run, download, torrent, approvals
 ├── ats_plan.py             Plan and schedule layer
 ├── ats_download.py         HTTP downloader with resume and integrity check
-└── ats_torrent.py          aria2c wrapper for torrents and magnets
+├── ats_torrent.py          aria2c wrapper for torrents and magnets
+├── ats_mcp.py              MCP adapter (stdio, 16 tools)
+├── ats_mcp_http.py         Streamable HTTP endpoint hosted by the console
+├── ats_ui.py               Local web console: monitor, run, approvals, create
+└── ats_ui.cmd              Windows one-click launcher (--ensure, then open browser)
 tests/                      Checks that CI and contributors both run
 ├── lint.py                 Compile, indentation, whitespace, final newline
 └── selftest.py             Behavioural cases for tasks, plans, gates, recovery

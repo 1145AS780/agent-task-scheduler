@@ -108,6 +108,80 @@ python scripts/ats.py download --url https://example.com/file.bin --out ./dl --w
 python scripts/ats.py torrent --magnet "magnet:?xt=urn:btih:..." --out ./dl --wait
 ```
 
+本地控制台与 MCP：
+
+```bash
+# 本地 Web 控制台 http://127.0.0.1:8765（监控、运行、审批、创建）
+python scripts/ats_ui.py --open
+
+# Windows 一键启动：未运行则后台自启，再打开浏览器
+scripts\ats_ui.cmd <ATS_ROOT>
+```
+
+两种 MCP 用法见下文 [MCP](#mcp) 一节。
+
+## MCP
+
+接入 MCP 客户端有两种方式。两者共用 `scripts/ats_mcp.py` 里同一份 16 个工具的定义；HTTP 端点直接 import 它，不复制第二套。
+
+### stdio——客户端拉起服务
+
+```bash
+python scripts/ats_mcp.py [--root DIR]
+```
+
+stdio 每行一个 JSON-RPC 2.0 消息。stdout 只承载协议流量，日志与 traceback 一律走 stderr。适配器不 import CLI 模块——每次工具调用都以子进程运行 `ats.py` / `ats_plan.py`，文件系统仍是唯一状态源。同目录缺少任一 CLI 文件时退出码为 `2`。
+
+```json
+{
+  "mcpServers": {
+    "agent-task-scheduler": {
+      "command": "python",
+      "args": ["<repo>/scripts/ats_mcp.py", "--root", "<ATS_ROOT>"]
+    }
+  }
+}
+```
+
+### HTTP——控制台内置，默认关闭
+
+控制台可以在自己的进程内托管一个 Streamable HTTP 端点（`POST /mcp`）。它**不会**随控制台启动而自动监听：
+
+```bash
+# 控制台在 127.0.0.1:8765；MCP 端点默认使用 控制台端口 + 1（即 8766）
+python scripts/ats_ui.py --open
+
+# 显式指定 MCP 端口
+python scripts/ats_ui.py --port 8765 --mcp-port 8766 --open
+```
+
+- 默认端口：控制台端口 + 1；`--mcp-port` 可覆盖（`--port` 仍是控制台端口）
+- 端点地址：`http://127.0.0.1:<mcp-port>/mcp`
+- 从控制台界面开启，或 `POST /api/action`，body 为 `{"action":"mcp.start","confirm":true}`；缺少 `confirm:true` 时 HTTP 400。**开启等于授权本机任意进程执行命令**
+- 状态：`stopped` / `running` / `failed`（界面会显示失败原因，例如端口被占用）
+- `initialize` 用响应头下发 `Mcp-Session-Id`；`DELETE /mcp` 结束会话；空闲 30 分钟的会话自动剔除
+- `GET /mcp` 返回 405（不伪造 SSE 推送流）；`GET /health` 返回端点状态；通知消息返回 202 空体
+- 关闭立即停止监听并释放端口；控制台退出时同样释放
+
+```json
+{
+  "mcpServers": {
+    "agent-task-scheduler": {
+      "type": "http",
+      "url": "http://127.0.0.1:8766/mcp"
+    }
+  }
+}
+```
+
+**协议版本**：服务端支持 `2025-06-18`、`2025-03-26`、`2024-11-05`；`initialize` 请求命中哪个就回声哪个，否则回最新的 `2025-06-18`。HTTP 端点上报 `2025-06-18`。
+
+**工具（16 个）**：`task_create`、`task_run`、`task_status`、`task_list`、`task_logs`、`task_stop`、`task_check`、`approval_resolve`、`plan_list`、`plan_show`、`plan_run`、`plan_resume`、`schedule_check`、`schedule_pause`、`schedule_resume`、`schedule_cancel`。
+
+**错误行为**：JSON-RPC `-32700` 解析错误、`-32600` 非法请求、`-32601` 未知方法、`-32602` 未知工具或参数缺失/类型错误。工具级失败（任务不存在、CLI 非 0）作为正常结果返回并带 `isError: true`，不是协议层错误；工具调用内部异常同样返回 `isError: true` 与 `{"error":"internal_error"}`，traceback 写入 stderr。HTTP 另加 `403`（Host 或 Origin 不符）、`415`（Content-Type 非 JSON）、`406`（Accept 不接受）、`413`（请求体超过 8 MB）、`404`（路径错误或会话失效）、`405`（`GET /mcp`）、`503`（端点未运行）。
+
+**安全约束**：只绑 `127.0.0.1`，不跟随控制台的 `--host`；`Host` 只接受 `127.0.0.1:<port>` 或 `localhost:<port>`；带 `Origin` 时必须同源；不返回任何 CORS 头。没有 token / 账户鉴权——回环绑定与显式确认就是全部防线。
+
 ## 权限分级
 
 | 等级 | 含义 | 是否需审批 |
@@ -139,7 +213,11 @@ scripts/                    调度器本体
 ├── ats.py                  Task 层：创建、运行、下载、种子、审批
 ├── ats_plan.py             Plan 与 Schedule 层
 ├── ats_download.py         HTTP 下载器，断点续传与完整性校验
-└── ats_torrent.py          种子与磁力的 aria2c 封装
+├── ats_torrent.py          种子与磁力的 aria2c 封装
+├── ats_mcp.py              MCP 适配器（stdio，16 个工具）
+├── ats_mcp_http.py         控制台托管的 Streamable HTTP 端点
+├── ats_ui.py               本地 Web 控制台：监控、运行、审批、创建
+└── ats_ui.cmd              Windows 一键启动（--ensure，随后打开浏览器）
 tests/                      CI 与贡献者共用的检查
 ├── lint.py                编译、缩进、行尾空白、末尾换行
 └── selftest.py            任务、计划、闸门、恢复的行为用例

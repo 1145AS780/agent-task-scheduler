@@ -1,0 +1,4 @@
+# Windows batch files must stay CRLF regardless of core.autocrlf,
+# otherwise cmd.exe mis-parses line breaks on clone.
+*.cmd text eol=crlf
+*.bat text eol=crlf

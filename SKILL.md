@@ -157,6 +157,25 @@ python scripts/ats.py list --pack pk-demo
 
 `pack` 只把命令**文本**写成 N 个 `pending` Task，不启动进程、不产生日志；要执行仍逐条 `run <task_id>`（审批门照旧）。
 
+### 3.7 本地控制台
+
+```bash
+# 启动（默认 127.0.0.1:8765，--open 自动打开浏览器）
+python scripts/ats_ui.py --open
+
+# 未运行则后台自启，已在运行则直接复用（--ensure）
+python scripts/ats_ui.py --ensure --open
+
+# Windows 一键启动（等价于 --ensure --open；可传 ATS_ROOT）
+scripts\ats_ui.cmd <ATS_ROOT>
+
+# 查看 / 停止由 --ensure 启动的控制台
+python scripts/ats_ui.py --status
+python scripts/ats_ui.py --stop
+```
+
+控制台提供只读监控、运行/停止/重试、审批与创建编排；数据仍全部读写 `ATS_ROOT`，不引入第二套状态。MCP 接入见 §12。
+
 ---
 
 ## 4. 命令总表
@@ -729,7 +748,128 @@ python scripts/ats.py logs --plain | Select-String "ci1-a1"   # 只看某次
 
 ---
 
-## 12. 目录索引
+## 12. MCP 接入（stdio 与 HTTP）
+
+本技能提供两种 MCP 用法，**共用同一份工具表**：HTTP 端点直接 `import ats_mcp`，复用它的 `TOOLS` 与分发逻辑，不维护第二套工具定义。
+
+| 用法 | 进程归属 | 传输 | 启停方式 | 适用场景 |
+| --- | --- | --- | --- | --- |
+| `scripts/ats_mcp.py`（stdio） | MCP 客户端自己拉起 | stdio，每行一个 JSON-RPC 2.0 消息 | 客户端断开即退出 | 桌面 / IDE 里的 MCP 客户端 |
+| `scripts/ats_mcp_http.py`（HTTP） | `scripts/ats_ui.py` 控制台进程内 | Streamable HTTP，`POST /mcp` | 控制台开关，**默认关闭** | 需要网页开关、常驻本机端点 |
+
+### 12.1 stdio：客户端拉起，单文件独立运行
+
+```bash
+python scripts/ats_mcp.py [--root DIR]
+```
+
+- stdout 只写协议消息，日志 / traceback 全部走 stderr；`--root` 原样透传给 `ats.py` / `ats_plan.py`
+- 不 import `ats.py` / `ats_plan.py`，每次工具调用都以子进程走现有 CLI，状态读写只有一份真相
+- 启动只检查同目录的 `ats.py` 与 `ats_plan.py` 是否存在，缺失时退出码 `2`
+- 客户端配置：
+
+```json
+{
+  "mcpServers": {
+    "agent-task-scheduler": {
+      "command": "python",
+      "args": ["<repo>/scripts/ats_mcp.py", "--root", "<ATS_ROOT>"]
+    }
+  }
+}
+```
+
+### 12.2 HTTP：控制台内置，开关控制，默认关闭
+
+HTTP 端点由 `ats_ui.py` 在进程内创建，**不会随控制台启动而自动监听**：
+
+```bash
+# 控制台默认 127.0.0.1:8765；MCP 端点默认使用 控制台端口 + 1（即 8766）
+python scripts/ats_ui.py --open
+
+# 显式指定 MCP 端口
+python scripts/ats_ui.py --port 8765 --mcp-port 8766 --open
+```
+
+| 项 | 说明 |
+| --- | --- |
+| 默认端口 | 控制台端口 + 1；`--mcp-port` 可覆盖（`ats_ui.py` 的 `--port` 仍是控制台端口） |
+| 端点地址 | `http://127.0.0.1:<mcp-port>/mcp` |
+| 开启方式 | 控制台界面的 MCP 开关，或 `POST /api/action` 且 body 为 `{"action":"mcp.start","confirm":true}` |
+| 确认要求 | 缺少 `confirm:true` 时返回 HTTP 400 `bad_action`；**开启等于授权本机任意进程执行命令** |
+| 状态 | `stopped`（未启动）/ `running`（运行中）/ `failed`（启动失败，界面显示原因，例如端口被占用） |
+| 关闭 | `{"action":"mcp.stop"}`；立即停止监听并释放端口 |
+| 会话 | `initialize` 用响应头 `Mcp-Session-Id` 下发；`DELETE /mcp` 结束会话；空闲 30 分钟的会话自动剔除 |
+| 传输细节 | `GET /mcp` 返回 405（不伪造 SSE 推送流）；`GET /health` 返回端点状态；通知消息返回 202 空体 |
+| 进程退出 | 控制台退出时一并停止端点、释放端口 |
+
+客户端配置（地址与界面「一键复制」给出的片段一致）：
+
+```json
+{
+  "mcpServers": {
+    "agent-task-scheduler": {
+      "type": "http",
+      "url": "http://127.0.0.1:8766/mcp"
+    }
+  }
+}
+```
+
+**协议版本**：服务端支持 `2025-06-18` / `2025-03-26` / `2024-11-05`；`initialize` 请求命中哪个就回声哪个，否则回最新的 `2025-06-18`。HTTP 端点上报 `2025-06-18`。
+
+### 12.3 工具清单（16 个）
+
+工具名与 `ats_mcp.py` 的 `TOOLS` 一一对应，stdio 与 HTTP 完全相同：
+
+| 分组 | 工具 | 作用 |
+| --- | --- | --- |
+| Task | `task_create` | 创建任务，不启动 |
+| Task | `task_run` | 启动任务；`wait=true` 阻塞到结束 |
+| Task | `task_status` | 单个任务的轻量状态 |
+| Task | `task_list` | 列表，可按状态过滤 |
+| Task | `task_logs` | 任务详情 + stdout/stderr 尾部 |
+| Task | `task_stop` | 停止任务（杀进程树） |
+| Task | `task_check` | 核对存活状态，返回变更 / 运行中 / `next_poll` |
+| 审批 | `approval_resolve` | 批准或拒绝审批（可批量） |
+| Plan | `plan_list` | 列出 Schedule / Plan 概况 |
+| Plan | `plan_show` | 按 id 查看 Plan / Schedule |
+| Plan | `plan_run` | 执行 Plan 并等待 Stage 结束 |
+| Plan | `plan_resume` | 恢复中断的 Plan 或暂停的 Schedule |
+| Schedule | `schedule_check` | 驱动周期计划并返回 `next_run` / `next_poll` |
+| Schedule | `schedule_pause` | 暂停周期计划 |
+| Schedule | `schedule_resume` | 恢复暂停的周期计划 |
+| Schedule | `schedule_cancel` | 取消周期计划并跳过剩余步骤 |
+
+### 12.4 错误行为
+
+JSON-RPC 层（stdio 与 HTTP 相同）：
+
+| 场景 | 返回 |
+| --- | --- |
+| JSON 无法解析 | `-32700` Parse error |
+| 消息不是合法 JSON-RPC 2.0 请求 | `-32600` Invalid Request |
+| 未知方法 | `-32601` Method not found |
+| 未知工具 | `-32602` Invalid params |
+| 工具参数缺失 / 类型错误 | `-32602` Invalid params（携带具体字段说明） |
+| 工具执行失败（任务不存在、CLI 非 0 等） | `result.content[0]` 内是错误 JSON，且 `isError:true`（不是协议层错误） |
+| 工具调用内部异常 | `isError:true` 的结果 `{"error":"internal_error"}`，traceback 写入 stderr；不返回 `-32603` |
+| 通知（无 `id`） | 不产生响应；HTTP 返回 202 空体 |
+
+HTTP 层额外状态码：`403`（`forbidden_host` / `forbidden_origin`）、`415`（Content-Type 非 `application/json`）、`406`（Accept 不含 JSON 或 SSE）、`413`（请求体超过 8 MB）、`404`（路径错误或 `session_not_found`）、`405`（`GET /mcp` 或 `OPTIONS`）、`503`（端点未启动）、`400`（空请求体或缺少 `confirm`）。
+
+### 12.5 安全约束
+
+- **只绑 `127.0.0.1`**：MCP 端点不跟随控制台的 `--host` 暴露到局域网
+- **Host 校验**：只接受 `127.0.0.1:<mcp-port>` 或 `localhost:<mcp-port>`
+- **Origin 校验**：浏览器来源必须与端点同源；不返回任何 CORS 头
+- **默认关闭**：控制台启动不代表 MCP 已开启；开启必须显式确认
+- **权限含义**：开启开关等于把「执行命令」的能力暴露给本机任意进程；本端点没有 token / 账户鉴权，别把它当成安全边界
+- **不落盘**：会话与连接计数只在内存中，关闭即释放端口；控制台进程退出也会一并释放
+
+---
+
+## 13. 目录索引
 
 - [orchestration-spec.md](references/orchestration-spec.md) — 编排规格、能力矩阵、事件与命令映射
 - [permissions.md](references/permissions.md) — 等级、策略、白名单、审批闭环细节
@@ -743,7 +883,7 @@ python scripts/ats.py logs --plain | Select-String "ci1-a1"   # 只看某次
 
 ---
 
-## 13. 限制与未实现
+## 14. 限制与未实现
 
 | 项 | 状态 | 说明 |
 | --- | --- | --- |
@@ -759,13 +899,16 @@ python scripts/ats.py logs --plain | Select-String "ci1-a1"   # 只看某次
 | 指令包自动执行 | 不实现 | `pack` 只登记文本（全部 `pending`），不解析、不运行；必须逐条 `run` |
 | 钩子类型 | 仅 `enc` | 目前只支持 `@enc` 编码转换钩子；不支持任意「成功后追加命令」的通用链 |
 | 按日志文本自动停止 | 不实现 | 停止只依据退出码（含超时），不扫描 `stdout.log` / `stderr.log` 内容 |
+| MCP 端点鉴权 | 仅本机回环 + Host/Origin 校验 | 无 token / 账户鉴权；开启开关等于授权本机任意进程执行命令，不是安全边界 |
+| MCP 服务端推送 | 不实现 | 只做 Streamable HTTP 的 `POST` / `DELETE`；`GET /mcp` 回 405，不提供 SSE 推送流 |
 
 ---
 
-## 14. 版本历史
+## 15. 版本历史
 
 | 版本 | 变更 |
 | --- | --- |
+| 2.9.1 | 新增 MCP 适配与本地控制台：`scripts/ats_mcp.py`（stdio，客户端拉起，16 个工具，协议 `2025-06-18` / `2025-03-26` / `2024-11-05`）、`scripts/ats_mcp_http.py`（控制台进程内的 Streamable HTTP 端点，默认关闭，`--mcp-port` 默认控制台端口 + 1，`confirm:true` 才允许开启，只绑 `127.0.0.1` 并校验 Host / Origin）、`scripts/ats_ui.py` 本地 Web 控制台（`--ensure` / `--status` / `--stop`）与 `scripts/ats_ui.cmd` 一键启动（修正为指向 `ats_ui.py`） |
 | 2.8 | 新增「存活租约免审」`lease_autonomy`：`policy.json` / `ATS_LEASE_AUTONOMY` 配置 `enabled` / `max_level` / `rules` / `deny_rules`，`lease_file` / `ATS_LEASE_FILE` 指定租约路径（默认 `<root>/../temp/py_lease.json`，不存在则回落 `<root>/../.autopilot/temp/py_lease.json`）；`permission_gate` 与 `gate_operation` 在身份判定之后、审批之前插入该路径，放行写 `status=approved` 的留痕审批（`auto_approved=true`、`resolved_by=py_lease:<令牌>`）不投待办；判定为五道关（总闸 / 等级上限 / 租约存活 / 命令白名单 / 租约自带约束），任一不满足退回审批，坏配置一律回落关闭；`policy` 命令新增 `lease` 段报告租约状态；`py_consent.py` 第 4 题把授予范围变成用户可勾选项 |
 | 2.7 | 新增 `@enc` 后缀钩子：命令文本末尾追加 `@enc <转换器参数>` 即把编码转换登记为任务的 `post_hook`，主命令退出码为 0 才执行（转换器 `tools/encoding_converter.py`，可用 `ATS_ENCODER_PATH` 覆盖）；钩子失败则任务 `failed` 且 `exit_code` 取钩子码，日志 `hook-enc.log`、事件 `task_post_hook`；`create` / `pack` 均支持，坏语法报 `bad_hook` / `bad_hook_item`；转换器仍可独立 CLI 使用 |
 | 2.6 | 新增「关键任务失败即停」：Step 级 `critical: true` + Plan 级 `fail_on_critical: "stop"`，或 `run_plan` / `resume` 加 `--fail-fast`（临时视全部 Step 为 critical）；判定为**重试耗尽后仍失败**（`failed` / `timeout`），触发后立即 `taskkill /T /F` 终止同批兄弟进程树（`step.json` 记 `aborted_by="fail_fast"` + `aborted_at`，事件 `task_aborted`），当前 Stage 剩余 Step 标 `skipped(critical_failed)`、后续 Stage 标 `skipped`、`plan.status=failed`；修复 Plan 级 `fail_on_critical` 未写入 `plan.json` 与停止路径 `plan_end` 状态残留 `running` |
