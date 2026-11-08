@@ -3,7 +3,7 @@
 *the scheduler your agent can steer*
 
 <p align="center">
-  <img src=".github/assets/banner.svg" alt="Agent Task Scheduler" width="100%">
+  <img src=".github/assets/banner-ats.svg" alt="Agent Task Scheduler" width="100%">
 </p>
 
 **English** | [中文](README.zh-CN.md)
