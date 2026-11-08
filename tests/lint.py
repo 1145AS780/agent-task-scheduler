@@ -59,7 +59,19 @@ def check_final_newline(f):
         problems.append("%s: 文件未以换行结尾" % f.relative_to(REPO))
 
 
+def utf8_console():
+    """把 stdout/stderr 切到 UTF-8，避免 Windows 管道下打印中文抛 UnicodeEncodeError。"""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            try:
+                reconfigure(encoding="utf-8")
+            except (ValueError, OSError):
+                pass
+
+
 def main():
+    utf8_console()
     files = py_files()
     if not files:
         print("没有找到待检查的 Python 文件")

@@ -220,7 +220,23 @@ def finished_task_not_misreported():
 
 # ---------------------------------------------------------------- 入口
 
+def utf8_console():
+    """把 stdout/stderr 切到 UTF-8。
+
+    Windows 上被管道重定向时默认用 cp1252，打印中文会抛 UnicodeEncodeError，
+    表现为用例全过却退出码非零。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            try:
+                reconfigure(encoding="utf-8")
+            except (ValueError, OSError):
+                pass
+
+
 def main(argv):
+    utf8_console()
     keyword = None
     if "-k" in argv:
         i = argv.index("-k")
