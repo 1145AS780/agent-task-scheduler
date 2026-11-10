@@ -154,7 +154,7 @@
 
 **症状**：命令返回 `denied_policy`，用户反复 `approve` 却依然被拦。
 
-**为什么错**：判定顺序是「白名单 → 策略上限 → 身份 → 审批」。`level > max_level` 在**审批之前**就返回，审批压根不参与。
+**为什么错**：策略上限紧接在白名单之后判定，`level > max_level` 在**审批之前**就返回，审批压根不参与。身份直通只对 `approval_mode=auto` 的等级生效（默认仅 L0/L1）。
 
 **正确做法**：改 `policy.json` 的 `max_level`，或把 step 的 `level` 降下来。`denied_policy` 的返回里带 `policy_max`，用它对齐。
 

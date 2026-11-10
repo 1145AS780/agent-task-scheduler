@@ -47,6 +47,11 @@ import time
 import uuid
 from pathlib import Path
 
+try:                                    # 预演模块缺失时退化为纯权限门行为
+    import ats_preflight
+except Exception:                       # noqa: BLE001
+    ats_preflight = None
+
 # ---------------------------------------------------------------- 常量
 
 LEVEL_RANK = {"L0": 0, "L1": 1, "L2": 2, "L3": 3}
@@ -83,6 +88,15 @@ POLICY_DEFAULTS = {
     "stall_seconds": STALL_SECONDS_DEFAULT,
     "lease_autonomy": DEFAULT_LEASE_AUTONOMY,
     "lease_file": "",
+    # —— Pre-flight Sandbox / 审批开关（定案时只改 policy.json，不用回改代码）
+    "approval_mode": "ask",
+    "approval_mode_by_level": {"L0": "auto", "L1": "auto", "L2": "ask", "L3": "ask"},
+    "preflight_dry_run": False,
+    "preflight_timeout_seconds": 8,
+    "denied_injection_allow_override": True,
+    "win32_isolation": False,
+    "preflight_fail_closed": True,
+    "operation_levels": {"stop": "L2", "delete": "L3"},
 }
 
 POLICY_ENV = {
@@ -94,9 +108,21 @@ POLICY_ENV = {
     "stall_seconds": "ATS_STALL",
     "lease_autonomy": "ATS_LEASE_AUTONOMY",
     "lease_file": "ATS_LEASE_FILE",
+    "approval_mode": "ATS_APPROVAL_MODE",
+    "approval_mode_by_level": "ATS_APPROVAL_MODE_BY_LEVEL",
+    "preflight_dry_run": "ATS_PREFLIGHT_DRY_RUN",
+    "preflight_timeout_seconds": "ATS_PREFLIGHT_TIMEOUT",
+    "denied_injection_allow_override": "ATS_DENIED_INJECTION_OVERRIDE",
+    "win32_isolation": "ATS_WIN32_ISOLATION",
+    "preflight_fail_closed": "ATS_PREFLIGHT_FAIL_CLOSED",
+    "operation_levels": "ATS_OPERATION_LEVELS",
 }
 
-INT_POLICY_KEYS = ("approval_ttl_seconds", "keep_runs_per_plan", "stall_seconds")
+INT_POLICY_KEYS = ("approval_ttl_seconds", "keep_runs_per_plan", "stall_seconds",
+                   "preflight_timeout_seconds")
+BOOL_POLICY_KEYS = ("preflight_dry_run", "denied_injection_allow_override", "win32_isolation",
+                    "preflight_fail_closed")
+APPROVAL_MODES = ("auto", "ask", "deny-only")
 
 
 # ---------------------------------------------------------------- 基础 IO
@@ -198,14 +224,103 @@ def normalize_lease_autonomy(value):
     return cfg
 
 
+def as_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def normalize_approval_mode(value, default="ask"):
+    text = str(value or "").strip().lower().replace("_", "-")
+    return text if text in APPROVAL_MODES else default
+
+
+def normalize_mode_map(value):
+    """按等级审批模式表；非法键/值直接丢弃，不阻断读取。"""
+    out = {}
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return out
+    if not isinstance(value, dict):
+        return out
+    for key, mode in value.items():
+        level = str(key).upper()
+        if level in LEVEL_RANK:
+            out[level] = normalize_approval_mode(mode, POLICY_DEFAULTS["approval_mode"])
+    return out
+
+
+def approval_mode_for(pol, level) -> str:
+    """按等级取审批模式：approval_mode_by_level > approval_mode > ask。"""
+    modes = pol.get("approval_mode_by_level") or {}
+    mode = modes.get(str(level).upper()) or pol.get("approval_mode") or "ask"
+    return normalize_approval_mode(mode)
+
+
+def normalize_level_map(value):
+    """操作等级表（stop/delete 等）；非法等级丢弃，不阻断读取。"""
+    out = {}
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return out
+    if not isinstance(value, dict):
+        return out
+    for key, level in value.items():
+        text = str(level).upper()
+        if text in LEVEL_RANK:
+            out[str(key)] = text
+    return out
+
+
+def operation_level(pol, name, default="L2") -> str:
+    """取某操作型命令的等级；未配置或非法时回落到 default。"""
+    levels = pol.get("operation_levels") or {}
+    text = str(levels.get(str(name)) or "").upper()
+    return text if text in LEVEL_RANK else str(default).upper()
+
+
+DERIVE_L3_PATTERN = re.compile(
+    r"\b(rm|rmdir|del|erase|format|mkfs|shutdown|reboot|"
+    r"reg\s+(add|delete)|git\s+push\s+(--force|-f)|git\s+reset\s+--hard|"
+    r"git\s+clean\s+-[a-z]*f|npm\s+(i|install)\s+-g|pip\s+install|"
+    r"chmod\s+777|chown)\b",
+    re.IGNORECASE)
+DERIVE_L2_PATTERN = re.compile(
+    r"([A-Za-z]:\\|/etc/|/usr/|/bin/|\.ssh|"
+    r"\|\s*(sh|bash)\b|curl\s+\S+\s*\|\s*(sh|bash)|"
+    r"invoke-expression|\biex\b|\biwr\b|>\s*[A-Za-z~/])",
+    re.IGNORECASE)
+
+
+def derive_level(command, default=None) -> str:
+    """未传 --level 时按命令文本推等级：只抬高风险，判不准回落到 default。
+
+    只做正则匹配，看不懂 base64、变量拼接与脚本内部行为；
+    它的用途是把明显的危险命令抬进审批，不是识别恶意。
+    """
+    text = str(command or "")
+    if DERIVE_L3_PATTERN.search(text):
+        return "L3"
+    if DERIVE_L2_PATTERN.search(text):
+        return "L2"
+    return str(default or DEFAULT_TASK_LEVEL).upper()
+
+
 def policy(root, data=None):
     """读取策略：默认值 < policy.json < 环境变量。
 
     返回 dict，键集合固定为 POLICY_DEFAULTS 的键；lease_autonomy 与 lease_file
     是「存活租约免审」的两个开关，默认关闭，必须显式配置才生效。
     """
-    pol = dict(POLICY_DEFAULTS)
-    pol["allow_rules"] = []
+    pol = {key: (dict(value) if isinstance(value, dict) else
+                 list(value) if isinstance(value, (list, tuple)) else value)
+           for key, value in POLICY_DEFAULTS.items()}
     stored = jread(Path(root) / "policy.json", {})
     if isinstance(stored, dict):
         for key in POLICY_DEFAULTS:
@@ -226,6 +341,15 @@ def policy(root, data=None):
                 pol[key] = int(raw)
             except ValueError:
                 pass
+        elif key in BOOL_POLICY_KEYS:
+            pol[key] = as_bool(raw)
+        elif key == "approval_mode_by_level":
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict):
+                pol[key] = parsed
         else:
             pol[key] = str(raw)
     rules = pol.get("allow_rules")
@@ -237,10 +361,16 @@ def policy(root, data=None):
             pol[key] = int(pol[key])
         except (TypeError, ValueError):
             pol[key] = POLICY_DEFAULTS[key]
+    pol["preflight_timeout_seconds"] = max(1, min(60, pol["preflight_timeout_seconds"]))
+    for key in BOOL_POLICY_KEYS:
+        pol[key] = as_bool(pol[key])
     for key in ("max_level", "actor_level"):
         pol[key] = str(pol[key]).upper()
         if pol[key] not in LEVEL_RANK:
             pol[key] = POLICY_DEFAULTS[key]
+    pol["approval_mode"] = normalize_approval_mode(pol.get("approval_mode"))
+    pol["approval_mode_by_level"] = normalize_mode_map(pol.get("approval_mode_by_level"))
+    pol["operation_levels"] = normalize_level_map(pol.get("operation_levels"))
     pol["lease_autonomy"] = normalize_lease_autonomy(pol.get("lease_autonomy"))
     pol["lease_file"] = str(pol.get("lease_file") or "").strip()
     return pol
@@ -362,7 +492,7 @@ def approval_expired(record) -> bool:
         return False
 
 
-def find_pending_approval(root, command, context):
+def find_pending_approval(root, command, context, statuses=("pending",)):
     """查找同一条命令、同一个任务实例的待决审批，用于去重复用。
 
     重复发起同一条被拦命令时复用既有待决记录，避免每试一次就堆一条待办。
@@ -372,7 +502,7 @@ def find_pending_approval(root, command, context):
         rec = jread(p, {})
         if not isinstance(rec, dict):
             continue
-        if rec.get("status") != "pending":
+        if rec.get("status") not in statuses:
             continue
         if rec.get("command") != command:
             continue
@@ -412,20 +542,26 @@ def approval_instance_match(record, context):
     return False
 
 
-def create_approval(root, command, required_level, context=None, ttl=None, resume=None):
+def create_approval(root, command, required_level, context=None, ttl=None, resume=None,
+                    preflight=None, status="pending"):
     context = dict(context or {})
     pol = policy(root)
     if ttl is None:
         ttl = int(pol.get("approval_ttl_seconds", DEFAULT_APPROVAL_TTL))
     created = now_ts()
-    reuse = find_pending_approval(root, command, context)
+    reuse = find_pending_approval(root, command, context, ("pending", "denied_injection"))
     if reuse:
+        if preflight is not None:
+            reuse["preflight"] = preflight
+        if status == "denied_injection" and reuse.get("status") == "pending":
+            reuse["status"] = "denied_injection"
+        save_approval(root, reuse)
         return reuse
     record = {
         "id": new_approval_id(),
         "command": command,
         "required_level": str(required_level).upper(),
-        "status": "pending",
+        "status": status,
         "created_at": created,
         "created_iso": iso(created),
         "expires_at": (created + int(ttl)) if int(ttl) > 0 else None,
@@ -443,6 +579,8 @@ def create_approval(root, command, required_level, context=None, ttl=None, resum
         "task_created_at": context.get("task_created_at"),
         "resume": resume or context.get("resume"),
     }
+    if preflight is not None:
+        record["preflight"] = preflight
     save_approval(root, record)
     log_event(root, "approval_created",
               approval_id=record["id"],
@@ -467,6 +605,8 @@ def approval_check(root, approval_id, command):
         error = "rejected"
     elif status == "expired":
         error = "expired"
+    elif status == "denied_injection":
+        error = "denied_injection"
     elif status == "approved" and approval_expired(record):
         error = "expired"
     elif status != "approved":
@@ -686,7 +826,13 @@ def permission_gate(root, command, approval_id=None, context=None):
     返回 {"allowed", "reason", "required_level", "actor_level", "policy_max",
           "effective_level", "whitelist", "approval_id", "approval_error", "approval",
           "lease"}。
-    reason ∈ whitelist / level / lease_autonomy / approval / denied_policy / approval_required
+    reason ∈ whitelist / level / lease_autonomy / approval / denied_policy /
+             denied_mode / approval_required
+
+    approval_mode（auto/ask/deny-only）是「是否走人工审批」的独立闸门：
+      auto      —— 维持 actor_level 直通（旧行为）；
+      ask       —— 受控等级不再直通，必须走审批；
+      deny-only —— 受控等级直接拒绝，不产生可批准记录。
     """
     context = dict(context or {})
     pol = policy(root)
@@ -705,6 +851,7 @@ def permission_gate(root, command, approval_id=None, context=None):
         "lease": None,
         "allowed": False,
         "reason": None,
+        "approval_mode": None,
     }
     rule = whitelist_match(root, context.get("whitelist_text") or command)
     if rule:
@@ -713,7 +860,12 @@ def permission_gate(root, command, approval_id=None, context=None):
     if level_rank(required) > level_rank(cap):
         result.update(allowed=False, reason="denied_policy")
         return result
-    if level_rank(required) <= level_rank(actor):
+    mode = approval_mode_for(pol, required)
+    result["approval_mode"] = mode
+    if mode == "deny-only":
+        result.update(allowed=False, reason="denied_mode")
+        return result
+    if mode == "auto" and level_rank(required) <= level_rank(actor):
         result.update(allowed=True, reason="level")
         return result
     lease = lease_autonomy(root, required, context.get("whitelist_text") or command, context)
@@ -734,10 +886,42 @@ def permission_gate(root, command, approval_id=None, context=None):
     return result
 
 
-def gate_operation(root, level, label, approval_id=None, context=None):
-    """操作型（stop/delete/cancel/prune/rerun）权限门。
+def preflight_review(root, command, level, context=None, gate=None, shell=True):
+    """权限门之后、真正 spawn 之前的预演入口。
 
-    与 permission_gate 共用白名单/身份上限/策略上限逻辑；失败时自动创建审批并投递事件。
+    whitelist 直接跳过；denied_policy / denied_mode 不再跑侵入式检查。
+    预检自身异常时按 preflight_fail_closed 决定：True 判 deny_injection（要人看），
+    False 才退化为 None（旧行为）。
+    """
+    if ats_preflight is None:
+        return None
+    gate = gate or {}
+    if gate.get("reason") in ("whitelist", "denied_policy", "denied_mode"):
+        return None
+    ctx = dict(context or {})
+    ctx.setdefault("source", "run")
+    try:
+        return ats_preflight.review(root, command, level, context=ctx,
+                                    pol=policy(root), shell=bool(shell))
+    except Exception as exc:             # noqa: BLE001
+        try:
+            fail_closed = as_bool(policy(root).get("preflight_fail_closed"))
+        except Exception:                # noqa: BLE001
+            fail_closed = bool(POLICY_DEFAULTS["preflight_fail_closed"])
+        if not fail_closed:
+            return None
+        return {"status": "error", "verdict": "deny_injection",
+                "reason": "preflight_error", "tags": [], "confidence": "none",
+                "error": "%s: %s" % (type(exc).__name__, exc)}
+
+
+def gate_operation(root, level, label, approval_id=None, context=None):
+    """操作型（stop/delete）权限门。
+
+    操作型命令走独立闸门：与 permission_gate 共用策略上限与存活租约逻辑，
+    并读取 approval_mode：auto 且 level <= actor_level 才直接放行；
+    ask / deny-only 一律不因 actor_level 或白名单而放行。
+    失败时自动创建审批并投递事件。
     """
     context = dict(context or {})
     context.setdefault("source", "operation")
@@ -746,14 +930,20 @@ def gate_operation(root, level, label, approval_id=None, context=None):
     cap = str(pol.get("max_level") or DEFAULT_MAX_LEVEL).upper()
     level = str(level).upper()
 
-    rule = whitelist_match(root, context.get("whitelist_text") or label)
-    if rule:
-        return {"allowed": True, "reason": "whitelist", "whitelist": rule, "label": label}
     if level_rank(level) > level_rank(cap):
         return {"allowed": False, "reason": "denied_policy", "error": "denied_policy",
                 "label": label, "level": level}
-    if level_rank(level) <= level_rank(actor):
-        return {"allowed": True, "reason": "level", "label": label, "level": level}
+    mode = approval_mode_for(pol, level)
+    if mode == "deny-only":
+        return {"allowed": False, "reason": "denied_mode", "error": "denied_mode",
+                "label": label, "level": level, "approval_mode": mode}
+    rule = whitelist_match(root, context.get("whitelist_text") or label)
+    if rule and mode == "auto":
+        return {"allowed": True, "reason": "whitelist", "whitelist": rule,
+                "label": label, "level": level, "approval_mode": mode}
+    if mode == "auto" and level_rank(level) <= level_rank(actor):
+        return {"allowed": True, "reason": "level", "label": label,
+                "level": level, "approval_mode": mode}
 
     lease = lease_autonomy(root, level, context.get("whitelist_text") or label, context)
     if lease:
@@ -766,12 +956,15 @@ def gate_operation(root, level, label, approval_id=None, context=None):
         check = {"ok": False, "error": "mismatch", "record": check["record"]}
     if check["ok"]:
         return {"allowed": True, "reason": "approval", "label": label,
-                "approval": check["record"], "level": level}
+                "approval": check["record"], "level": level, "approval_mode": mode}
     record = create_approval(root, label, level, context=context, resume=context.get("resume"))
     announce_approval(root, record)
-    return {"allowed": False, "reason": "approval_required", "error": "approval_required",
-            "label": label, "level": level, "approval_error": check["error"],
-            "approval_id": record["id"], "approval": record}
+    blocked = {"allowed": False, "reason": "approval_required", "error": "approval_required",
+               "label": label, "level": level, "approval_error": check["error"],
+               "approval_id": record["id"], "approval": record, "approval_mode": mode}
+    if rule:
+        blocked["whitelist_ignored"] = rule
+    return blocked
 
 
 # ---------------------------------------------------------------- Task 存储
@@ -879,11 +1072,18 @@ def kill_pid(pid):
     except (TypeError, ValueError):
         return False
     if os.name == "nt":
-        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                       capture_output=True)
-        return True
+        done = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                              capture_output=True)
+        if done.returncode == 0:
+            return True
+        return not pid_alive(pid)
     try:
-        os.killpg(os.getpgid(pid), signal.SIGKILL)
+        pgid = os.getpgid(pid)
+        if pgid == os.getpgid(0):
+            # 目标仍在调用者自己的进程组里：killpg 会连发起 stop 的进程一起杀掉。
+            # 拒绝整组杀，让调用方看到 leftovers，而不是假装成功。
+            return False
+        os.killpg(pgid, signal.SIGKILL)
     except Exception:
         try:
             os.kill(pid, signal.SIGKILL)
@@ -908,6 +1108,33 @@ def pid_alive(pid) -> bool:
         return True
     except OSError:
         return False
+
+
+def stop_process_tree(task, wait_seconds=2.0):
+    """停止任务进程（树），返回 (leftovers, checked)。
+
+    POSIX 下任务由 start_new_session 起成独立进程组，killpg 一次带走整组；
+    Windows 下 taskkill /T 带走整棵子树。杀完轮询确认，仍有存活的再扫一次。
+    """
+    roots = [p for p in (task.get("pid"), task.get("supervisor_pid")) if p]
+    if not roots:
+        return [], 0
+    pids = {int(r) for r in roots}
+    for pid in pids:
+        kill_pid(pid)
+
+    alive = {p for p in pids if pid_alive(p)}
+    deadline = time.time() + max(0.0, wait_seconds)
+    while alive and time.time() < deadline:
+        time.sleep(0.1)
+        alive = {p for p in alive if pid_alive(p)}
+    for pid in alive:
+        kill_pid(pid)
+    deadline = time.time() + 1.0
+    while alive and time.time() < deadline:
+        time.sleep(0.1)
+        alive = {p for p in alive if pid_alive(p)}
+    return sorted(alive), len(pids)
 
 
 # ---------------------------------------------------------------- Task 状态同步
@@ -1042,7 +1269,7 @@ def cmd_create(root, args):
         key, value = item.split("=", 1)
         env[key] = value
 
-    level = str(args.level or spec.get("level") or DEFAULT_TASK_LEVEL).upper()
+    level = str(args.level or spec.get("level") or derive_level(command)).upper()
     if level not in LEVEL_RANK:
         print(json.dumps({"error": "bad_level", "level": level}, ensure_ascii=False))
         return EXIT_USAGE
@@ -1229,7 +1456,9 @@ def cmd_pack(root, args):
                            "hint": "钩子写法：<命令> @enc <转换器参数>；@enc 前后都要有内容"},
                           EXIT_USAGE)
 
-    level = str(args.level or DEFAULT_TASK_LEVEL).upper()
+    derived = max([derive_level(c) for c, _hook in parsed] or [DEFAULT_TASK_LEVEL],
+                  key=level_rank)
+    level = str(args.level or derived).upper()
     if level not in LEVEL_RANK:
         return print_json({"error": "bad_level", "level": level}, EXIT_USAGE)
     timeout = args.timeout if args.timeout is not None else DEFAULT_TIMEOUT
@@ -1319,19 +1548,64 @@ def _start_task(root, task_id, approval=None, wait=False, force=False):
                                 "source": "run", "task_id": task["id"],
                                 "task_instance": task.get("instance_id"),
                                 "task_created_at": task.get("created_at")})
+
+        approved_rec = gate.get("approval") or {}
+        human_override = gate["reason"] == "approval" and bool(approved_rec.get("override"))
+        preflight = None
+        if human_override:
+            log_event(root, "preflight_override", task_id=task["id"],
+                      approval_id=approved_rec.get("id"))
+        elif gate["allowed"] or gate["reason"] == "approval_required":
+            preflight = preflight_review(
+                root, task["command"], task.get("level") or DEFAULT_TASK_LEVEL,
+                {"source": "run", "task_id": task.get("id"),
+                 "task_instance": task.get("instance_id"),
+                 "task_created_at": task.get("created_at"),
+                 "cwd": task.get("cwd"), "argv": bool(task.get("argv"))},
+                gate, shell=bool(task.get("shell", True)))
+
+        if preflight and preflight.get("verdict") == "deny_injection":
+            allow_override = bool(policy(root).get("denied_injection_allow_override"))
+            rec = create_approval(
+                root, task["command"], gate["required_level"],
+                {"source": "run", "task_id": task["id"],
+                 "task_instance": task.get("instance_id"),
+                 "task_created_at": task.get("created_at")},
+                resume=("python %s run %s --approval <approval_id>"
+                        % (Path(__file__).name, task["id"])),
+                preflight=preflight,
+                status="pending" if allow_override else "denied_injection")
+            announce_approval(root, rec)
+            log_event(root, "preflight_denied", task_id=task["id"], approval_id=rec["id"],
+                      verdict=preflight.get("verdict"), reason=preflight.get("reason"),
+                      tags=preflight.get("tags"), confidence=preflight.get("confidence"))
+            emit_event(root, {"type": "preflight_denied", "task_id": task["id"],
+                              "approval_id": rec["id"],
+                              "verdict": preflight.get("verdict"),
+                              "reason": preflight.get("reason"),
+                              "tags": preflight.get("tags"),
+                              "executed": False})
+            return {"error": "denied_injection", "task_id": task["id"],
+                    "level": gate["required_level"], "approval_id": rec["id"],
+                    "override_allowed": allow_override,
+                    "preflight": preflight, "executed": False}, EXIT_DENIED
+
         if not gate["allowed"]:
             payload = {"error": "approval_required" if gate["reason"] == "approval_required" else gate["reason"],
                        "task_id": task["id"], "level": gate["required_level"],
                        "effective_level": gate["effective_level"],
                        "actor_level": gate["actor_level"],
                        "approval_id": None, "approval_error": gate["approval_error"]}
+            if preflight:
+                payload["preflight"] = preflight
             if gate["reason"] == "approval_required":
                 rec = create_approval(root, task["command"], gate["required_level"],
                                       {"source": "run", "task_id": task["id"],
                                        "task_instance": task.get("instance_id"),
                                        "task_created_at": task.get("created_at")},
                                       resume=("python %s run %s --approval <approval_id>"
-                                              % (Path(__file__).name, task["id"])))
+                                              % (Path(__file__).name, task["id"])),
+                                      preflight=preflight)
                 announce_approval(root, rec)
                 payload["approval_id"] = rec["id"]
                 payload["approval"] = rec
@@ -1341,6 +1615,12 @@ def _start_task(root, task_id, approval=None, wait=False, force=False):
             else:
                 log_event(root, "task_blocked", task_id=task["id"], reason=gate["reason"])
             return payload, EXIT_DENIED
+
+        if preflight:
+            log_event(root, "preflight_completed", task_id=task["id"],
+                      verdict=preflight.get("verdict"), status=preflight.get("status"),
+                      tags=preflight.get("tags"), confidence=preflight.get("confidence"),
+                      duration_ms=preflight.get("duration_ms"))
 
         (tdir / "stdout.log").parent.mkdir(parents=True, exist_ok=True)
         (tdir / "stdout.log").write_text("", encoding="utf-8")
@@ -1401,8 +1681,10 @@ def _spawn_supervisor(argv, root, log_path):
     """
     if os.name != "nt":
         with log_path.open("a", encoding="utf-8") as fh:
+            # 独立会话/进程组：停止时 killpg 不会波及 ATS CLI 自己所在的那一组
             proc = subprocess.Popen(argv, cwd=str(root), stdin=subprocess.DEVNULL,
-                                    stdout=fh, stderr=fh, close_fds=True)
+                                    stdout=fh, stderr=fh, close_fds=True,
+                                    start_new_session=True)
         return proc.pid, "detached"
 
     detached = 0x00000008 | 0x00000200          # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
@@ -1460,15 +1742,19 @@ def _supervise(root, task_id):
     timeout = int(task.get("timeout") or 0)
 
     argv = task.get("argv")
+    # 任务自己也起成独立会话/进程组：stop 的 killpg 才不会打到调用者那一组
+    spawn_kw = {"start_new_session": True} if os.name != "nt" else {}
     with (tdir / "stdout.log").open("a", encoding="utf-8", errors="replace") as out, \
             (tdir / "stderr.log").open("a", encoding="utf-8", errors="replace") as err:
         if argv:
             # 原生 argv 任务（download）：不经过 shell，避免 Windows 路径引号问题
             proc = subprocess.Popen([str(x) for x in argv], cwd=cwd, env=env,
-                                    stdin=subprocess.DEVNULL, stdout=out, stderr=err)
+                                    stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                                    **spawn_kw)
         else:
             proc = subprocess.Popen(command, cwd=cwd, env=env, shell=shell,
-                                    stdin=subprocess.DEVNULL, stdout=out, stderr=err)
+                                    stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                                    **spawn_kw)
         task = load_task(root, task_id) or task
         task["pid"] = proc.pid
         task["supervisor_pid"] = os.getpid()
@@ -1962,7 +2248,8 @@ def cmd_stop(root, args):
                           "status": task.get("status")}, ensure_ascii=False))
         return EXIT_CONFLICT
     label = "stop %s" % task["id"]
-    gate = gate_operation(root, "L1", label, args.approval,
+    gate = gate_operation(root, operation_level(policy(root), "stop", "L2"), label,
+                          args.approval,
                           {"task_id": task["id"], "source": "stop",
                            "task_instance": task.get("instance_id"),
                            "task_created_at": task.get("created_at"),
@@ -1971,11 +2258,17 @@ def cmd_stop(root, args):
     if not gate["allowed"]:
         return print_json(gate, EXIT_DENIED)
 
-    kill_pid(task.get("pid"))
-    kill_pid(task.get("supervisor_pid"))
+    leftovers, checked = stop_process_tree(task)
+    if leftovers:
+        # 还有进程活着：不要谎报 killed，任务留在 running 让调用方重试或改配置
+        log_event(root, "task_stop", task_id=task["id"], gate=gate.get("reason"),
+                  leftovers=leftovers)
+        return print_json({"task": task, "stopped": False,
+                           "checked": checked, "leftovers": leftovers}, EXIT_CONFLICT)
     finalize_task(root, task, "killed", task.get("exit_code"), note="stopped_by_user")
     log_event(root, "task_stop", task_id=task["id"], gate=gate.get("reason"))
-    return print_json({"task": task, "stopped": True})
+    return print_json({"task": task, "stopped": True,
+                       "checked": checked, "leftovers": []})
 
 
 def cmd_delete(root, args):
@@ -1990,7 +2283,8 @@ def cmd_delete(root, args):
                           "hint": "stop the task before deleting"}, ensure_ascii=False))
         return EXIT_CONFLICT
     label = "delete %s" % task["id"]
-    gate = gate_operation(root, "L2", label, args.approval,
+    gate = gate_operation(root, operation_level(policy(root), "delete", "L3"), label,
+                          args.approval,
                           {"task_id": task["id"], "source": "delete",
                            "task_instance": task.get("instance_id"),
                            "task_created_at": task.get("created_at"),
@@ -2070,8 +2364,27 @@ def cmd_approve(root, args):
                             "actor_level": actor})
             continue
 
+        pf = record.get("preflight") or {}
+        if pf.get("verdict") == "deny_injection" and not args.reject:
+            if not bool(pol.get("denied_injection_allow_override")):
+                results.append({"approval_id": approval_id, "ok": False,
+                                "error": "injection_denied",
+                                "note": "denied_injection 已按策略禁止人工放行"})
+                continue
+            if not getattr(args, "override", False):
+                results.append({"approval_id": approval_id, "ok": False,
+                                "error": "override_required",
+                                "note": "denied_injection 放行需要 --override 与 --note"})
+                continue
+            if not (args.note or "").strip():
+                results.append({"approval_id": approval_id, "ok": False,
+                                "error": "note_required",
+                                "note": "强制放行必须填写备注"})
+                continue
+
         status = "rejected" if args.reject else "approved"
         record["status"] = status
+        record["override"] = bool(pf.get("verdict") == "deny_injection" and not args.reject)
         record["resolved_at"] = now_ts()
         record["resolved_iso"] = iso()
         record["resolved_by"] = "actor:%s" % actor
@@ -2093,6 +2406,7 @@ def cmd_approve(root, args):
             "step_id": record.get("step_id"),
             "resolved_by": record["resolved_by"],
             "note": record.get("note"),
+            "override": record.get("override"),
             "resume": record.get("resume"),
         }
         sid = record.get("schedule_id")
@@ -2102,7 +2416,7 @@ def cmd_approve(root, args):
         log_event(root, "approval_resolved", approval_id=approval_id, status=status,
                   required_level=record.get("required_level"),
                   schedule_id=record.get("schedule_id"), task_id=record.get("task_id"),
-                  resolved_by=record["resolved_by"])
+                  resolved_by=record["resolved_by"], override=record.get("override"))
         results.append({"approval_id": approval_id, "ok": True, "status": status,
                         "approval": record, "event": event})
 
@@ -2207,6 +2521,39 @@ def cmd_logs(root, args):
 
 
 def cmd_policy(root, args):
+    changes = dict(args.set or [])
+    if changes:
+        unknown = sorted(k for k in changes if k not in POLICY_DEFAULTS)
+        if unknown:
+            return print_json({"error": "unknown_keys", "keys": unknown,
+                               "allowed": sorted(POLICY_DEFAULTS)}, EXIT_USAGE)
+        path = Path(root) / "policy.json"
+        stored = jread(path, {})
+        if not isinstance(stored, dict):
+            stored = {}
+        for key, raw in changes.items():
+            if key in BOOL_POLICY_KEYS:
+                stored[key] = as_bool(raw)
+            elif key in INT_POLICY_KEYS:
+                try:
+                    stored[key] = int(raw)
+                except (TypeError, ValueError):
+                    return print_json({"error": "bad_value", "key": key,
+                                       "value": raw}, EXIT_USAGE)
+            elif key == "approval_mode_by_level":
+                try:
+                    parsed = json.loads(raw)
+                except (TypeError, ValueError):
+                    return print_json({"error": "bad_value", "key": key,
+                                       "value": raw}, EXIT_USAGE)
+                if not isinstance(parsed, dict):
+                    return print_json({"error": "bad_value", "key": key,
+                                       "value": raw}, EXIT_USAGE)
+                stored[key] = parsed
+            else:
+                stored[key] = raw
+        jwrite(path, stored)
+        log_event(root, "policy_updated", keys=sorted(changes))
     pol = policy(root)
     record, state = lease_state(root, pol)
     pol["lease"] = {
@@ -2340,6 +2687,8 @@ def build_parser():
     p.add_argument("--all", action="store_true")
     p.add_argument("--reject", action="store_true")
     p.add_argument("--note", default=None)
+    p.add_argument("--override", action="store_true",
+                   help="denied_injection 强制放行（需策略允许 + --note）")
 
     p = sub.add_parser("approval", help="审批记录维护（prune 清理已决议记录）")
     p.add_argument("action", choices=["prune"])
@@ -2356,8 +2705,10 @@ def build_parser():
     p.add_argument("--plain", action="store_true")
     p.add_argument("--json", action="store_true")
 
-    p = sub.add_parser("policy", help="查看有效策略")
+    p = sub.add_parser("policy", help="查看/修改有效策略")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--set", action="append", nargs=2, metavar=("KEY", "VALUE"),
+                   default=[], help="写入 policy.json，可重复：--set approval_mode ask")
 
     return ap
 

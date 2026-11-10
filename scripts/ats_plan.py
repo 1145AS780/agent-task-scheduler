@@ -58,6 +58,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ats  # noqa: E402
 
+try:                                    # 预演模块缺失时退化为纯权限门行为
+    import ats_preflight  # noqa: E402
+except Exception:                       # noqa: BLE001
+    ats_preflight = None
+
 EXIT_OK = 0
 EXIT_USAGE = 2
 EXIT_CONFLICT = 3
@@ -651,25 +656,69 @@ def ensure_step_permission(root, plan, sdir, stage, step, approval):
     approval_id = state.get("approval_id") or approval
     gate = ats.permission_gate(root, command, approval_id, context)
 
+    approved_rec = gate.get("approval") or {}
+    human_override = gate["reason"] == "approval" and bool(approved_rec.get("override"))
+    preflight = None
+    if ats_preflight is not None and not human_override and (
+            gate["allowed"] or gate["reason"] == "approval_required"):
+        preflight = ats_preflight.review(
+            root, command, context.get("required_level"),
+            context=dict(context, cwd=step.get("cwd") or plan.get("cwd")),
+            pol=ats.policy(root), shell=True)
+
+    if preflight and preflight.get("verdict") == "deny_injection":
+        allow_override = bool(ats.policy(root).get("denied_injection_allow_override"))
+        record = ats.create_approval(
+            root, command, gate["required_level"], context,
+            resume=("python ats_plan.py resume %s --approval <approval_id>"
+                    % Path(sdir).name),
+            preflight=preflight,
+            status="pending" if allow_override else "denied_injection")
+        state["status"] = "failed"
+        state["error_type"] = "denied_injection"
+        state["ended_at"] = now_ts()
+        state["approval_id"] = record["id"]
+        save_step(pdir, stage.get("id"), step.get("id"), state)
+        emit(sdir, {"type": "task_failed", "schedule_id": Path(sdir).name,
+                    "plan_id": plan.get("id"), "stage_id": stage.get("id"),
+                    "step_id": step.get("id"), "status": "failed",
+                    "error_type": "denied_injection",
+                    "approval_id": record["id"],
+                    "preflight": preflight})
+        plan_log(root, plan, "task_failed", stage_id=stage.get("id"),
+                 step_id=step.get("id"), status="failed", error_type="denied_injection")
+        return "denied", {"error": "denied_injection", "preflight": preflight,
+                          "approval_id": record["id"], "gate": gate,
+                          "override_allowed": allow_override}
+
     if gate["allowed"]:
+        if preflight:
+            ats.log_event(root, "preflight_completed", step_id=step.get("id"),
+                          verdict=preflight.get("verdict"),
+                          status=preflight.get("status"),
+                          tags=preflight.get("tags"),
+                          confidence=preflight.get("confidence"),
+                          duration_ms=preflight.get("duration_ms"))
         if approval and not state.get("approval_id"):
             state["approval_id"] = approval
             save_step(pdir, stage.get("id"), step.get("id"), state)
         return "ready", gate
 
-    if gate["reason"] == "denied_policy":
+    if gate["reason"] in ("denied_policy", "denied_mode"):
+        err = "policy_denied" if gate["reason"] == "denied_policy" else "mode_denied"
         state["status"] = "failed"
-        state["error_type"] = "policy_denied"
+        state["error_type"] = err
         state["ended_at"] = now_ts()
         save_step(pdir, stage.get("id"), step.get("id"), state)
         emit(sdir, {"type": "task_failed", "schedule_id": Path(sdir).name,
                     "plan_id": plan.get("id"), "stage_id": stage.get("id"),
                     "step_id": step.get("id"), "status": "failed",
-                    "error_type": "policy_denied",
+                    "error_type": err,
                     "required_level": gate["required_level"],
-                    "policy_max": gate["policy_max"]})
+                    "policy_max": gate["policy_max"],
+                    "approval_mode": gate.get("approval_mode")})
         plan_log(root, plan, "task_failed", stage_id=stage.get("id"),
-                 step_id=step.get("id"), status="failed", error_type="policy_denied")
+                 step_id=step.get("id"), status="failed", error_type=err)
         return "denied", gate
 
     # approval_required：缺失/过期时创建审批；pending 不重发（避免刷屏）
@@ -681,6 +730,7 @@ def ensure_step_permission(root, plan, sdir, stage, step, approval):
             root, command, gate["required_level"], context,
             resume=("python ats_plan.py resume %s --approval <approval_id>"
                     % Path(sdir).name),
+            preflight=preflight,
         )
         state["approval_id"] = record["id"]
         state["approval_reissued_at"] = now_ts()
@@ -695,6 +745,7 @@ def ensure_step_permission(root, plan, sdir, stage, step, approval):
                     "expires_at": record.get("expires_at"),
                     "approval_error": check["error"],
                     "reissued": replaced,
+                    "preflight": preflight,
                     "resume": record.get("resume")})
         plan_log(root, plan, "approval_reissued" if replaced else "approval_requested",
                  stage_id=stage.get("id"), step_id=step.get("id"),

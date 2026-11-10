@@ -57,15 +57,24 @@
    若 rank(required_level) > rank(max_level) → DENY(denied_policy)，结束
    （审批与租约都不能绕过；这是硬上限）
 
-3. 身份上限
-   若 rank(required_level) <= rank(actor_level) → ALLOW(level)，结束
+3. 取审批模式
+   mode = approval_mode_for(pol, required_level)
+   取值优先级：approval_mode_by_level[level] > approval_mode > "ask"
 
-4. 存活租约免审（详见 6.9）
+4. 直接拒绝（deny-only 档）
+   若 mode == "deny-only" → DENY(denied_mode)，结束
+   （不创建审批记录，不产生可批准对象）
+
+5. 身份直通（仅 auto 档）
+   若 mode == "auto" 且 rank(required_level) <= rank(actor_level) → ALLOW(level)，结束
+   （ask 档不看身份，即使 actor_level 更高也继续往下走审批）
+
+6. 存活租约免审（详见 6.9）
    若 lease_autonomy.enabled 且租约存活 且 required_level ≤ min(max_level, 租约授予等级)
    且 command 命中 rules、不命中 deny_rules、未触发租约自带约束
    → ALLOW(lease_autonomy)，写一条 status=approved 的留痕审批，结束
 
-5. 审批
+7. 审批
    check = approval_check(approval_id, command)
    若 check.ok → ALLOW(approval)，结束
    否则 → DENY(approval_required)，并在调用方决定是否创建审批
@@ -111,7 +120,7 @@
 python scripts/ats.py policy --json
 ```
 
-**注意**：环境变量优先于文件，便于临时提升/收紧权限。生产环境应把 `actor_level` 设低（如 L1），让 L2+ 必须走审批。
+**注意**：环境变量优先于文件，便于临时提升/收紧权限。L2/L3 是否需要审批由 `approval_mode` / `approval_mode_by_level` 决定（默认 L2/L3 为 `ask`），与 `actor_level` 无关；`actor_level` 只在 `auto` 档（默认 L0/L1）参与「等级 ≤ 身份即直通」的判定。生产环境建议把 `actor_level` 设低（如 L1），并让受控等级保持 `ask`。
 
 ---
 
@@ -433,7 +442,7 @@ check = approval_check(state.approval_id, command)
 | 反模式 | 后果 | 正确做法 |
 | --- | --- | --- |
 | `allow_rules: [".*"]` | 权限体系形同虚设 | 只放精确安全命令 |
-| `actor_level: "L3"` 长期不变 | 所有审批都被跳过 | 默认 L1，需要时临时提升 |
+| `actor_level: "L3"`（默认值）长期不变 | `auto` 档（默认 L0/L1）不再构成身份约束；`ask` 档（默认 L2/L3）本就由审批控制 | 需收紧 `auto` 档时临时降低；受控等级改 `approval_mode` |
 | 审批后拼接变量再执行 | `mismatch` 永远失败 | 审批前确定最终命令 |
 | TTL 设为 0（永久） | 过期授权被长期复用 | 按任务时长设 1-24 小时 |
 | 把 `--force` 命令放白名单 | 不可逆操作无门槛 | 显式走审批 |

@@ -389,12 +389,14 @@ python tools/encoding_converter.py logs --detect --to utf-8 --dry-run
 
 1. **白名单放行**：命令文本命中 `allow_rules` 任一正则 → 直接允许（优先于等级）
 2. **策略上限**：`level > max_level` → 直接拒绝，审批与租约都不能绕过
-3. **身份上限**：`level <= actor_level` → 直接允许
-4. **存活租约免审**：`lease_autonomy` 总闸开启、租约存活且命令命中其白名单 → 直接允许（见 5.6）
-5. **审批**：否则要求有效审批；无审批则创建审批记录、投递事件、返回 `approval_required`
+3. **取审批模式**：按 `approval_mode_by_level[level] > approval_mode > "ask"` 取 auto / ask / deny-only
+4. **直接拒绝**：`mode=deny-only` → 返回 `denied_mode`，不创建可批准记录
+5. **身份直通（仅 auto 档）**：`mode=auto` 且 `level <= actor_level` → 直接允许
+6. **存活租约免审**：`lease_autonomy` 总闸开启、租约存活且命令命中其白名单 → 直接允许（见 5.6）
+7. **审批**：否则要求有效审批；无审批则创建审批记录、投递事件、返回 `approval_required`
 
 有效等级 = `min(required_level, actor_level, max_level)`，用于解释为什么被拦。
-`reason` 取值按上表一一对应：`whitelist` / `denied_policy` / `level` / `lease_autonomy` / `approval` / `approval_required`。
+`reason` 取值：`whitelist` / `denied_policy` / `denied_mode` / `level` / `lease_autonomy` / `approval` / `approval_required`。
 
 ### 5.3 策略文件与环境变量
 
@@ -879,6 +881,7 @@ HTTP 层额外状态码：`403`（`forbidden_host` / `forbidden_origin`）、`41
 - [error-taxonomy.md](references/error-taxonomy.md) — 错误分类与重试矩阵
 - [command-guide.md](references/command-guide.md) — 命令书写与调用规范
 - [anti-patterns.md](references/anti-patterns.md) — 常见错误用法
+- [api-guide.md](references/api-guide.md) — 对外协议、退出码、审批协议与扩展点清单
 - [examples/](references/examples) — 可直接运行的最小样例
 
 ---

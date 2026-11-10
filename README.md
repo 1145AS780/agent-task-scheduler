@@ -73,7 +73,7 @@ Every step is a task behind a permission gate, so it reuses the task layer's app
 ## Quick start
 
 ```bash
-# Create a task (permission level defaults to L0)
+# Create a task (permission level defaults to L1)
 python scripts/ats.py create build --command "gradle build" --level L1
 
 # Run it and wait
@@ -208,6 +208,7 @@ references/                 Specs loaded on demand
 ├── error-taxonomy.md       Error classes and the retry matrix
 ├── command-guide.md        How to write and invoke commands
 ├── anti-patterns.md        Common misuse and why it breaks
+├── api-guide.md            Protocol and extension checklist
 └── examples/               Runnable minimal samples
 scripts/                    The scheduler itself
 ├── ats.py                  Task layer: create, run, download, torrent, approvals

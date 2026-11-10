@@ -206,6 +206,11 @@ def policy_info(root, errors=None):
     return data
 
 
+def invalidate_policy_cache():
+    """policy.set 成功后立即失效 15s 缓存，避免 UI 读到旧开关。"""
+    POLICY_CACHE.update(ts=0.0, data=None)
+
+
 def mcp_state():
     """MCP 端点状态。来自进程内存里的真实监听对象，不做持久化猜测。"""
     if MCP_ENDPOINT is None:
@@ -450,7 +455,24 @@ def dispatch(root, payload):
             argv.append("--reject")
         if payload.get("note"):
             argv += ["--note", str(payload["note"])]
+        if payload.get("override"):
+            argv.append("--override")
         return action_result(run_cli(ATS, argv, 30), action)
+
+    if action == "policy.set":
+        patch = payload.get("patch") or {}
+        if not isinstance(patch, dict):
+            raise ValueError("patch 必须是对象")
+        argv = ["--root", str(root), "policy"]
+        for key, value in patch.items():
+            if isinstance(value, (dict, list)):
+                value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            elif isinstance(value, bool):
+                value = "true" if value else "false"
+            argv += ["--set", str(key), str(value)]
+        result = action_result(run_cli(ATS, argv, 30), action)
+        invalidate_policy_cache()
+        return result
 
     if action == "plan.submit":
         spec_text = str(require(payload, "spec_text"))
@@ -634,6 +656,9 @@ tbody tr:last-child td{border-bottom:none}
 .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
 .hint{font-size:11.5px;color:var(--muted);margin-top:5px;line-height:1.45}
 .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.card .pf{margin-top:10px;padding-top:8px;border-top:1px dashed var(--line)}
+.card .pf summary{cursor:pointer;font-size:12.5px;font-weight:600}
+.pill.s-denied_injection{color:var(--bad);border-color:rgba(255,107,107,.45);background:rgba(255,107,107,.12)}
 pre.log{background:#0b0f15;border:1px solid var(--line);border-radius:8px;padding:12px;
   font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:1.55;color:#c8d2e0;
   max-height:46vh;overflow:auto;white-space:pre-wrap;word-break:break-all;margin:0}
@@ -745,6 +770,24 @@ pre.log{background:#0b0f15;border:1px solid var(--line);border-radius:8px;paddin
     <div class="toolbar">
       <label class="sub"><input type="checkbox" id="showAllApprovals" style="width:auto;vertical-align:middle"> 显示已决议</label>
       <span class="sub" id="approvalCount"></span>
+    </div>
+    <div class="card" style="margin-bottom:12px">
+      <h3>审批策略</h3>
+      <div class="grid2">
+        <div class="field"><label>全局模式</label><select id="modeGlobal"></select></div>
+        <div class="field"><label>L0</label><select class="modeLevel" id="modeL0"></select></div>
+        <div class="field"><label>L1</label><select class="modeLevel" id="modeL1"></select></div>
+        <div class="field"><label>L2</label><select class="modeLevel" id="modeL2"></select></div>
+        <div class="field"><label>L3</label><select class="modeLevel" id="modeL3"></select></div>
+      </div>
+      <div class="actions">
+        <label class="sub"><input type="checkbox" id="polOverride"> 允许 denied_injection 强制放行</label>
+        <label class="sub"><input type="checkbox" id="polDry"> 启用诱饵试跑</label>
+        <label class="sub"><input type="checkbox" id="polIso"> 启用 Win32 隔离（Job Object kill-on-close；非强安全边界）</label>
+      </div>
+      <div class="actions"><button class="primary" id="btnSavePolicy">保存审批策略</button>
+        <span class="hint" id="policyHint"></span></div>
+      <div class="hint">生效方式：下一次 run 立即生效（policy.json 热读）。</div>
     </div>
     <div class="cards" id="approvalBody"></div>
   </section>
@@ -953,7 +996,7 @@ function render(){
   $('#cntTasks').textContent = c.tasks || 0;
   $('#cntPlans').textContent = c.schedules || 0;
   $('#cntApprovals').textContent = c.pending_approvals || 0;
-  renderTasks(); renderPlans(); renderApprovals(); renderEvents(); renderMcp();
+  renderTasks(); renderPlans(); renderApprovals(); renderEvents(); renderMcp(); renderPolicyControls();
   if(SEL_TASK && TICK % 3 === 0) loadTask(true);
   if(SEL_PLAN && TICK % 3 === 0) loadPlan(true);
 }
@@ -1079,13 +1122,52 @@ function renderPlans(){
   $('#planBody').querySelectorAll('tr[data-ident]').forEach(tr => tr.onclick = () => openPlan(tr.dataset.ident));
 }
 
+function preflightHtml(a){
+  const pf = a.preflight;
+  if(!pf || typeof pf !== 'object') return '';
+  const dr = pf.dry_run || null;
+  const st = pf.static || {};
+  const ev = (st.evidence || []).slice(0, 6);
+  const rows = [
+    ['判决', pf.verdict || '-'],
+    ['置信度', pf.confidence || '-'],
+    ['标签', (pf.tags||[]).join(', ') || '无'],
+    ['原因', pf.reason || '-'],
+    ['阶段', pf.status || '-'],
+    ['耗时', pf.duration_ms==null ? '-' : pf.duration_ms+' ms']
+  ];
+  if(dr){
+    rows.push(['试跑', dr.status || '-']);
+    rows.push(['退出码', dr.exit_code==null ? '-' : String(dr.exit_code)]);
+    rows.push(['超时', dr.timed_out ? '是' : '否']);
+    rows.push(['哨兵被改', dr.sentinel_touched ? '是' : '否']);
+    rows.push(['隔离', dr.job_mode || '-']);
+    rows.push(['残留目录', dr.leftover ? '有' : '无']);
+    if((dr.sentinels||[]).length){
+      rows.push(['哨兵明细', dr.sentinels.map(x => x.path+':'+x.change).join(', ')]);
+    }
+  }
+  return '<details class="pf"><summary>preflight 证据</summary>'
+    + '<div class="meta" style="margin-top:8px;gap:10px">'
+    + rows.map(([k,v]) => '<span>'+esc(k)+' <b>'+esc(v)+'</b></span>').join('')
+    + '</div>'
+    + (ev.length ? '<div class="hint mono" style="margin-top:8px">'
+        + ev.map(e => esc((e.file||'')+(e.line?'#'+e.line:'')+' '+e.detail)).join('<br>') + '</div>' : '')
+    + '</details>';
+}
+
 function renderApprovals(){
   const all = (DATA.approvals||[]);
   const showAll = $('#showAllApprovals').checked;
-  const rows = all.filter(a => showAll || (a.status==='pending' && !a._expired));
+  const rows = all.filter(a => showAll || ((a.status==='pending' || a.status==='denied_injection') && !a._expired));
   $('#approvalCount').textContent = rows.length + ' 条';
+  const allowOverride = !!(DATA.policy && DATA.policy.denied_injection_allow_override);
   $('#approvalBody').innerHTML = rows.length ? rows.map(a => {
+    const inj = !!(a.preflight && a.preflight.verdict==='deny_injection');
+    const open = (a.status==='pending' || a.status==='denied_injection') && !a._expired;
     const can = a.status==='pending' && !a._expired;
+    const overrideBtn = open && inj ? '<button class="danger" data-override="'+esc(a.id)+'"'
+      + (allowOverride?'':' disabled')+'>强制放行（需备注）</button>' : '';
     return '<div class="card appr"><div class="meta">'+pill(a.status)+(a._expired?' '+pill('expired'):'')
       + '<span>等级 <b>'+esc(a.required_level||'-')+'</b></span>'
       + '<span>来源 <b>'+esc(a.source||'-')+'</b></span>'
@@ -1093,8 +1175,13 @@ function renderApprovals(){
       + '<div class="cmd">'+esc(a.command||'-')+'</div>'
       + '<div class="meta"><span>创建 '+esc(ts(a.created_at))+'</span><span>过期 '+esc(a.expires_at?ts(a.expires_at):'不限')+'</span>'
       + '<span class="mono">'+esc(a.id)+'</span></div>'
+      + preflightHtml(a)
       + (can?'<div class="actions"><button class="primary" data-approve="'+esc(a.id)+'">批准</button>'
            +'<button class="danger" data-reject="'+esc(a.id)+'">拒绝</button></div>':'')
+      + ((!can && open && inj) ? '<div class="actions"><button class="danger" data-reject="'+esc(a.id)+'">拒绝</button></div>' : '')
+      + overrideBtn
+      + (inj && !allowOverride ? '<div class="hint bad">当前策略禁止人工放行 denied_injection。</div>' : '')
+      + (inj && a.status==='denied_injection' ? '<div class="hint">该记录已在策略上被拒；放行需先开启审批策略开关。</div>' : '')
       + (a.resume?'<div class="hint">批准后恢复：<span class="mono">'+esc(a.resume)+'</span></div>':'')
       + '</div>';
   }).join('') : '<div class="empty">没有待处理审批</div>';
@@ -1104,6 +1191,70 @@ function renderApprovals(){
     if(note===null) return;
     act('approval.resolve',{ids:[b.dataset.reject],reject:true,note},'拒绝 '+b.dataset.reject+'？');
   });
+  $('#approvalBody').querySelectorAll('[data-override]').forEach(b => b.onclick = () => {
+    const note = prompt('强制放行备注（必填，将写入审批记录）：','');
+    if(note===null) return;
+    if(!note.trim()) return toast('强制放行必须填写备注','bad');
+    act('approval.resolve',{ids:[b.dataset.override],override:true,note},'确认强制放行 '+b.dataset.override+'？此操作会忽略预演证据并执行命令。');
+  });
+}
+
+const APPROVAL_MODES = [['auto','auto（按身份直通）'],['ask','ask（人工审批）'],['deny-only','deny-only（直接拒绝）']];
+let POLICY_SIG = '';
+
+function fillModeSelect(el, val){
+  if(!el) return;
+  if(!el.options.length){
+    APPROVAL_MODES.forEach(([v,t]) => {
+      const o = document.createElement('option'); o.value = v; o.textContent = t; el.appendChild(o);
+    });
+  }
+  el.value = val || 'ask';
+}
+
+function renderPolicyControls(){
+  const p = DATA && DATA.policy;
+  if(!p || !$('#modeGlobal')) return;
+  const byLevel = p.approval_mode_by_level || {};
+  const sig = JSON.stringify([p.approval_mode, byLevel, p.denied_injection_allow_override,
+    p.preflight_dry_run, p.win32_isolation]);
+  const editing = document.activeElement && document.activeElement.closest
+    && document.activeElement.closest('#panel-approvals');
+  if(sig === POLICY_SIG || editing) return;
+  POLICY_SIG = sig;
+  fillModeSelect($('#modeGlobal'), p.approval_mode);
+  ['L0','L1','L2','L3'].forEach(l => fillModeSelect($('#mode'+l), byLevel[l] || p.approval_mode));
+  $('#polOverride').checked = !!p.denied_injection_allow_override;
+  $('#polDry').checked = !!p.preflight_dry_run;
+  $('#polIso').checked = !!p.win32_isolation;
+}
+
+async function savePolicy(){
+  const patch = {
+    approval_mode: $('#modeGlobal').value,
+    approval_mode_by_level: {L0:$('#modeL0').value,L1:$('#modeL1').value,
+      L2:$('#modeL2').value,L3:$('#modeL3').value},
+    denied_injection_allow_override: $('#polOverride').checked,
+    preflight_dry_run: $('#polDry').checked,
+    win32_isolation: $('#polIso').checked
+  };
+  $('#policyHint').textContent = '保存中…';
+  try{
+    const d = await api('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({action:'policy.set',patch})}, 60000);
+    if(d.ok){
+      POLICY_SIG = '';
+      $('#policyHint').textContent = '已保存 '+new Date().toLocaleTimeString('zh-CN',{hour12:false});
+      toast('审批策略已保存','ok');
+      refresh();
+    }else{
+      $('#policyHint').textContent = '保存失败';
+      toast(errText(d),'bad');
+    }
+  }catch(e){
+    $('#policyHint').textContent = '保存失败';
+    toast('请求失败：'+e.message,'bad');
+  }
 }
 
 function renderEvents(){
@@ -1262,6 +1413,7 @@ $('#btnMcpCopy').onclick = mcpCopy;
 $('#interval').onchange = restartTimer;
 $('#taskSearch').oninput = renderTasks;
 $('#showAllApprovals').onchange = renderApprovals;
+$('#btnSavePolicy').onclick = savePolicy;
 document.querySelectorAll('.tab').forEach(b => b.onclick = () => showTab(b.dataset.tab));
 
 $('#btnCreateTask').onclick = () => {

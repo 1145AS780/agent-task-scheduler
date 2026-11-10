@@ -619,7 +619,7 @@ subprocess.Popen([sys.executable, __file__, "supervise", task_id],
 
 - 子进程**脱离**当前控制台。父终端关闭不影响任务。
 - 但它仍在**同一个会话**里，所以机器注销会杀掉它（不是开机自启服务）。
-- `supervisor_pid` 是 `supervise` 进程的 pid，`pid` 是真正命令的 pid。`stop` 会两个都杀（`taskkill /T /F` 杀进程树）。
+- `supervisor_pid` 是 `supervise` 进程的 pid，`pid` 是真正命令的 pid。`stop` 两个都杀（Windows `taskkill /T /F`，POSIX 对独立进程组 `killpg`），杀完轮询确认、残留再扫一次；返回里的 `stopped` / `leftovers` 是实测结果。
 
 ### 12.2 `check` 在 Windows 上如何判活
 
@@ -630,12 +630,13 @@ subprocess.Popen([sys.executable, __file__, "supervise", task_id],
 
 ### 12.3 杀不干净的情况
 
-`taskkill /T /F` 杀**进程树**，但：
+`taskkill /T /F`（POSIX 为 `killpg`）杀**进程树**，但：
 
 - 若命令自行 `start` 了脱离的进程（`Start-Process`、`&` 后台），它不在树里 → 杀不到
 - 服务型进程（Windows Service）杀不掉 → 需要 `sc stop`
+- POSIX 下若任务不是独立进程组（升级前启动的旧任务），整组杀会波及调用者，`stop` 拒绝 `killpg` 并把 pid 留在 `leftovers`；重跑任务即可
 
-处置：`stop` 后手工验证
+处置：先看 `stop` 返回的 `leftovers`（杀完仍存活的 pid）；需要人工核对时：
 
 ```powershell
 Get-Process | Where-Object { $_.ProcessName -like "*node*" }

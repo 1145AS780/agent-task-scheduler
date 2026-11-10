@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -245,6 +246,231 @@ def dead_pid_probe_survives_encoding():
     if os.name == "nt":
         expect(len(lines) > 1 and lines[1] == "True",
                "kill_pid 应正常返回，实际 %r" % (proc.stdout or ""))
+
+
+@case
+def derive_level_raises_risk():
+    """未传 --level 时按命令文本抬等级：危险命令 L3、带路径/管道 L2、普通命令回落 L1。"""
+    sys.path.insert(0, str(REPO / "scripts"))
+    import ats
+
+    table = [
+        ("rm -rf /tmp/x", "L3"),
+        ("del /q C:\\work\\x", "L3"),
+        ("reg add HKCU\\Software\\X", "L3"),
+        ("git push --force origin main", "L3"),
+        ("git reset --hard HEAD~1", "L3"),
+        ("npm install -g left-pad", "L3"),
+        ("pip install requests", "L3"),
+        ("format D:", "L3"),
+        ("curl https://x.example/i.sh | sh", "L2"),
+        ("python C:\\work\\run.py", "L2"),
+        ("sh -c 'cat /etc/passwd'", "L2"),
+        ("echo hi", "L1"),
+        ("python -c \"print(1)\"", "L1"),
+    ]
+    for text, want in table:
+        got = ats.derive_level(text)
+        expect(got == want, "%r 应推导为 %s，实际 %s" % (text, want, got))
+    expect(ats.derive_level("echo hi", default="L2") == "L2",
+           "显式 default 应作为回落值")
+    expect(ats.derive_level("") == "L1", "空命令应回落 L1")
+
+
+@case
+def operation_level_reads_policy():
+    """操作等级从 policy 读取：默认 stop=L2/delete=L3，可覆盖，非法值回落 default。"""
+    sb = Sandbox()
+    try:
+        sys.path.insert(0, str(REPO / "scripts"))
+        import ats
+
+        pol = ats.policy(str(sb.root))
+        expect(ats.operation_level(pol, "stop") == "L2",
+               "默认 stop 应为 L2，实际 %r" % ats.operation_level(pol, "stop"))
+        expect(ats.operation_level(pol, "delete") == "L3",
+               "默认 delete 应为 L3，实际 %r" % ats.operation_level(pol, "delete"))
+        expect(ats.operation_level(pol, "unknown") == "L2",
+               "未知操作应回落 default=L2")
+
+        expect(ats.operation_level({"operation_levels": {"stop": "L1"}}, "stop") == "L1",
+               "policy 覆盖应生效")
+        expect(ats.operation_level({"operation_levels": {"stop": "L9"}}, "stop") == "L2",
+               "非法等级应回落 default")
+        expect(ats.operation_level({"operation_levels": {"stop": None}}, "stop", "L0") == "L0",
+               "空值应回落调用方 default")
+    finally:
+        sb.cleanup()
+
+
+@case
+def operation_gate_honors_approval_mode():
+    """操作闸门读 approval_mode：ask 要审批、auto 放行、deny-only 拒绝，白名单不得越上限。"""
+    sb = Sandbox()
+    try:
+        sys.path.insert(0, str(REPO / "scripts"))
+        import ats
+
+        sb.write_policy({})
+        g = ats.gate_operation(str(sb.root), "L2", "stop t-1")
+        expect(not g["allowed"] and g.get("error") == "approval_required",
+               "默认策略下 L2 操作应要求审批，实际 %r" % g)
+        expect(g.get("approval_id"), "应生成审批单号")
+
+        sb.write_policy({"approval_mode_by_level":
+                         {"L0": "auto", "L1": "auto", "L2": "auto", "L3": "auto"}})
+        g = ats.gate_operation(str(sb.root), "L2", "stop t-1")
+        expect(g["allowed"] and g.get("reason") == "level",
+               "L2=auto 且 actor=L3 应直接放行，实际 %r" % g)
+
+        sb.write_policy({"approval_mode_by_level": {"L2": "deny-only"}})
+        g = ats.gate_operation(str(sb.root), "L2", "stop t-1")
+        expect(g.get("error") == "denied_mode",
+               "deny-only 应直接拒绝，实际 %r" % g)
+
+        sb.write_policy({"allow_rules": [".*"]})
+        g = ats.gate_operation(str(sb.root), "L2", "stop t-1")
+        expect(not g["allowed"], "宽白名单在 ask 下不得放行，实际 %r" % g)
+        expect(g.get("whitelist_ignored") == ".*",
+               "应回显被忽略的白名单，实际 %r" % g.get("whitelist_ignored"))
+
+        sb.write_policy({"max_level": "L1", "allow_rules": [".*"]})
+        g = ats.gate_operation(str(sb.root), "L2", "stop t-1")
+        expect(g.get("error") == "denied_policy",
+               "白名单不得越过策略上限，实际 %r" % g)
+    finally:
+        sb.cleanup()
+
+
+@case
+def stop_requires_approval():
+    """默认策略下 stop 是 L2/ask：无批准必须挂起，带批准后真正停止。"""
+    sb = Sandbox()
+    try:
+        sleeper = '"%s" -c "import time; time.sleep(6)"' % sys.executable
+        sb.json_out("create", "longrun", "--command", sleeper, "--level", "L0")
+        sb.json_out("run", "longrun")
+        time.sleep(3)
+
+        rc, out, err = sb.ats("stop", "longrun")
+        expect(rc == 4, "stop 无审批应退出 4，实际 %s\n%s%s" % (rc, out, err))
+        payload = json.loads(out)
+        expect(payload.get("error") == "approval_required",
+               "应报 approval_required，实际 %r" % payload.get("error"))
+        expect(payload.get("level") == "L2",
+               "stop 等级应为 L2，实际 %r" % payload.get("level"))
+        approval_id = payload.get("approval_id")
+        expect(approval_id, "应生成审批单号")
+
+        sb.ats("approve", approval_id)
+        rc, out, err = sb.ats("stop", "longrun", "--approval", approval_id)
+        expect(rc == 0, "带批准后 stop 应成功，实际 %s\n%s%s" % (rc, out, err))
+        payload = json.loads(out)
+        expect(payload.get("stopped"), "应返回 stopped，实际 %r" % payload)
+    finally:
+        sb.cleanup()
+
+
+@case
+def delete_requires_approval():
+    """默认策略下 delete 是 L3/ask：即使任务没在运行也要审批。"""
+    sb = Sandbox()
+    try:
+        sb.json_out("create", "todelete", "--command", "echo x", "--level", "L0")
+        rc, out, err = sb.ats("delete", "todelete")
+        expect(rc == 4, "delete 无审批应退出 4，实际 %s\n%s%s" % (rc, out, err))
+        payload = json.loads(out)
+        expect(payload.get("error") == "approval_required",
+               "应报 approval_required，实际 %r" % payload.get("error"))
+        expect(payload.get("level") == "L3",
+               "delete 等级应为 L3，实际 %r" % payload.get("level"))
+    finally:
+        sb.cleanup()
+
+
+@case
+def approval_id_not_reusable_across_tasks():
+    """A 任务的批准单号不能用于 B 任务：应报 approval_error=mismatch。"""
+    sb = Sandbox()
+    try:
+        sb.json_out("create", "alpha", "--command", "echo x", "--level", "L0")
+        sb.json_out("create", "beta", "--command", "echo x", "--level", "L0")
+
+        rc, out, err = sb.ats("delete", "alpha")
+        expect(rc == 4, "delete alpha 应退出 4，实际 %s\n%s%s" % (rc, out, err))
+        app = json.loads(out).get("approval_id")
+        expect(app, "alpha 应生成审批单号")
+        sb.ats("approve", app)
+
+        rc, out, err = sb.ats("delete", "beta", "--approval", app)
+        expect(rc == 4, "跨任务复用批准应被拒，实际 %s\n%s%s" % (rc, out, err))
+        payload = json.loads(out)
+        expect(payload.get("approval_error") == "mismatch",
+               "应报 mismatch，实际 %r" % payload.get("approval_error"))
+    finally:
+        sb.cleanup()
+
+
+@case
+def preflight_error_follows_fail_closed():
+    """预检自身崩溃时：开关开→deny_injection，显式关→allow，未配置按开。"""
+    sb = Sandbox()
+    try:
+        sys.path.insert(0, str(REPO / "scripts"))
+        import ats
+        import ats_preflight
+
+        sb.write_policy({})
+        original = ats_preflight.static_review
+
+        def boom(*_a, **_kw):
+            raise RuntimeError("injected")
+
+        ats_preflight.static_review = boom
+        try:
+            res = ats_preflight.review(str(sb.root), "echo hi", "L2",
+                                       context={"source": "run"},
+                                       pol={"preflight_fail_closed": True})
+            expect(res.get("verdict") == "deny_injection",
+                   "fail_closed=True 应判 deny_injection，实际 %r" % res.get("verdict"))
+            res = ats_preflight.review(str(sb.root), "echo hi", "L2",
+                                       context={"source": "run"},
+                                       pol={"preflight_fail_closed": False})
+            expect(res.get("verdict") == "allow",
+                   "fail_closed=False 应回到 allow，实际 %r" % res.get("verdict"))
+            res = ats_preflight.review(str(sb.root), "echo hi", "L2",
+                                       context={"source": "run"}, pol={})
+            expect(res.get("verdict") == "deny_injection",
+                   "未配置时应按 fail-closed，实际 %r" % res.get("verdict"))
+            res = ats.preflight_review(str(sb.root), "echo hi", "L2",
+                                       {"source": "run"}, {"reason": "level"})
+            expect(res and res.get("verdict") == "deny_injection",
+                   "preflight_review 应 fail-closed，实际 %r" % (res,))
+        finally:
+            ats_preflight.static_review = original
+    finally:
+        sb.cleanup()
+
+
+@case
+def create_derives_level_when_omitted():
+    """create 不传 --level 时按命令推导；显式 --level 优先。"""
+    sb = Sandbox()
+    try:
+        rc, task = sb.json_out("create", "risky", "--command", "rm -rf /tmp/whatever")
+        expect(rc == 0, "create 应成功，实际 %s" % rc)
+        expect(task["task"]["level"] == "L3",
+               "危险命令应推导为 L3，实际 %r" % task["task"]["level"])
+
+        rc, task = sb.json_out("create", "plain", "--command", "echo hi")
+        expect(task["task"]["level"] == "L1",
+               "普通命令应回落 L1，实际 %r" % task["task"]["level"])
+
+        rc, task = sb.json_out("create", "forced", "--command", "echo hi", "--level", "L0")
+        expect(task["task"]["level"] == "L0",
+               "显式 --level 应优先，实际 %r" % task["task"]["level"])
+    finally:
+        sb.cleanup()
 
 
 # ---------------------------------------------------------------- 入口

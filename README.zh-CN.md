@@ -73,7 +73,7 @@ Schedule（周期/一次性）
 ## 快速上手
 
 ```bash
-# 创建任务（权限等级默认 L0）
+# 创建任务（权限等级默认 L1）
 python scripts/ats.py create build --command "gradle build" --level L1
 
 # 运行并等待
@@ -208,6 +208,7 @@ references/                 按需加载的规格文档
 ├── error-taxonomy.md       错误分类与重试矩阵
 ├── command-guide.md        命令书写与调用规范
 ├── anti-patterns.md        常见错误用法及原因
+├── api-guide.md            协议与扩展点清单
 └── examples/               可运行的最小样例
 scripts/                    调度器本体
 ├── ats.py                  Task 层：创建、运行、下载、种子、审批

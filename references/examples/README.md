@@ -132,7 +132,7 @@ python scripts\ats_plan.py resume gated --approval <approval_id>
 | L2 | L2 |
 | L3 | L3 |
 
-如果你把 `ATS_ACTOR_LEVEL` 设成 `L3`，`run_plan` 会一路跑通不停——审批只在身份不足时才出现。
+如果你把 `ATS_ACTOR_LEVEL` 设成 `L3`，`auto` 档（默认 L0/L1）的步骤会直接放行；但 `ask` 档（默认 L2/L3）的步骤仍会暂停并生成审批，与 `actor_level` 无关。
 
 恢复后 `stages/release/stage.json` 的 `waves` 应为 **3**：`deploy` 被拦那次已消耗第 1 波，`deploy` 自己占第 2 波，`purge` 占第 3 波。暂停不重置计数（暂停时 `waves` 已落盘）。
 
