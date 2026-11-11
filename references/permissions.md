@@ -49,9 +49,15 @@
 ```
 输入：command（命令原文）、required_level、approval_id、context
 
+0. 硬下限
+   required_level = max(required_level, hard_floor_level(command))
+   硬危险特征（删盘/强推/丢弃工作区/管道执行等）至少抬到 L3 或 L2，
+   传入 L0 也压不过去
+
 1. 白名单
    for rule in allow_rules:
-       若 re.search(rule, command, IGNORECASE) → ALLOW(whitelist=rule)，结束
+       若 re.search(rule, command, IGNORECASE) 且未触发硬下限 → ALLOW(whitelist=rule)，结束
+       命中白名单但触发了硬下限 → 记 whitelist_ignored，继续往下走
 
 2. 策略上限
    若 rank(required_level) > rank(max_level) → DENY(denied_policy)，结束
@@ -130,7 +136,7 @@ python scripts/ats.py policy --json
 
 - 规则是**正则**，用 `re.search` 匹配命令原文（不区分大小写）
 - 列表顺序即匹配顺序，第一条命中即返回
-- 命中后**跳过等级检查与审批**，直接放行
+- 命中后**跳过等级检查与审批**，直接放行；但**硬下限例外**——命令命中硬危险特征时白名单不放行，转走审批并标注 `whitelist_ignored`
 - 白名单**不能**突破「不存在」之类的实体检查（只影响权限判定）
 
 ### 5.2 写法建议

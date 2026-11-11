@@ -286,10 +286,24 @@ def operation_level(pol, name, default="L2") -> str:
 
 
 DERIVE_L3_PATTERN = re.compile(
-    r"\b(rm|rmdir|del|erase|format|mkfs|shutdown|reboot|"
-    r"reg\s+(add|delete)|git\s+push\s+(--force|-f)|git\s+reset\s+--hard|"
-    r"git\s+clean\s+-[a-z]*f|npm\s+(i|install)\s+-g|pip\s+install|"
-    r"chmod\s+777|chown)\b",
+    r"(\b(rm|rmdir|del|erase|format|mkfs|shutdown|reboot)\b|"
+    r"\breg\s+(add|delete)\b|"
+    r"\bgit\s+push\s+(--force|-f)\b|"
+    r"\bgit\s+reset\s+--hard\b|"
+    r"\bgit\s+clean\s+-[a-z]*f\b|"
+    r"\bgit\s+(checkout|restore)\s+(--\s+)?\.|"
+    r"\bnpm\s+(i|install)\s+-g\b|"
+    r"\bpip\s+install\b|"
+    r"\bchmod\s+777\b|\bchown\b|"
+    r"\bremove-item|"
+    r"\bclear-(content|recyclebin|disk)\b|"
+    r"\b(stop|restart)-computer\b|"
+    r"\btruncate\b|"
+    r"\bdd\s+if=|"
+    r"\bsc\s+delete\b|"
+    r"\bbcdedit\b|"
+    r"\bdiskpart\b|"
+    r"\brobocopy[^\n]*/mir\b)",
     re.IGNORECASE)
 DERIVE_L2_PATTERN = re.compile(
     r"([A-Za-z]:\\|/etc/|/usr/|/bin/|\.ssh|"
@@ -310,6 +324,49 @@ def derive_level(command, default=None) -> str:
     if DERIVE_L2_PATTERN.search(text):
         return "L2"
     return str(default or DEFAULT_TASK_LEVEL).upper()
+
+
+DERIVE_FLOOR_L2_PATTERN = re.compile(
+    r"(\|\s*(sh|bash)\b|curl\s+\S+\s*\|\s*(sh|bash)|"
+    r"invoke-expression|\biex\b|\biwr\b|>\s*[A-Za-z~/]|\.ssh|"
+    r"\bset-content\b|\btaskkill[^\n]*/f\b)",
+    re.IGNORECASE)
+
+
+def hard_floor_level(command):
+    """硬危险特征的下限等级；路径类启发式不参与，避免误伤普通绝对路径。"""
+    text = str(command or "")
+    if DERIVE_L3_PATTERN.search(text):
+        return "L3"
+    if DERIVE_FLOOR_L2_PATTERN.search(text):
+        return "L2"
+    return None
+
+
+def floor_level(level, command, default=None):
+    """显式等级只能抬高，不能压过硬危险特征的下限。
+
+    未命中硬危险特征时保持显式等级；命中则取两者较高者，
+    避免 --level L0 把删除、管道执行一类命令送进 auto 直通。
+    """
+    chosen = str(level or default or DEFAULT_TASK_LEVEL).upper()
+    hard = hard_floor_level(command)
+    if hard and level_rank(hard) > level_rank(chosen):
+        return hard
+    return chosen
+
+
+def pack_level(explicit, commands):
+    """指令包整体等级：显式等级、逐条推导、逐条硬下限三者取最高。
+
+    与 floor_level 的区别是包内每条命令各自算下限再取最大，
+    避免同包里的安全命令把危险命令的下限稀释掉。
+    """
+    derived = max([derive_level(c) for c in commands] or [DEFAULT_TASK_LEVEL],
+                  key=level_rank)
+    floor = max([hard_floor_level(c) or DEFAULT_TASK_LEVEL for c in commands]
+                or [DEFAULT_TASK_LEVEL], key=level_rank)
+    return str(max([explicit or derived, derived, floor], key=level_rank)).upper()
 
 
 def policy(root, data=None):
@@ -837,6 +894,9 @@ def permission_gate(root, command, approval_id=None, context=None):
     context = dict(context or {})
     pol = policy(root)
     required = str(context.get("required_level") or DEFAULT_TASK_LEVEL).upper()
+    hard = hard_floor_level(command)
+    if hard and level_rank(hard) > level_rank(required):
+        required = hard
     actor = str(pol.get("actor_level") or DEFAULT_ACTOR_LEVEL).upper()
     cap = str(pol.get("max_level") or DEFAULT_MAX_LEVEL).upper()
     result = {
@@ -854,9 +914,11 @@ def permission_gate(root, command, approval_id=None, context=None):
         "approval_mode": None,
     }
     rule = whitelist_match(root, context.get("whitelist_text") or command)
-    if rule:
+    if rule and not hard:
         result.update(allowed=True, reason="whitelist", whitelist=rule)
         return result
+    if rule:
+        result["whitelist_ignored"] = rule
     if level_rank(required) > level_rank(cap):
         result.update(allowed=False, reason="denied_policy")
         return result
@@ -1269,7 +1331,7 @@ def cmd_create(root, args):
         key, value = item.split("=", 1)
         env[key] = value
 
-    level = str(args.level or spec.get("level") or derive_level(command)).upper()
+    level = floor_level(args.level or spec.get("level"), command)
     if level not in LEVEL_RANK:
         print(json.dumps({"error": "bad_level", "level": level}, ensure_ascii=False))
         return EXIT_USAGE
@@ -1456,9 +1518,7 @@ def cmd_pack(root, args):
                            "hint": "钩子写法：<命令> @enc <转换器参数>；@enc 前后都要有内容"},
                           EXIT_USAGE)
 
-    derived = max([derive_level(c) for c, _hook in parsed] or [DEFAULT_TASK_LEVEL],
-                  key=level_rank)
-    level = str(args.level or derived).upper()
+    level = pack_level(args.level, [c for c, _hook in parsed])
     if level not in LEVEL_RANK:
         return print_json({"error": "bad_level", "level": level}, EXIT_USAGE)
     timeout = args.timeout if args.timeout is not None else DEFAULT_TIMEOUT

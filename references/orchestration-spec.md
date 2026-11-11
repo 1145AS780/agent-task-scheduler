@@ -15,7 +15,7 @@
 | 审批文件 + 命令绑定 | ✅ | 2.0 | `approvals/<id>.json` |
 | 审批有效期 | ✅ | 2.1 | `expires_at`、`approval_expired` |
 | 批量批准/拒绝 | ✅ | 2.1 | `approve --all` / `--reject` |
-| 白名单放行 | ✅ | 2.1 | `allow_rules` 正则，优先级最高 |
+| 白名单放行 | ✅ | 2.1 | `allow_rules` 正则；硬危险特征例外 |
 | 审批事件投递 | ✅ | 2.1 | 任务→全局流；Plan→schedule 流 |
 | Stage 串行/并行 | ✅ | 2.0 | `mode` |
 | Stage 内单层依赖 | ✅ | 2.1 | `depends_on` + 拓扑稳定排序 |

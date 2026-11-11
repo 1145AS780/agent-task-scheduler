@@ -387,13 +387,14 @@ python tools/encoding_converter.py logs --detect --to utf-8 --dry-run
 
 ### 5.2 判定顺序
 
-1. **白名单放行**：命令文本命中 `allow_rules` 任一正则 → 直接允许（优先于等级）
-2. **策略上限**：`level > max_level` → 直接拒绝，审批与租约都不能绕过
-3. **取审批模式**：按 `approval_mode_by_level[level] > approval_mode > "ask"` 取 auto / ask / deny-only
-4. **直接拒绝**：`mode=deny-only` → 返回 `denied_mode`，不创建可批准记录
-5. **身份直通（仅 auto 档）**：`mode=auto` 且 `level <= actor_level` → 直接允许
-6. **存活租约免审**：`lease_autonomy` 总闸开启、租约存活且命令命中其白名单 → 直接允许（见 5.6）
-7. **审批**：否则要求有效审批；无审批则创建审批记录、投递事件、返回 `approval_required`
+1. **硬下限**：命令命中硬危险特征（删盘/强推/丢弃工作区/管道执行等）→ `required_level` 至少抬到 L3（或 L2），传入 L0 也压不过去
+2. **白名单放行**：命令文本命中 `allow_rules` 任一正则，**且未触发硬下限** → 直接允许
+3. **策略上限**：`level > max_level` → 直接拒绝，审批与租约都不能绕过
+4. **取审批模式**：按 `approval_mode_by_level[level] > approval_mode > "ask"` 取 auto / ask / deny-only
+5. **直接拒绝**：`mode=deny-only` → 返回 `denied_mode`，不创建可批准记录
+6. **身份直通（仅 auto 档）**：`mode=auto` 且 `level <= actor_level` → 直接允许
+7. **存活租约免审**：`lease_autonomy` 总闸开启、租约存活且命令命中其白名单 → 直接允许（见 5.6）
+8. **审批**：否则要求有效审批；无审批则创建审批记录、投递事件、返回 `approval_required`
 
 有效等级 = `min(required_level, actor_level, max_level)`，用于解释为什么被拦。
 `reason` 取值：`whitelist` / `denied_policy` / `denied_mode` / `level` / `lease_autonomy` / `approval` / `approval_required`。

@@ -278,6 +278,102 @@ def derive_level_raises_risk():
 
 
 @case
+def hard_floor_blocks_l0_bypass():
+    """硬危险特征做下限：--level L0 不能压过删除/关机/丢弃工作区一类命令。"""
+    sys.path.insert(0, str(REPO / "scripts"))
+    import ats
+
+    blocked = [
+        ("Remove-Item -Recurse -Force C:\\temp\\x", "L3"),
+        ("Remove-ItemProperty -Path HKLM:\\Software\\X", "L3"),
+        ("Clear-Content C:\\a.txt", "L3"),
+        ("Stop-Computer -Force", "L3"),
+        ("Restart-Computer", "L3"),
+        ("robocopy C:\\a C:\\b /MIR", "L3"),
+        ("git checkout .", "L3"),
+        ("git restore .", "L3"),
+        ("truncate -s 0 /var/log/syslog", "L3"),
+        ("dd if=/dev/zero of=/dev/sda", "L3"),
+        ("sc delete MyService", "L3"),
+        ("bcdedit /deletevalue safeboot", "L3"),
+        ("diskpart /s wipe.txt", "L3"),
+        ("Clear-Disk -Number 0", "L3"),
+        ("Set-Content -Path C:\\a.txt -Value x", "L2"),
+        ("taskkill /F /IM explorer.exe", "L2"),
+    ]
+    for text, want in blocked:
+        got = ats.floor_level("L0", text)
+        expect(got == want, "L0 + %r 应被抬到 %s，实际 %s" % (text, want, got))
+
+    kept = [
+        "python C:\\work\\build.py",
+        "echo hi",
+        "git checkout main",
+        "git restore --staged foo.py",
+        "Copy-Item a b",
+        "robocopy a b",
+        "taskkill /IM notepad.exe",
+    ]
+    for text in kept:
+        expect(ats.floor_level("L0", text) == "L0",
+               "L0 + %r 不应被抬高" % text)
+
+    expect(ats.hard_floor_level("echo hi") is None, "普通命令不应有硬下限")
+
+
+@case
+def pack_level_respects_hard_floor():
+    """pack 登记等级不得被 --level L0 压低到硬下限以下。"""
+    sys.path.insert(0, str(REPO / "scripts"))
+    import ats
+
+    expect(ats.pack_level("L0", ["Set-Content a.txt hi"]) == "L2",
+           "pack L0 + Set-Content 应登记 L2")
+    expect(ats.pack_level("L0", ["taskkill /F /IM explorer.exe"]) == "L2",
+           "pack L0 + taskkill /F 应登记 L2")
+    expect(ats.pack_level("L0", ["Set-Content a.txt hi", "echo hi"]) == "L2",
+           "包内安全命令不得稀释危险命令的下限")
+    expect(ats.pack_level("L0", ["git checkout ."]) == "L3",
+           "pack L0 + git checkout . 应登记 L3")
+    expect(ats.pack_level("L0", ["python build.py"]) == "L1",
+           "安全命令保持推导默认值 L1")
+    expect(ats.pack_level(None, ["echo hi"]) == "L1", "未传等级时回落 L1")
+
+
+@case
+def whitelist_does_not_bypass_hard_floor():
+    """白名单不得穿透硬下限：危险命令即使命中 allow_rules 也要走审批。"""
+    sb = Sandbox()
+    try:
+        sys.path.insert(0, str(REPO / "scripts"))
+        import ats
+
+        sb.write_policy({"allow_rules": ["^git"]})
+        root = str(sb.root)
+
+        for cmd in ("git checkout .", "git restore .", "git reset --hard HEAD~1"):
+            gate = ats.permission_gate(root, cmd, None, {"required_level": "L0"})
+            expect(gate["required_level"] == "L3",
+                   "%r 应被硬下限抬到 L3，实际 %s" % (cmd, gate["required_level"]))
+            expect(gate["allowed"] is False,
+                   "%r 命中白名单也不应放行，实际 reason=%s" % (cmd, gate["reason"]))
+            expect(gate["reason"] == "approval_required",
+                   "%r 应转审批，实际 %s" % (cmd, gate["reason"]))
+            expect(gate.get("whitelist_ignored") == "^git",
+                   "%r 应标注 whitelist_ignored，实际 %r"
+                   % (cmd, gate.get("whitelist_ignored")))
+
+        for cmd in ("git checkout main", "git status"):
+            gate = ats.permission_gate(root, cmd, None, {"required_level": "L0"})
+            expect(gate["allowed"] is True and gate["reason"] == "whitelist",
+                   "安全命令 %r 应仍按白名单放行，实际 reason=%s" % (cmd, gate["reason"]))
+            expect(gate.get("whitelist_ignored") is None,
+                   "安全命令 %r 不应标注 whitelist_ignored" % cmd)
+    finally:
+        sb.cleanup()
+
+
+@case
 def operation_level_reads_policy():
     """操作等级从 policy 读取：默认 stop=L2/delete=L3，可覆盖，非法值回落 default。"""
     sb = Sandbox()

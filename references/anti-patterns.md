@@ -195,7 +195,7 @@ Get-ChildItem .ats\approvals\*.json | ForEach-Object {
 
 **症状**：所有命令都免审批，等于权限系统不存在。
 
-**为什么错**：`allow_rules` 用 `re.search`，不区分大小写，且**优先级最高**（在 `max_level` 之前）。一条 `.*` 就让整套 L0-L3 失效，而且它还能让 `denied_policy` 失效。
+**为什么错**：`allow_rules` 用 `re.search`，不区分大小写，且优先级很高（在 `max_level` 之前）。一条 `.*` 就让整套 L0-L3 失效，还能让 `denied_policy` 失效。唯一的例外是硬下限：命中硬危险特征时白名单不放行。
 
 **正确做法**：白名单只放「明确安全」的前缀，且锚定开头：
 

@@ -6,8 +6,8 @@
 > 阅读方式：不需要从头读。调用方只看第 1–9 节；要改代码时直接跳第 10–12 节。
 > 本文只写**已在代码中确认存在**的行为，未定案的内容集中放在第 13 节，不与现状混写。
 >
-> **版本锚点**：`fc7cb5f`（2026-11-08）＋工作区未提交改动（`approval_mode` / `preflight_*` /
-> `denied_mode`）。核对日期 2026-11-10。代码变动后先比对 `git log --oneline -5` 与本节，再读第 13 节。
+> **版本锚点**：`540b004`（刀2 + 刀3）＋工作区未提交改动（`hard_floor` 硬下限 / 白名单例外 /
+> `whitelist_ignored`）。核对日期 2026-11-11。代码变动后先比对 `git log --oneline -5` 与本节，再读第 13 节。
 
 ---
 
@@ -178,7 +178,8 @@ python scripts/ats.py run deploy1 --approval $apId --wait
 判定顺序（`scripts/ats.py`）：
 
 ```
-1. 白名单        allow_rules 命中 → allowed, reason="whitelist"
+0. 硬下限        hard_floor_level 命中 → required 至少抬到 L3/L2（压过传入等级）
+1. 白名单        allow_rules 命中且未触发硬下限 → allowed, reason="whitelist"
 2. 策略上限      rank(required) > rank(max_level) → denied, reason="denied_policy"
 3. 取审批模式    approval_mode_for(pol, required)
                  （approval_mode_by_level[level] > approval_mode > "ask"）
@@ -189,7 +190,7 @@ python scripts/ats.py run deploy1 --approval $apId --wait
 8. 兜底          denied, reason="approval_required"（调用方据此创建审批）
 ```
 
-**关键点**：`actor_level` 只在第 5 步生效。`approval_mode=ask` 的等级**不看身份**，
+**关键点**：`actor_level` 只在第 6 步生效。`approval_mode=ask` 的等级**不看身份**，
 即使 `actor_level=L3` 也要审批。
 
 ### 7.2 `gate_operation`（操作型命令路径）
@@ -197,12 +198,11 @@ python scripts/ats.py run deploy1 --approval $apId --wait
 `stop` / `delete` / `pause` / `cancel` / `rerun_task` / `prune` / `resume_schedule` 走这一条：
 
 ```
-1. 白名单 → 2. 策略上限 → 3. 等级 <= actor_level 直接放行 → 4. 存活租约 → 5/6. 审批
+1. 白名单（仅 auto 档）→ 2. 策略上限 → 3. 等级 <= actor_level 直接放行（仅 auto 档）
+→ 4. 存活租约 → 5/6. 审批
 ```
 
-**它不读取 `approval_mode`。** 因此在默认配置（`actor_level=L3`）下，
-`delete`（L2）、`cancel`（L2）、`resume_schedule`（L1）**实际直接放行，不生成审批**。
-这是当前实现的真实行为，属于第 13 节的未定案项。
+**它读取 `approval_mode`**：`auto` 档才允许白名单与身份直通；`ask` / `deny-only` 档一律走审批或拒绝。
 
 ### 7.3 默认值
 
@@ -341,7 +341,7 @@ policy() → permission_gate() → [denied | approved | approval_required]
 1. 定级（L1/L2/L3）并写进 `error-taxonomy.md` 命令等级表
 2. `gate_operation(root, level, label, ...)`，`label` 必须**稳定可复现**（它就是审批绑定文本）
 3. 被拦时返回 `approval_required` + `approval_id`，不要自造错误码
-4. 明确它**不读 `approval_mode`** 这一事实（或先完成第 13 节第 1 项）
+4. 无需额外处理模式：`gate_operation` 已读 `approval_mode`，只有 `auto` 档才允许白名单与身份直通
 
 ### F. 新增一个 UI 动作
 
@@ -388,19 +388,14 @@ python tests/readme_parity.py     # README.md 与 README.zh-CN.md 的结构/技�
 
 以下均为**已确认的现状与文档不一致**，尚未决定修哪一侧，故只记录、不声称已解决：
 
-1. **`gate_operation` 不读 `approval_mode`**（`ats.py`）。默认 `actor_level=L3` 时，
-   `delete`（L2）、`cancel`（L2）、`resume_schedule`（L1）直接放行且不生成审批。
-   而 `error-taxonomy.md`、`command-guide.md`、`anti-patterns.md` 仍写「这些命令需要审批」。
-   → 待定：让 `gate_operation` 接入模式，还是把文档改成「操作型命令只看等级」。
-   **触发**：任一侧定案后，删本条并改 §7.2 与 §11.E 第 4 条。
-2. **`approval_mode` / `approval_mode_by_level` / `preflight_*` 等新策略键尚未补进**
+1. **`approval_mode` / `approval_mode_by_level` / `preflight_*` 等新策略键尚未补进**
    `SKILL.md` 策略键表与 `references/data-model.md` 字段表。
    **触发**：两处补齐后删本条。
-3. **`denied_mode` / `denied_injection` / `override_required` / `note_required` /
+2. **`denied_mode` / `denied_injection` / `override_required` / `note_required` /
    `injection_denied` / `already_denied_injection` 尚未补进** `references/error-taxonomy.md`。
    **触发**：错误码表补齐后删本条。
-4. **`--level` 的 argparse 没有 `help` 文本**，`create --help` 看不到默认 L1 与审批语义。
-5. **`ats_preflight.py` 目前无自动化测试覆盖**（原 `tests/test_preflight.py` 已备份后移除）。
+3. **`--level` 的 argparse 没有 `help` 文本**，`create --help` 看不到默认 L1 与审批语义。
+4. **`ats_preflight.py` 目前无自动化测试覆盖**（原 `tests/test_preflight.py` 已备份后移除）。
 
 ---
 
