@@ -207,6 +207,33 @@ Approvals have an expiry, support batch approval, and honour a whitelist. A high
 
 Exit codes: `0` success, `2` bad arguments or missing confirmation, `3` missing object or state conflict, `4` insufficient permission.
 
+## Safety model
+
+Three layers stand between an agent and a destructive command, and all of them fail closed:
+
+| Layer | What it does | Where |
+| --- | --- | --- |
+| Hard floor | Obvious destructive commands carry a level floor: `--level L0` cannot downgrade them, and a whitelist hit does not bypass the floor | `scripts/ats.py` |
+| Guard watchdog | Every start compares core script SHA256 with `ats_guard_manifest.json`; on a mismatch every subcommand except `approve` is refused | `scripts/ats_guard.py` |
+| Lease autonomy | A live local lease may auto-approve whitelisted commands under a level cap, and every auto-approval is recorded with its token | `policy.json` |
+
+The watchdog is a speed bump, not a sandbox. Four limits are stated rather than hidden: the manifest is not signed (change a script and its digest, and `verify` still answers ok); a process with the same rights can delete the manifest and the key and rebuild the baseline; environment overrides such as `ATS_ALLOW_RULES` are not gated; and a lost key is not self-healing.
+
+## Batch work: globs and manifests
+
+One task can cover many files. Globs are expanded by the scheduler itself, never by a shell:
+
+```bash
+python scripts/ats.py create enc1 --command 'build.bat @enc --from gbk --to utf-8 "logs/*.log"'
+python scripts/ats.py download --file "manifests/*.txt" --out ./dl
+python scripts/ats.py download --file a.json --file b.csv --out ./dl
+```
+
+- Zero matches fail loudly (`hook_glob_no_match`, `manifest_no_match:<pattern>`) instead of being read as a literal filename
+- Caps: 256 files per hook (`ATS_HOOK_GLOB_MAX`), 64 manifests per `--file` value (`ATS_DOWNLOAD_MANIFEST_MAX`)
+- Two globs, or a glob mixed with literal paths, are rejected as ambiguous — the scheduler does not guess which one was meant
+- Manifests that disagree on `outputs` are refused unless `--out` is given; the expanded paths are written to `tasks/<id>/download.json`
+
 ## Repository layout
 
 ```

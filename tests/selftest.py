@@ -1397,7 +1397,11 @@ print(json.dumps(res, ensure_ascii=False))
 
 @case
 def guard_holds_handles_and_freezes_policy():
-    """持句柄挡住替换但不禁读；policy 走握手快照，运行中原地改写不影响决策。"""
+    """持句柄挡住替换但不禁读；policy 走握手快照，运行中原地改写不影响决策。
+
+    「挡替换」只在 Windows 成立（open 不带 FILE_SHARE_DELETE）；POSIX 下 rename
+    覆盖已打开文件是合法的，故那条断言按平台分流，不在别的系统上假装通过。
+    """
     sb = Sandbox()
     sb.auto_seal = False
     try:
@@ -1418,8 +1422,13 @@ def guard_holds_handles_and_freezes_policy():
                "握手应放行，实际 %r" % payload.get("handshake"))
         expect("ats.py" in payload.get("held", []),
                "应持有 ats.py 句柄，实际 %r" % payload.get("held"))
-        expect(payload.get("replace") != "OK",
-               "持句柄期间替换 ats.py 必须失败，实际 %r" % payload.get("replace"))
+        if os.name == "nt":
+            expect(payload.get("replace") != "OK",
+                   "持句柄期间替换 ats.py 必须失败，实际 %r" % payload.get("replace"))
+        else:
+            expect(payload.get("replace") == "OK",
+                   "POSIX 下 rename 覆盖已打开文件是合法的，「持句柄挡替换」这条只在 "
+                   "Windows 成立；此处应观察到 OK，实际 %r" % payload.get("replace"))
         expect(payload.get("read") == "OK",
                "持句柄不应挡住读取，实际 %r" % payload.get("read"))
         expect(payload.get("policy_after") == payload.get("policy_before"),

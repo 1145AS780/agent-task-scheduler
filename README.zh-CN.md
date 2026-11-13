@@ -206,6 +206,33 @@ python scripts/ats_ui.py --port 8765 --mcp-port 8766 --open
 
 退出码：`0` 正常，`2` 参数或确认缺失，`3` 不存在或状态冲突，`4` 权限不足。
 
+## 安全模型
+
+代理与破坏性命令之间有三层，且全部 fail-closed：
+
+| 层 | 作用 | 位置 |
+| --- | --- | --- |
+| 硬下限 | 明显破坏性的命令带等级下限：`--level L0` 降不下去，白名单命中也不绕过下限 | `scripts/ats.py` |
+| 看门狗 | 每次启动比对核心脚本 SHA256 与 `ats_guard_manifest.json`，不符则除 `approve` 外全部拒绝 | `scripts/ats_guard.py` |
+| 租约免审 | 存活租约可在等级上限内自动批准白名单命令，每笔自动批准都带令牌留痕 | `policy.json` |
+
+看门狗是减速带，不是沙箱。四条边界写在文档里而不是藏起来：清单本身没有签名（改脚本再改清单里的摘要，`verify` 照样回 ok）；同权限进程可以删掉清单与密钥重建基线；`ATS_ALLOW_RULES` 这类环境覆盖不受闸门约束；密钥丢了不能自愈。
+
+## 批量作业：通配与清单
+
+一条任务可以覆盖多个文件。通配由调度器自己展开，绝不交给 shell：
+
+```bash
+python scripts/ats.py create enc1 --command 'build.bat @enc --from gbk --to utf-8 "logs/*.log"'
+python scripts/ats.py download --file "manifests/*.txt" --out ./dl
+python scripts/ats.py download --file a.json --file b.csv --out ./dl
+```
+
+- 0 匹配直接失败（`hook_glob_no_match`、`manifest_no_match:<pattern>`），不会把字面量当文件名读
+- 上限：单个钩子 256 个文件（`ATS_HOOK_GLOB_MAX`），单个 `--file` 值 64 份清单（`ATS_DOWNLOAD_MANIFEST_MAX`）
+- 两个通配、或通配与手写路径混写，按「有歧义」拒绝——调度器不猜你想指哪个
+- 多份清单 `outputs` 不一致且没写 `--out` 会被拒；展开出的路径写入 `tasks/<id>/download.json`
+
 ## 仓库结构
 
 ```
