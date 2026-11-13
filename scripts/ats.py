@@ -56,6 +56,11 @@ try:                                    # 预演模块缺失时退化为纯权�
 except Exception:                       # noqa: BLE001
     ats_preflight = None
 
+try:                                    # 扩展发现层缺失时 extend 子命令直接报错
+    import ats_extend
+except Exception:                       # noqa: BLE001
+    ats_extend = None
+
 # ---------------------------------------------------------------- 常量
 
 LEVEL_RANK = {"L0": 0, "L1": 1, "L2": 2, "L3": 3}
@@ -1099,6 +1104,62 @@ def permission_gate(root, command, approval_id=None, context=None):
         return result
     result.update(allowed=False, reason="approval_required")
     return result
+
+
+def gate_preview(root, command, required_level, context=None):
+    """权限门的纯读预演：算等级、模式、白名单，不写审批、不判租约。
+
+    与 permission_gate 的判定链对齐到「模式判定」为止，差在两步刻意不做：
+      * 不调用 lease_autonomy —— 它命中后会 create_lease_approval，落盘；
+      * 不做 approval_check —— 那是查已有审批，预演时本来就没有。
+    所以 would 只表示「若不免审、不批，会怎样」，调用方必须看 lease_checked /
+    approval_checked 两个标记，别把 would=allow 当成一定能直通。
+
+    extend check 用它：预演阶段不能留下任何审批记录，否则「只读」就不成立。
+    """
+    context = dict(context or {})
+    pol = policy(root)
+    required = str(required_level or DEFAULT_TASK_LEVEL).upper()
+    hard = hard_floor_level(command)
+    if hard and level_rank(hard) > level_rank(required):
+        required = hard
+    if GUARD_SKIP_ACTIVE:
+        required = normalize_floor_level(required,
+                                         pol.get("guard_skip_level") or GUARD_SKIP_LEVEL)
+    actor = str(pol.get("actor_level") or DEFAULT_ACTOR_LEVEL).upper()
+    cap = str(pol.get("max_level") or DEFAULT_MAX_LEVEL).upper()
+    out = {
+        "required_level": required,
+        "actor_level": actor,
+        "policy_max": cap,
+        "effective_level": lower_level(required, lower_level(actor, cap)),
+        "hard_floor": hard,
+        "approval_mode": None,
+        "whitelist": None,
+        "would": None,
+        "reason": None,
+        "lease_checked": False,
+        "approval_checked": False,
+    }
+    rule = whitelist_match(root, context.get("whitelist_text") or command)
+    if rule and not hard and not GUARD_SKIP_ACTIVE:
+        out.update(would="allow", reason="whitelist", whitelist=rule)
+        return out
+    if rule:
+        out["whitelist_ignored"] = rule
+    if level_rank(required) > level_rank(cap):
+        out.update(would="deny", reason="denied_policy")
+        return out
+    mode = approval_mode_for(pol, required)
+    out["approval_mode"] = mode
+    if mode == "deny-only":
+        out.update(would="deny", reason="denied_mode")
+        return out
+    if mode == "auto" and level_rank(required) <= level_rank(actor):
+        out.update(would="allow", reason="level")
+        return out
+    out.update(would="approval_required", reason="approval_required")
+    return out
 
 
 def preflight_review(root, command, level, context=None, gate=None, shell=True):
@@ -3046,6 +3107,213 @@ def cmd_policy(root, args):
     return EXIT_OK
 
 
+def cmd_extend(root, args):
+    """扩展插件只读发现层：list / help / check。不导入、不执行任何插件代码。"""
+    if ats_extend is None:
+        return print_json({"error": "extend_module_missing",
+                           "hint": "scripts/ats_extend.py 缺失或无法导入，扩展发现层不可用"},
+                          EXIT_USAGE)
+    if args.action == "list":
+        data = ats_extend.scan(root)
+        if args.json:
+            return print_json(data)
+        for line in ats_extend.render_table(data["extends"]):
+            print(line)
+        if not data["extends"]:
+            print("no extends in %s" % data["extend_dir"])
+        if data["skipped_symlinks"]:
+            print("skipped %d symlinked director%s"
+                  % (data["skipped_symlinks"],
+                     "y" if data["skipped_symlinks"] == 1 else "ies"))
+        return EXIT_OK
+    if args.action == "check":
+        return cmd_extend_check(root, args)
+    if args.action == "run":
+        return cmd_extend_run(root, args)
+    item = ats_extend.describe(root, args.extend_id)
+    if item is None:
+        return print_json({"error": "not_found", "extend_id": args.extend_id,
+                           "hint": "先运行 extend list 查看可用插件"},
+                          EXIT_CONFLICT)
+    if args.json:
+        return print_json({"extend": item})
+    for line in ats_extend.render_help(item):
+        print(line)
+    return EXIT_OK
+
+
+def cmd_extend_check(root, args):
+    """扩展执行的纯预演：算等级、过权限门、跑静态预检，但绝不执行插件。
+
+    这是「执行前先过审」的准备层：第 3 批接执行时直接复用这里算出的
+    gate_text 与 required_level，保证审批绑定与预演结果同源。
+
+    三个刻意的边界：
+      * 权限门用 gate_preview 而不是 permission_gate —— 后者命中租约会写审批；
+      * 预检用 static_review 而不是 review —— 后者在 preflight_dry_run 开启时
+        会在沙箱里真跑命令，那就是执行插件代码；
+      * 输出里恒有 executed=false，别让调用方把 would=allow 当成已跑过。
+    """
+    item = ats_extend.describe(root, args.extend_id)
+    if item is None:
+        return print_json({"error": "not_found", "extend_id": args.extend_id,
+                           "hint": "先运行 extend list 查看可用插件"},
+                          EXIT_CONFLICT)
+    action, argv, bad = ats_extend.check_args(args.action_name, args.arg)
+    if bad:
+        return print_json({"error": bad["code"], "extend_id": args.extend_id,
+                           "detail": bad["detail"], "executed": False},
+                          EXIT_USAGE)
+    if item["state"] != "active":
+        return print_json({
+            "extend_id": args.extend_id,
+            "state": item["state"],
+            "reason": item["reason"],
+            "detail": item["detail"],
+            "problems": item["problems"],
+            "would": "deny",
+            "error": "inactive_extend",
+            "executed": False,
+            "hint": "非 active 插件不参与执行；按 problems 修好后再 check",
+        }, EXIT_DENIED)
+    commands = item.get("commands") or {}
+    if action is not None and action not in commands:
+        return print_json({
+            "error": "unknown_action",
+            "extend_id": args.extend_id,
+            "action": action,
+            "known": sorted(commands),
+            "executed": False,
+            "hint": "指令名取 instruction.json 的 commands 键",
+        }, EXIT_USAGE)
+    text = ats_extend.gate_text(item, action, argv)
+    level, level_note = ats_extend.task_level(item)
+    gate = gate_preview(root, text, level, {"whitelist_text": text})
+    preflight = None
+    if ats_preflight is not None:
+        try:
+            preflight = ats_preflight.static_review(text, {"cwd": item["dir"]})
+        except Exception as exc:         # noqa: BLE001
+            preflight = {"error": "%s: %s" % (type(exc).__name__, exc),
+                         "tags": [], "confidence": "none"}
+    payload = {
+        "extend_id": args.extend_id,
+        "dis_name": item.get("dis_name"),
+        "state": item["state"],
+        "executed": False,
+        "action": action,
+        "args": argv,
+        "gate_text": text,
+        "level": level,
+        "level_note": level_note,
+        "gate": gate,
+        "preflight": preflight,
+        "warnings": item.get("warnings") or [],
+    }
+    if args.json:
+        return print_json(payload)
+    for line in ats_extend.render_check(payload):
+        print(line)
+    return EXIT_OK
+
+
+def cmd_extend_run(root, args):
+    """按插件声明的入口建 Task 并启动（argv 模式，不经 shell）。
+
+    与 extend check 只差最后一步：check 算完就返回，run 把同一份
+    gate_text / argv / level 交给 _start_task，走既有的权限门、预检、
+    审批、supervisor、日志链路。扩展层不自建第二套执行器 —— 否则审批绑定、
+    编码解码、失败收敛这些既有行为都要重新实现一遍，且必然与主体漂移。
+
+    三个必须守住的点：
+      * command 必须等于 gate_text：_start_task 用 task["command"] 做审批绑定
+        与预检，换成任何别的写法都会让「预演看到的」和「执行的」不一致；
+      * shell=False + argv：参数不经 shell 解释，空格与 `&`、`;` 只是普通字符；
+      * cwd 设为插件目录：插件按相对路径读自己的资源。它也能用 `../..` 读到
+        root，这属于执行期的沙箱边界，静态预检只能看常量路径，看不到运行时拼接。
+    """
+    item = ats_extend.describe(root, args.extend_id)
+    if item is None:
+        return print_json({"error": "not_found", "extend_id": args.extend_id,
+                           "hint": "先运行 extend list 查看可用插件"}, EXIT_CONFLICT)
+    action, argv_args, bad = ats_extend.check_args(args.action_name, args.arg)
+    if bad:
+        return print_json({"error": bad["code"], "extend_id": args.extend_id,
+                           "detail": bad["detail"], "executed": False}, EXIT_USAGE)
+    if item["state"] != "active":
+        return print_json({
+            "extend_id": args.extend_id, "state": item["state"],
+            "reason": item["reason"], "detail": item["detail"],
+            "problems": item["problems"], "error": "inactive_extend",
+            "executed": False,
+            "hint": "非 active 插件不参与执行；按 problems 修好后再 run",
+        }, EXIT_DENIED)
+    commands = item.get("commands") or {}
+    if action is not None and action not in commands:
+        return print_json({"error": "unknown_action", "extend_id": args.extend_id,
+                           "action": action, "known": sorted(commands),
+                           "executed": False}, EXIT_USAGE)
+    argv = ats_extend.extend_argv(item, action, argv_args)
+    text = ats_extend.gate_text(item, action, argv_args)
+    if argv is None or text is None:
+        return print_json({"error": "missing_entry_point", "extend_id": args.extend_id,
+                           "executed": False}, EXIT_CONFLICT)
+    level, level_note = ats_extend.task_level(item)
+
+    task_id = args.id or new_task_id()
+    tdir = task_dir(root, task_id)
+    if (tdir / "task.json").exists() and not args.force:
+        return print_json({"error": "task_exists", "task_id": task_id}, EXIT_CONFLICT)
+
+    timeout = args.timeout if args.timeout is not None else DEFAULT_TIMEOUT
+    try:
+        timeout = int(timeout or 0)
+    except (TypeError, ValueError):
+        return print_json({"error": "bad_timeout"}, EXIT_USAGE)
+
+    now = now_ts()
+    task = {
+        "id": task_id,
+        "instance_id": uuid.uuid4().hex[:12],
+        "command": text,
+        "argv": argv,
+        "cwd": item["dir"],
+        "level": level,
+        "timeout": timeout,
+        "env": {},
+        "shell": False,
+        "description": "extend %s%s" % (item["extend_id"],
+                                        "" if not action else ":" + action),
+        "tags": ["extend", item["extend_id"]],
+        "status": "pending",
+        "created_at": now,
+        "created_iso": iso(now),
+        "updated_at": now,
+        "started_at": None,
+        "ended_at": None,
+        "pid": None,
+        "supervisor_pid": None,
+        "exit_code": None,
+        "approval_id": None,
+        "finalized": False,
+        "extend": {"extend_id": item["extend_id"], "action": action,
+                   "level": level, "level_note": level_note},
+    }
+    tdir.mkdir(parents=True, exist_ok=True)
+    save_task(root, task)
+    emit_event(root, {"type": "task_created", "task_id": task_id, "level": level,
+                      "command": text, "kind": "extend",
+                      "extend_id": item["extend_id"]})
+    log_event(root, "task_created", task_id=task_id, level=level,
+              command=text, kind="extend", extend_id=item["extend_id"])
+
+    payload, code = _start_task(root, task_id, args.approval, args.wait, False)
+    payload["extend"] = {"extend_id": item["extend_id"], "action": action,
+                         "level": level, "level_note": level_note,
+                         "gate_text": text}
+    return print_json(payload, code)
+
+
 # ---------------------------------------------------------------- 看门狗准入
 
 def _sha256_file(path):
@@ -3457,6 +3725,37 @@ def build_parser():
     p.add_argument("--set", action="append", nargs=2, metavar=("KEY", "VALUE"),
                    default=[], help="写入 policy.json，可重复：--set approval_mode ask")
 
+    p = sub.add_parser("extend", help="扩展插件（只读发现层）")
+    esub = p.add_subparsers(dest="action", required=True)
+
+    e = esub.add_parser("list", help="列出插件与状态（active / inactive）")
+    e.add_argument("--json", action="store_true")
+
+    e = esub.add_parser("help", help="查看单个插件的说明与指令")
+    e.add_argument("extend_id")
+    e.add_argument("--json", action="store_true")
+
+    e = esub.add_parser("check", help="预演插件执行的等级与审批（不执行）")
+    e.add_argument("extend_id")
+    e.add_argument("--action", dest="action_name", default=None,
+                   help="插件指令名，取 instruction.json 的 commands 键")
+    e.add_argument("--arg", action="append", default=[],
+                   help="传给插件的参数，可重复")
+    e.add_argument("--json", action="store_true")
+
+    e = esub.add_parser("run", help="建 Task 并启动插件（走既有审批与预检）")
+    e.add_argument("extend_id")
+    e.add_argument("--action", dest="action_name", default=None,
+                   help="插件指令名，取 instruction.json 的 commands 键")
+    e.add_argument("--arg", action="append", default=[],
+                   help="传给插件的参数，可重复")
+    e.add_argument("--approval", default=None, help="复用已有审批 id")
+    e.add_argument("--id", default=None, help="指定 task id")
+    e.add_argument("--timeout", type=int, default=None, help="超时秒数，0 为不限")
+    e.add_argument("--wait", action="store_true", help="同步等待执行结束")
+    e.add_argument("--force", action="store_true", help="task id 已存在时覆盖")
+    e.add_argument("--json", action="store_true")
+
     return ap
 
 
@@ -3478,6 +3777,7 @@ HANDLERS = {
     "events": cmd_events,
     "logs": cmd_logs,
     "policy": cmd_policy,
+    "extend": cmd_extend,
 }
 
 

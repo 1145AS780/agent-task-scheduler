@@ -25,6 +25,7 @@ version: "3.1.1"
 - 高风险命令（删除、发布、动生产数据）需要人工点头才允许执行
 - 需要事后回看「这次跑到哪一步、每步退出码是多少」
 - 需要批量下载文件、断点续传或按限速抓取（直接用内置 `download`，不必自己写脚本）；磁力链 / `.torrent` 用 `torrent`（依赖 aria2c）
+- 有自己写的小工具要接进来，又不想改调度器本体（放进 `extend/<id>/`，用 `extend check` 先预演、`extend run` 走同一套审批）
 
 **不适用**
 
@@ -202,11 +203,12 @@ python scripts/ats_ui.py --stop
 
 | 命令 | 作用 | 关键参数 |
 | --- | --- | --- |
-| `create` | 创建任务（命令末尾可挂 `@enc` 钩子，见 §4.7） | `--command` / `--cwd` / `--level` / `--timeout` / `--env K=V` / `--no-shell` / `--spec` / `--force` |
+| `create` | 创建任务（命令末尾可挂 `@enc` 钩子，见 §4.8） | `--command` / `--cwd` / `--level` / `--timeout` / `--env K=V` / `--no-shell` / `--spec` / `--force` |
 | `pack` | 加载指令包：多条命令一次性登记为独立 Task，**不执行**（每项均可挂 `@enc`） | `commands`（英文逗号分隔）/ `--pack-id` / `--cwd` / `--level` / `--timeout` / `--description` |
 | `run` | 启动任务 | `--approval AP` / `--wait` / `--force`（重跑需 force） |
 | `download` | 创建并启动下载任务（`kind="download"`，复用 Task 全链路） | `--url` / `--file` / `--out` / `--name` / `--sha256` / `--size` / `--header` / `--proxy` / `--concurrency` / `--rate` / `--retry` / `--no-resume` / `--overwrite` / `--insecure` / `--level` |
 | `torrent` | 创建并启动种子下载任务（`kind="torrent"`，依赖 aria2c） | `--magnet` / `--torrent` / `--out` / `--seed-time` / `--max-download` / `--max-upload` / `--level` / `--timeout` |
+| `extend` | 扩展插件：`list` / `help` / `check`（预演，不执行）/ `run`（走普通 Task 全链路） | `extend_id` / `--action` / `--arg` / `--wait` / `--json` |
 | `check` | 同步运行中任务（超时、退出、监督进程丢失） | 可选 `task_id`；不带则批量 |
 | `list` | 列表 | `--status succeeded,failed` / `--pack <pack_id>` / `--json` |
 | `show` | 详情 + stdout/stderr 尾部 | `--lines N` |
@@ -375,11 +377,41 @@ python scripts/ats.py pack "npm run build,npm test,git status" --pack-id pk-buil
 
 **查看与流转**：`list --pack pk-build` 筛出整包；每条 Task 与普通 Task 完全同权——`run` / `check` / `show` / `stop` / `delete` 都可用，审批门不受 `pack` 影响。
 
-### 4.6 全局参数
+### 4.6 扩展插件 `ats.py extend`
+
+插件是 `<ATS_ROOT>/extend/<extend_id>/` 下一个自包含目录，用 `instruction.json` 声明入口与指令。**发现层只扫描、不导入、不执行**；执行时复用普通 Task 全链路（权限门、预检、审批、日志、`stop`）。
+
+```bash
+python scripts/ats.py extend list                        # 扫描并报 active / inactive
+python scripts/ats.py extend help hello                  # 单个插件的说明与指令
+python scripts/ats.py extend check hello --action run    # 预演：等级、门禁文本、审批（不执行）
+python scripts/ats.py extend run hello --action run --wait
+```
+
+| 规则 | 说明 |
+| --- | --- |
+| 目录名 | 必须等于 `instruction.json` 的 `extend_id`，否则 `inactive` |
+| id 形状 | `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`，不匹配即 `inactive` |
+| 入口 | 必须落在插件目录内，禁止目录穿越；缺失即 `inactive` |
+| 等级 | 声明值不被信任：低于 L2 抬到 L2，缺失或非法按 L3 |
+| `check` | 纯读：不写审批、不碰租约、不执行 |
+| `run` | `command` 与 `check` 的 `gate_text` 完全相同；`shell=false`；`--arg` 进 argv 不进 shell |
+| 非 active | 不建 Task、不执行，直接 `inactive_extend`（退出码 4） |
+| 静态扫描 | 入口绝对路径在门禁文本里，预检会自动扫到插件源码 |
+
+**返回结构**（`extend check --json`）：
+
+```json
+{"extend_id": "hello", "state": "active", "executed": false,
+ "level": "L2", "level_note": null, "gate_text": "<解释器> <entry> --action run",
+ "gate": {"would": "ask", "reason": "approval"}, "preflight": {...}, "warnings": []}
+```
+
+### 4.7 全局参数
 
 两个脚本都支持 `--root <dir>`，优先级：`--root` > 环境变量 `ATS_ROOT` > `<cwd>/.ats`。
 
-### 4.7 `@enc` 后缀钩子（命令成功后自动转码）
+### 4.8 `@enc` 后缀钩子（命令成功后自动转码）
 
 在 `create` / `pack` 的命令文本**末尾**追加一段 `@enc <转换器参数>`，该任务就会在主命令**退出码为 0** 之后自动执行一次编码转换。`@enc` 必须是独立 token（前后为空白、行首或行尾）。
 

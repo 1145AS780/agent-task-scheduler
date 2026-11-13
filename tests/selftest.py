@@ -1439,6 +1439,453 @@ def guard_holds_handles_and_freezes_policy():
         sb.cleanup()
 
 
+# ---------------------------------------------------------------- 扩展发现层
+
+def write_extend(root, extend_id, entry_name="__init__.py", entry_text="# noop\n",
+                 declared_id=None, **fields):
+    """在 <root>/extend/<extend_id>/ 下写一个插件，返回目录。
+
+    declared_id 用于造「目录名与 instruction.json 不一致」的用例。
+    """
+    base = Path(root) / "extend" / extend_id
+    base.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "extend_id": extend_id,
+        "dis_name": "Demo",
+        "desc": "示例插件",
+        "version": "1.0.0",
+        "level": "L2",
+        "language": "python",
+        "entry_point": entry_name,
+        "commands": {"run": "--action run"},
+    }
+    if declared_id is not None:
+        payload["extend_id"] = declared_id
+    payload.update(fields)
+    (base / "instruction.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    if entry_text is not None:
+        (base / entry_name).write_text(entry_text, encoding="utf-8")
+    return base
+
+
+@case
+def extend_list_states():
+    """三种典型状态：合法 active、坏 JSON inactive、入口缺失 inactive。"""
+    sb = Sandbox()
+    try:
+        write_extend(sb.root, "hello")
+        base = Path(sb.root) / "extend" / "broken"
+        base.mkdir(parents=True, exist_ok=True)
+        (base / "instruction.json").write_text("{not json", encoding="utf-8")
+        write_extend(sb.root, "noentry", entry_name="run.py", entry_text=None)
+
+        rc, data = sb.json_out("extend", "list", "--json")
+        expect(rc == 0, "extend list 应退出 0，实际 %s" % rc)
+        expect(data["count"] == 3, "应发现 3 个插件，实际 %s" % data["count"])
+        by_id = {x["extend_id"]: x for x in data["extends"]}
+        expect(by_id["hello"]["state"] == "active",
+               "hello 应为 active，实际 %r" % by_id["hello"]["state"])
+        expect(by_id["broken"]["reason"] == "missing_or_invalid_instruction",
+               "坏 JSON 应报 missing_or_invalid_instruction，实际 %r"
+               % by_id["broken"]["reason"])
+        expect(by_id["noentry"]["reason"] == "missing_entry_point",
+               "缺入口应报 missing_entry_point，实际 %r"
+               % by_id["noentry"]["reason"])
+        expect(data["active"] == 1 and data["inactive"] == 2,
+               "计数应为 1 active / 2 inactive，实际 %s / %s"
+               % (data["active"], data["inactive"]))
+    finally:
+        sb.cleanup()
+
+
+@case
+def extend_list_empty_dir():
+    """extend 目录不存在时返回空结果，不报错。"""
+    sb = Sandbox()
+    try:
+        rc, data = sb.json_out("extend", "list", "--json")
+        expect(rc == 0, "无 extend 目录也应退出 0，实际 %s" % rc)
+        expect(data["count"] == 0, "应为 0 个插件，实际 %s" % data["count"])
+        expect(data["extends"] == [], "extends 应为空列表")
+    finally:
+        sb.cleanup()
+
+
+@case
+def extend_never_executes():
+    """发现层不导入插件：入口文件里的导入副作用不得发生。"""
+    sb = Sandbox()
+    try:
+        marker = Path(sb.root) / "executed.marker"
+        write_extend(
+            sb.root, "sideeffect",
+            entry_text="import pathlib\npathlib.Path(%r).write_text('boom')\n" % str(marker),
+        )
+        rc, data = sb.json_out("extend", "list", "--json")
+        expect(rc == 0, "extend list 应退出 0，实际 %s" % rc)
+        expect(not marker.exists(),
+               "extend list 不得执行插件代码，但入口副作用已发生：%s" % marker)
+
+        rc, data = sb.json_out("extend", "help", "sideeffect", "--json")
+        expect(rc == 0, "extend help 应退出 0，实际 %s" % rc)
+        expect(not marker.exists(),
+               "extend help 不得执行插件代码，但入口副作用已发生：%s" % marker)
+    finally:
+        sb.cleanup()
+
+
+@case
+def extend_level_floor():
+    """声明等级不被当真：低于 L2 抬到 L2，缺失或非法按 L3。"""
+    sb = Sandbox()
+    try:
+        write_extend(sb.root, "low", level="L0")
+        write_extend(sb.root, "high", level="L3")
+        write_extend(sb.root, "badlevel", level="L9")
+        write_extend(sb.root, "nolevel", level="")
+
+        rc, data = sb.json_out("extend", "list", "--json")
+        expect(rc == 0, "extend list 应退出 0，实际 %s" % rc)
+        by_id = {x["extend_id"]: x for x in data["extends"]}
+        expect(by_id["low"]["level"] == "L2" and by_id["low"]["level_note"] == "raised_to_floor",
+               "L0 应抬到 L2，实际 %r / %r"
+               % (by_id["low"]["level"], by_id["low"]["level_note"]))
+        expect(by_id["high"]["level"] == "L3" and by_id["high"]["level_note"] is None,
+               "L3 应原样保留，实际 %r / %r"
+               % (by_id["high"]["level"], by_id["high"]["level_note"]))
+        for name in ("badlevel", "nolevel"):
+            expect(by_id[name]["level"] == "L3",
+                   "%s 应覆写为 L3，实际 %r" % (name, by_id[name]["level"]))
+            expect(by_id[name]["level_note"] == "missing_or_invalid_level",
+                   "%s 应标 missing_or_invalid_level，实际 %r"
+                   % (name, by_id[name]["level_note"]))
+            expect(by_id[name]["state"] == "active",
+                   "%s 等级非法只覆写等级，不因此判 inactive，实际 %r"
+                   % (name, by_id[name]["state"]))
+    finally:
+        sb.cleanup()
+
+
+@case
+def extend_id_mismatch_and_bad_name():
+    """目录名与 extend_id 不一致、目录名非法，都必须判 inactive。"""
+    sb = Sandbox()
+    try:
+        write_extend(sb.root, "folder_a", declared_id="other_id")
+        base = Path(sb.root) / "extend" / "bad name"
+        base.mkdir(parents=True, exist_ok=True)
+        (base / "instruction.json").write_text(
+            json.dumps({"extend_id": "bad name", "dis_name": "x", "desc": "x",
+                        "version": "1", "level": "L2", "language": "python",
+                        "entry_point": "__init__.py", "commands": {"a": "b"}}),
+            encoding="utf-8")
+        (base / "__init__.py").write_text("# noop\n", encoding="utf-8")
+
+        rc, data = sb.json_out("extend", "list", "--json")
+        expect(rc == 0, "extend list 应退出 0，实际 %s" % rc)
+        by_id = {x["extend_id"]: x for x in data["extends"]}
+        expect(by_id["folder_a"]["reason"] == "extend_id_mismatch",
+               "id 不一致应报 extend_id_mismatch，实际 %r"
+               % by_id["folder_a"]["reason"])
+        expect(by_id["bad name"]["reason"] == "bad_extend_id",
+               "非法目录名应报 bad_extend_id，实际 %r" % by_id["bad name"]["reason"])
+        expect(by_id["bad name"]["state"] == "inactive", "非法目录名应为 inactive")
+    finally:
+        sb.cleanup()
+
+
+@case
+def extend_help_and_not_found():
+    """help 返回说明与指令；未知 id 返回 not_found 且退出码 3。"""
+    sb = Sandbox()
+    try:
+        write_extend(sb.root, "hello", dis_name="Hello", desc="打招呼",
+                     commands={"greet": "--name x", "echo": "--text y"})
+
+        rc, data = sb.json_out("extend", "help", "hello", "--json")
+        expect(rc == 0, "extend help 应退出 0，实际 %s" % rc)
+        ext = data["extend"]
+        expect(ext["desc"] == "打招呼", "desc 应回传，实际 %r" % ext["desc"])
+        expect(ext["commands"].get("greet") == "--name x",
+               "commands 应回传，实际 %r" % ext["commands"])
+        expect(ext["state"] == "active", "应为 active，实际 %r" % ext["state"])
+
+        rc, data = sb.json_out("extend", "help", "ghost", "--json")
+        expect(rc == 3, "未知插件应返回 EXIT_CONFLICT(3)，实际 %s" % rc)
+        expect(data.get("error") == "not_found", "应报 not_found，实际 %r" % data.get("error"))
+
+        rc, data = sb.json_out("extend", "help", "../escape", "--json")
+        expect(rc == 3, "带 .. 的 id 应按 not_found 处理，实际 %s" % rc)
+    finally:
+        sb.cleanup()
+
+
+@case
+def extend_check_reports_gate():
+    """合法插件：check 算出等级、过权限门、给出 would，并声明未执行。"""
+    sb = Sandbox()
+    try:
+        write_extend(sb.root, "hello")
+        rc, data = sb.json_out("extend", "check", "hello", "--action", "run", "--json")
+        expect(data.get("executed") is False, "check 必须声明 executed=false，实际 %r"
+               % data.get("executed"))
+        expect(data["state"] == "active", "应为 active，实际 %r" % data["state"])
+        expect(data["level"] == "L2", "插件声明 L2 应保持 L2，实际 %r" % data["level"])
+        gate = data["gate"]
+        expect(gate["required_level"] == "L2",
+               "required 应为 L2，实际 %r" % gate["required_level"])
+        expect(gate["lease_checked"] is False and gate["approval_checked"] is False,
+               "预演不得查租约或审批，实际 %r / %r"
+               % (gate["lease_checked"], gate["approval_checked"]))
+        # 默认策略 approval_mode_by_level 把 L2 定为 ask：插件执行默认要审批，
+        # 这正是「插件不能自己决定直通」的体现。
+        expect(gate["approval_mode"] == "ask",
+               "默认策略下 L2 模式应为 ask，实际 %r" % gate["approval_mode"])
+        expect(gate["would"] == "approval_required",
+               "L2 应判需审批，实际 %r (%r)"
+               % (gate["would"], gate.get("reason")))
+        expect(rc == 0, "check 是诊断命令，结论非 allow 也应退出 0，实际 %s" % rc)
+
+        text = data["gate_text"]
+        entry = str(Path(sb.root) / "extend" / "hello" / "__init__.py")
+        expect(entry in text, "门禁文本应含入口绝对路径，实际 %r" % text)
+        expect(sys.executable in text,
+               "门禁文本应以当前解释器开头（依赖校验用的就是它），实际 %r" % text)
+
+        rc, out, err = sb.ats("extend", "check", "hello", "--action", "run")
+        expect(rc == 0, "文本模式 check 应退出 0，实际 %s\n%s\n%s" % (rc, out, err))
+        expect("executed : no" in out, "文本输出应显式声明未执行，实际 %r" % out)
+        expect(entry in out, "文本输出应显示门禁文本，实际 %r" % out)
+    finally:
+        sb.cleanup()
+
+
+@case
+def extend_check_never_executes():
+    """check 不得执行插件：入口副作用不发生，preflight 也不试跑。"""
+    sb = Sandbox()
+    try:
+        marker = Path(sb.root) / "executed.marker"
+        write_extend(
+            sb.root, "sideeffect",
+            entry_text="import pathlib\npathlib.Path(%r).write_text('boom')\n" % str(marker),
+        )
+        rc, data = sb.json_out("extend", "check", "sideeffect", "--json")
+        expect(not marker.exists(),
+               "extend check 不得执行插件代码，但入口副作用已发生：%s" % marker)
+        expect(data.get("executed") is False, "check 必须声明未执行")
+        expect(data["preflight"] is not None, "应带静态预检结果")
+    finally:
+        sb.cleanup()
+
+
+@case
+def extend_check_dangerous_arg_raises_level():
+    """参数里的硬危险命令抬高 required，不被插件声明的 L2 压住。"""
+    sb = Sandbox()
+    try:
+        write_extend(sb.root, "hello")
+        rc, data = sb.json_out("extend", "check", "hello",
+                               "--action", "run", "--arg", "rm -rf /tmp/x", "--json")
+        gate = data["gate"]
+        expect(gate["hard_floor"] == "L3",
+               "rm -rf 应触发 L3 硬下限，实际 %r" % gate["hard_floor"])
+        expect(gate["required_level"] == "L3",
+               "required 应抬到 L3，实际 %r" % gate["required_level"])
+        expect(data["level"] == "L2",
+               "插件自身等级仍应是 L2，抬高只发生在门禁层，实际 %r" % data["level"])
+    finally:
+        sb.cleanup()
+
+
+@case
+def extend_check_inactive_and_unknown_action():
+    """inactive 插件直接 deny；未知指令名报 unknown_action 并列出可用指令。"""
+    sb = Sandbox()
+    try:
+        write_extend(sb.root, "noentry", entry_name="run.py", entry_text=None)
+        rc, data = sb.json_out("extend", "check", "noentry", "--json")
+        expect(rc == 4, "inactive 插件应退出 EXIT_DENIED(4)，实际 %s" % rc)
+        expect(data.get("error") == "inactive_extend",
+               "应报 inactive_extend，实际 %r" % data.get("error"))
+        expect(data.get("would") == "deny", "inactive 应判 deny，实际 %r" % data.get("would"))
+        expect(data.get("executed") is False, "inactive 也必须声明未执行")
+
+        write_extend(sb.root, "hello", commands={"run": "x"})
+        rc, data = sb.json_out("extend", "check", "hello",
+                               "--action", "nope", "--json")
+        expect(rc == 2, "未知指令名应退出 EXIT_USAGE(2)，实际 %s" % rc)
+        expect(data.get("error") == "unknown_action",
+               "应报 unknown_action，实际 %r" % data.get("error"))
+        expect(data.get("known") == ["run"],
+               "应列出可用指令 run，实际 %r" % data.get("known"))
+    finally:
+        sb.cleanup()
+
+
+@case
+def extend_check_no_approval_side_effect():
+    """check 不得留下审批记录：预演走 gate_preview，不写 approvals/。"""
+    sb = Sandbox()
+    try:
+        write_extend(sb.root, "hello")
+        adir = Path(sb.root) / "approvals"
+
+        def snapshot():
+            return sorted(p.name for p in adir.glob("ap-*.json")) if adir.is_dir() else []
+
+        before = snapshot()
+        sb.json_out("extend", "check", "hello", "--action", "run", "--json")
+        after = snapshot()
+        expect(before == after,
+               "check 不得写审批记录，%r -> %r" % (before, after))
+    finally:
+        sb.cleanup()
+
+
+@case
+def extend_check_scans_plugin_source():
+    """插件源码经门禁文本进入静态扫描：入口里的删除调用必须被识别。"""
+    sb = Sandbox()
+    try:
+        write_extend(sb.root, "danger",
+                     entry_text="import os\nos.remove('/tmp/x')\n")
+        rc, data = sb.json_out("extend", "check", "danger", "--json")
+        pf = data["preflight"]
+        expect(pf is not None, "应带静态预检结果")
+        expect("fs_delete" in (pf.get("tags") or []),
+               "入口里的 os.remove 应标 fs_delete，实际 tags=%r" % pf.get("tags"))
+        expect(pf.get("confidence") in ("low", "medium", "high"),
+               "应给出置信度，实际 %r" % pf.get("confidence"))
+        sources = pf.get("sources") or []
+        entry = str(Path(sb.root) / "extend" / "danger" / "__init__.py")
+        expect(any(s.get("file") == entry and s.get("ok") for s in sources),
+               "应真的解析了插件入口 %s，实际 sources=%r" % (entry, sources))
+    finally:
+        sb.cleanup()
+
+
+AUTO_POLICY = {"approval_mode_by_level": {"L0": "auto", "L1": "auto",
+                                          "L2": "auto", "L3": "auto"}}
+
+
+@case
+def extend_run_executes_and_binds_text():
+    """run 真执行插件；task.command 必须与 check 的 gate_text 完全相同。"""
+    sb = Sandbox()
+    try:
+        marker = Path(sb.root) / "ran.marker"
+        write_extend(
+            sb.root, "hello",
+            entry_text=("import pathlib, sys\n"
+                        "pathlib.Path(%r).write_text('|'.join(sys.argv[1:]))\n" % str(marker)),
+        )
+        sb.write_policy(AUTO_POLICY)
+
+        rc, chk = sb.json_out("extend", "check", "hello", "--action", "run", "--json")
+        expect(rc == 0, "check 应退出 0，实际 %s" % rc)
+
+        rc, run = sb.json_out("extend", "run", "hello", "--action", "run",
+                              "--id", "ext-1", "--wait", "--json")
+        expect(rc == 0, "auto 策略下 run 应退出 0，实际 %s\n%s" % (rc, run))
+        expect(run["task"]["status"] == "succeeded",
+               "插件应执行成功，实际 %r" % run["task"]["status"])
+        expect(marker.exists(), "插件应真的被执行，但 marker 不存在")
+        expect(marker.read_text(encoding="utf-8") == "--action|run",
+               "插件应收到 --action run，实际 %r"
+               % marker.read_text(encoding="utf-8"))
+
+        task = json.loads((Path(sb.root) / "tasks" / "ext-1" / "task.json")
+                          .read_text(encoding="utf-8"))
+        expect(task["command"] == chk["gate_text"],
+               "task.command 必须等于 check 的 gate_text（审批绑定同源）\n%r\n!=\n%r"
+               % (task["command"], chk["gate_text"]))
+        expect(task["shell"] is False,
+               "插件任务必须 shell=False，实际 %r" % task["shell"])
+        expect(task["level"] == "L2", "task level 应为 L2，实际 %r" % task["level"])
+        expect(task["cwd"] == str(Path(sb.root) / "extend" / "hello"),
+               "task cwd 应为插件目录，实际 %r" % task["cwd"])
+        expect(task["tags"] == ["extend", "hello"],
+               "task tags 应标注来源，实际 %r" % task["tags"])
+    finally:
+        sb.cleanup()
+
+
+@case
+def extend_run_requires_approval_by_default():
+    """默认策略 L2=ask：run 返回 approval_required，插件不得被执行。"""
+    sb = Sandbox()
+    try:
+        marker = Path(sb.root) / "ran.marker"
+        write_extend(
+            sb.root, "hello",
+            entry_text="import pathlib\npathlib.Path(%r).write_text('x')\n" % str(marker),
+        )
+        rc, run = sb.json_out("extend", "run", "hello", "--action", "run",
+                              "--id", "ext-2", "--wait", "--json")
+        expect(rc == 4, "默认 L2=ask 应返回 EXIT_DENIED(4)，实际 %s\n%s" % (rc, run))
+        expect(run.get("error") == "approval_required",
+               "应报 approval_required，实际 %r" % run.get("error"))
+        expect(run.get("approval_id"), "应给出 approval_id，实际 %r" % run.get("approval_id"))
+        expect(not marker.exists(), "未审批前插件不得被执行")
+    finally:
+        sb.cleanup()
+
+
+@case
+def extend_run_args_not_interpreted_by_shell():
+    """argv 模式：参数里的 & 与 ; 只当普通字符，不会变成第二条命令。"""
+    sb = Sandbox()
+    try:
+        out = Path(sb.root) / "argv.txt"
+        write_extend(
+            sb.root, "echoargs",
+            entry_text=("import pathlib, sys\n"
+                        "pathlib.Path(%r).write_text(repr(sys.argv[1:]))\n" % str(out)),
+        )
+        sb.write_policy(AUTO_POLICY)
+        rc, run = sb.json_out("extend", "run", "echoargs", "--action", "run",
+                              "--arg", "a & b; c", "--id", "ext-3", "--wait", "--json")
+        expect(rc == 0, "run 应退出 0，实际 %s\n%s" % (rc, run))
+        content = out.read_text(encoding="utf-8")
+        expect("'a & b; c'" in content,
+               "参数应原样到达插件（不经过 shell），实际 %r" % content)
+        expect("hacked" not in content and content.count("--action") == 1,
+               "参数不应被 shell 拆成多条命令，实际 %r" % content)
+    finally:
+        sb.cleanup()
+
+
+@case
+def extend_run_rejects_inactive_and_policy_cap():
+    """inactive 插件不建 task；策略上限低于插件等级时判 denied_policy。"""
+    sb = Sandbox()
+    try:
+        write_extend(sb.root, "noentry", entry_name="run.py", entry_text=None)
+        rc, run = sb.json_out("extend", "run", "noentry", "--action", "run",
+                              "--id", "ext-4", "--json")
+        expect(rc == 4, "inactive 插件应退出 EXIT_DENIED(4)，实际 %s" % rc)
+        expect(run.get("error") == "inactive_extend",
+               "应报 inactive_extend，实际 %r" % run.get("error"))
+        expect(not (Path(sb.root) / "tasks" / "ext-4").exists(),
+               "inactive 插件不得建 task")
+
+        write_extend(sb.root, "hello")
+        sb.write_policy({"max_level": "L1"})
+        rc, run = sb.json_out("extend", "run", "hello", "--action", "run",
+                              "--id", "ext-5", "--json")
+        expect(rc == 4, "策略上限 L1 应拒绝 L2 插件，实际 %s\n%s" % (rc, run))
+        expect(run.get("error") == "denied_policy",
+               "应报 denied_policy，实际 %r" % run.get("error"))
+        task = json.loads((Path(sb.root) / "tasks" / "ext-5" / "task.json")
+                          .read_text(encoding="utf-8"))
+        expect(task["status"] == "pending",
+               "被策略拒绝的 task 应停在 pending，实际 %r" % task["status"])
+    finally:
+        sb.cleanup()
+
+
 # ---------------------------------------------------------------- 口令闸门
 
 @case

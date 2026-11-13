@@ -70,6 +70,31 @@ Schedule（周期/一次性）
 - Python 3（仅标准库）
 - `aria2c` 在 `PATH` 中——仅当需要种子/磁力下载时
 
+## 一键设置（Windows，小白版）
+
+不用开终端、不用背命令：在仓库根目录**双击 `setup.bat`** 就行。它干的事和下面
+「快速上手」里那两行一模一样，只是把容易出错的顺序替你记住了：
+
+1. 先看这台电脑上有没有 `python`，而且是不是 Python 3；没有就告诉你去装什么。
+2. 再看这个状态目录是不是已经设置好了（跑一次 `ats_guard.py verify`）：
+   - 已经好了 → 直接停下，一个文件都不改
+   - 全新目录 → 建密钥 + 建清单（`init` + `seal`）
+   - 核心脚本改过 → 只重新建清单（`seal`）
+3. 只问你一次口令，输入时屏幕上不显示。口令经标准输入交给 `ats_guard.py`：
+   不进命令行参数、不落盘、不进命令历史。
+
+退出码：`0` 完成，`1` 没装 python 或不是 Python 3，`2` 口令为空，`3` 口令少于 8 位，
+`4` 口令不对或密钥文件丢失。**检查不通过时，它一个文件都不会写。**
+
+```bat
+setup.bat                      :: 用 %ATS_ROOT%，没设就用 .\.ats
+setup.bat "D:\my-state"        :: 指定别的状态目录
+seal-once.bat                  :: 同一个东西，旧名字留着的入口
+```
+
+真正的中文提示和逻辑在 `setup.ps1`（UTF-8 编码，中文才不会乱码）；
+`setup.bat` 只保留纯 ASCII 的一行转发，因为 `cmd.exe` 解析 UTF-8 中文批处理会乱。
+
 ## 快速上手
 
 全新克隆首次运行：`ats.py` 会拒绝启动，直到信任根建立为止（`guard_check_failed` /
@@ -233,6 +258,34 @@ python scripts/ats.py download --file a.json --file b.csv --out ./dl
 - 两个通配、或通配与手写路径混写，按「有歧义」拒绝——调度器不猜你想指哪个
 - 多份清单 `outputs` 不一致且没写 `--out` 会被拒；展开出的路径写入 `tasks/<id>/download.json`
 
+## 扩展插件
+
+扩展插件是 `ATS_ROOT/extend/<extend_id>/` 下一个自包含目录，用 `instruction.json` 声明入口与指令。调度器只做发现，发现阶段绝不导入插件代码；执行时与普通任务走同一套权限门、预检审查与审批流。
+
+```json
+{
+  "extend_id": "hello",
+  "language": "python",
+  "entry_point": "__init__.py",
+  "commands": {"run": "--action run"}
+}
+```
+
+```bash
+python scripts/ats.py extend list                 # 扫描并报状态
+python scripts/ats.py extend help hello           # 查看单个插件说明
+python scripts/ats.py extend check hello --action run   # 预演：等级、门禁文本、审批（不执行）
+python scripts/ats.py extend run hello --action run --wait
+```
+
+以下规则不因插件自己怎么声明而改变：
+
+- 目录名必须与 `extend_id` 相同；名字不一致、入口缺失、入口落在插件目录之外、或 id 不匹配 `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`，一律判 `inactive`，而 inactive 插件永不执行
+- 声明等级不被信任：低于 L2 一律抬到 L2，缺失或非法按 L3
+- `extend check` 是纯读预演——不写审批、不碰租约
+- `extend run` 建出的任务，其 `command` 与 `check` 报出的门禁文本完全一致，`shell=false`，参数以 argv 列表传递，所以 `&` 与 `;` 只是普通字符
+- 插件入口源码会自动进入预检静态扫描，因为入口绝对路径本身就是门禁文本的一部分
+
 ## 仓库结构
 
 ```
@@ -253,6 +306,7 @@ scripts/                    调度器本体
 ├── ats_plan.py             Plan 与 Schedule 层
 ├── ats_download.py         HTTP 下载器，断点续传与完整性校验
 ├── ats_torrent.py          种子与磁力的 aria2c 封装
+├── ats_extend.py           扩展发现、等级下限、门禁文本
 ├── ats_mcp.py              MCP 适配器（stdio，16 个工具）
 ├── ats_mcp_http.py         控制台托管的 Streamable HTTP 端点
 ├── ats_ui.py               本地 Web 控制台：监控、运行、审批、创建

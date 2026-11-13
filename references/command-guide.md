@@ -633,6 +633,30 @@ python scripts/ats.py run t-1a2b3c        # 要跑哪条再单独 run
 - 每条 Task 与普通 Task 同权：`run` / `check` / `show` / `stop` / `delete` 都可用，审批门不受 `pack` 影响
 - 包内**没有依赖与顺序**：`index` 只表示它在原文本中的位置
 
+### 11.13 「跑一个自己写的扩展插件」
+
+```powershell
+python scripts/ats.py extend list                        # 看有哪些插件、状态如何
+python scripts/ats.py extend help hello                  # 看单个插件的指令与说明
+python scripts/ats.py extend check hello --action run    # 预演：等级、门禁文本、是否需要审批
+python scripts/ats.py extend run hello --action run --wait
+```
+
+插件放在 `<ATS_ROOT>/extend/<extend_id>/`，目录名必须等于 `instruction.json` 里的 `extend_id`：
+
+```json
+{"extend_id": "hello", "language": "python",
+ "entry_point": "__init__.py", "commands": {"run": "--action run"}}
+```
+
+- `check` 是**纯读**：算等级、拼门禁文本、跑预检静态扫描，但不写审批、不碰租约、不执行
+- `run` 建出的 Task，其 `command` 与 `check` 报出的 `gate_text` **完全相同**（审批按文本绑定，两处必须同源）
+- 参数用 `--arg` 传，进 argv 列表而**不进 shell**：`--arg "a & b; c"` 到达插件时仍是这一整串
+- 等级不看插件声明：低于 L2 抬到 L2，缺失或非法按 L3；`max_level` 低于 L2 时一律 `denied_policy`
+- 非 `active`（入口缺失、目录名与 id 不一致、id 含非法字符等）**不建 Task、不执行**
+- 插件入口源码会自动进预检静态扫描，因为入口绝对路径本身就是门禁文本的一部分
+- 停止、查看、删除走普通 Task 命令：`show <task_id>` / `stop <task_id>` / `delete <task_id>`
+
 ---
 
 ## 12. Windows 专项

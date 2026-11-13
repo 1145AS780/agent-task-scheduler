@@ -70,6 +70,34 @@ Every step is a task behind a permission gate, so it reuses the task layer's app
 - Python 3 (standard library only)
 - `aria2c` on `PATH` — only if you want torrent and magnet downloads
 
+## One-click setup (Windows)
+
+No terminal and no typed commands — double-click **`setup.bat`** in the repo root.
+It is the same two guard steps as below, wrapped so that a first-timer cannot get
+them wrong:
+
+1. Checks that `python` exists on `PATH` and is Python 3 (says what to install if not).
+2. Checks whether this `ATS_ROOT` is already sealed (`ats_guard.py verify`).
+   - already fine → it stops there and writes nothing
+   - fresh root → `init` + `seal`
+   - scripts changed → `seal` only
+3. Asks for the passphrase once, masked. It is passed to `ats_guard.py` over
+   stdin: not in argv, not on disk, not in shell history.
+
+Exit codes: `0` done, `1` python missing / not Python 3, `2` empty passphrase,
+`3` passphrase shorter than 8, `4` wrong passphrase or key missing. Nothing is
+written when a check fails.
+
+```bat
+setup.bat                      :: uses %ATS_ROOT%, else .\.ats
+setup.bat "D:\my-state"        :: explicit ATS_ROOT
+seal-once.bat                  :: same thing, kept as the old entry point
+```
+
+The logic lives in `setup.ps1` (UTF-8, so the Chinese prompts render correctly);
+`setup.bat` is a pure-ASCII wrapper because `cmd.exe` misparses UTF-8 Chinese
+lines in batch files.
+
 ## Quick start
 
 First run on a fresh clone: `ats.py` refuses to start until the trust root exists
@@ -234,6 +262,34 @@ python scripts/ats.py download --file a.json --file b.csv --out ./dl
 - Two globs, or a glob mixed with literal paths, are rejected as ambiguous — the scheduler does not guess which one was meant
 - Manifests that disagree on `outputs` are refused unless `--out` is given; the expanded paths are written to `tasks/<id>/download.json`
 
+## Extension plugins
+
+An extension is a self-contained directory under `ATS_ROOT/extend/<extend_id>/` with an `instruction.json` describing its entry point and commands. The scheduler discovers it, never imports it during discovery, and only runs it through the same permission gate, preflight review and approval flow as any other task.
+
+```json
+{
+  "extend_id": "hello",
+  "language": "python",
+  "entry_point": "__init__.py",
+  "commands": {"run": "--action run"}
+}
+```
+
+```bash
+python scripts/ats.py extend list                 # scan and report state
+python scripts/ats.py extend help hello           # instructions of one plugin
+python scripts/ats.py extend check hello --action run   # dry-run: level, gate text, approval (never executes)
+python scripts/ats.py extend run hello --action run --wait
+```
+
+Rules that hold regardless of what the plugin declares:
+
+- The directory name must equal `extend_id`; a mismatch, a missing entry point, an entry outside the plugin directory, or an id that fails `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` makes the plugin `inactive`, and inactive plugins never run
+- The declared level is not trusted: anything below L2 is raised to L2, and a missing or invalid level becomes L3
+- `extend check` is pure read — it writes no approval and touches no lease
+- `extend run` builds a task whose `command` is exactly the gate text `check` reports, sets `shell=false`, and passes arguments as an argv list, so `&` and `;` stay literal
+- Plugin entry sources are pulled into the preflight static scan automatically, because the entry's absolute path is part of the gate text
+
 ## Repository layout
 
 ```
@@ -254,6 +310,7 @@ scripts/                    The scheduler itself
 ├── ats_plan.py             Plan and schedule layer
 ├── ats_download.py         HTTP downloader with resume and integrity check
 ├── ats_torrent.py          aria2c wrapper for torrents and magnets
+├── ats_extend.py           Extension discovery, level floor, gate text
 ├── ats_mcp.py              MCP adapter (stdio, 16 tools)
 ├── ats_mcp_http.py         Streamable HTTP endpoint hosted by the console
 ├── ats_ui.py               Local web console: monitor, run, approvals, create

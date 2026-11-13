@@ -32,6 +32,10 @@ $env:ATS_ROOT = "D:\state\ats"      # PowerShell
 ```
 <root>/
 ├── policy.json                     # 可选：策略
+├── extend/                         # 可选：扩展插件（人写的，不归 ATS 生命周期管）
+│   └── hello/
+│       ├── instruction.json        # 插件描述（发现层只读，不导入）
+│       └── __init__.py             # 入口，执行时以 argv 拉起
 ├── events.jsonl                    # 全局事件流（Task 层 + 无 schedule 的审批）
 ├── events_state.json               # 全局事件游标
 ├── scheduler.log                   # 全局日志（JSONL）
@@ -104,6 +108,7 @@ $env:ATS_ROOT = "D:\state\ats"      # PowerShell
 | 路径 | 写者 | 读者 | 语义 |
 | --- | --- | --- | --- |
 | `policy.json` | 人 | 两个脚本 | 策略；可热改 |
+| `extend/<id>/instruction.json` | 人 | `ats_extend.py`（只读） | 插件描述；发现层不导入、不执行 |
 | `events.jsonl` | ats.py（Task 事件）/ ats.py（审批） | `ats.py events`、外部 | 全局事件流 |
 | `events_state.json` | `ats.py events` | 同上 | 游标（行号） |
 | `scheduler.log` | 两个脚本 | `ats.py logs`、人 | 全局时间线 |
