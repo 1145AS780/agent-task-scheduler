@@ -3108,7 +3108,7 @@ def cmd_policy(root, args):
 
 
 def cmd_extend(root, args):
-    """扩展插件只读发现层：list / help / check。不导入、不执行任何插件代码。"""
+    """扩展插件入口：list / help / check 只读，run 走普通 Task 链路真执行。"""
     if ats_extend is None:
         return print_json({"error": "extend_module_missing",
                            "hint": "scripts/ats_extend.py 缺失或无法导入，扩展发现层不可用"},
@@ -3725,7 +3725,7 @@ def build_parser():
     p.add_argument("--set", action="append", nargs=2, metavar=("KEY", "VALUE"),
                    default=[], help="写入 policy.json，可重复：--set approval_mode ask")
 
-    p = sub.add_parser("extend", help="扩展插件（只读发现层）")
+    p = sub.add_parser("extend", help="扩展插件（发现 / 预演 / 执行）")
     esub = p.add_subparsers(dest="action", required=True)
 
     e = esub.add_parser("list", help="列出插件与状态（active / inactive）")

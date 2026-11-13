@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""扩展插件只读发现层：扫描 <ATS_ROOT>/extend/ 并给出状态。
+"""扩展插件发现层：扫描 <ATS_ROOT>/extend/ 并给出状态。
 
 这一层只做三件事：读 instruction.json、查文件是否齐全、报状态。
-它从不导入、从不执行插件代码，哪怕状态是 active——执行层是后续批次的事。
+它从不导入、从不执行插件代码，哪怕状态是 active。执行不在本模块：
+`ats.py extend run` 把 gate_text 与 argv 交给普通 Task 链路（权限门、预检、
+审批、supervisor、日志）真跑，本层只负责算出「该跑什么、该是什么等级」。
 
 状态只有两种，非 active 一律不执行（fail-closed）：
 
@@ -363,6 +365,8 @@ def render_help(item):
     if item.get("state") == "active" and item.get("commands"):
         lines.append("")
         lines.append("预演审批（不执行）: ats extend check %s --action <指令名>"
+                     % item["extend_id"])
+        lines.append("真执行（走 Task 链路）: ats extend run %s --action <指令名> --wait"
                      % item["extend_id"])
     if item.get("detail"):
         lines.append("")
