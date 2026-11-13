@@ -72,7 +72,7 @@ $verifyRc = Invoke-Guard -GuardArgs @('verify', '--root', $Root) -Quiet
 if ($verifyRc -eq 0) {
     Write-Host ''
     Write-Host '      [完成] 这个目录已经设置好了，什么都不用做。' -ForegroundColor Green
-    Write-Host '             想直接试试：python scripts\ats.py status'
+    Write-Host '             想直接试试：python scripts\ats.py list'
     Exit-With 0 ''
 }
 Write-Host '      还没有设置好，继续第 3 步。'
@@ -177,7 +177,8 @@ Write-Rule
 Write-Host '  [完成] 设置好了，现在可以用了' -ForegroundColor Green
 Write-Rule
 Write-Host ''
-Write-Host '  试一下：              python scripts\ats.py status'
+Write-Host '  看看现在有什么：      python scripts\ats.py list'
+Write-Host '  建一个任务：          python scripts\ats.py create demo --command "echo hi" --level L1'
 Write-Host '  看有哪些命令：        python scripts\ats.py --help'
 Write-Host '  忘了怎么用：          打开 README.md 或 SKILL.md'
 Write-Host ''
