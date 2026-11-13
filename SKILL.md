@@ -62,6 +62,22 @@ Schedule（周期/一次性）
 
 ## 3. 60 秒上手
 
+### 3.0 首次使用：先建信任根（每个 root 只做一次）
+
+```bash
+# 口令只从标准输入读一行，不进 argv；两步用同一个口令
+echo "your-passphrase" | python scripts/ats_guard.py init --confirm --passphrase-stdin
+echo "your-passphrase" | python scripts/ats_guard.py seal   --confirm --passphrase-stdin
+python scripts/ats_guard.py verify     # {"ok": true, "checked": 9, "problems": []}
+```
+
+**不做这一步，下面 3.1 的命令一条都跑不起来**：全新 root 里没有 `ats_guard_manifest.json`
+也没有密钥，`ats.py` 启动准入直接返回 `guard_check_failed`（`detail.error=manifest_missing`，
+`next_action=init`）。这是有意的 fail-closed，不是环境问题。
+
+后续维护只有两条：改过核心脚本 → 重跑 `seal --confirm`（口令同 init）；只丢了清单 → `seal`
+能修；密钥也丢了 → 见 §5.7 的 `restore_key`，`seal` 修不好。
+
 ### 3.1 单条命令
 
 ```bash

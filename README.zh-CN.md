@@ -72,6 +72,17 @@ Schedule（周期/一次性）
 
 ## 快速上手
 
+全新克隆首次运行：`ats.py` 会拒绝启动，直到信任根建立为止（`guard_check_failed` /
+`manifest_missing`）。每个 `ATS_ROOT` 建一次，口令从标准输入读、不进 argv：
+
+```bash
+echo "your-passphrase" | python scripts/ats_guard.py init --confirm --passphrase-stdin
+echo "your-passphrase" | python scripts/ats_guard.py seal   --confirm --passphrase-stdin
+python scripts/ats_guard.py verify     # {"ok": true, "checked": 9, "problems": []}
+```
+
+然后：
+
 ```bash
 # 创建任务（权限等级默认 L1）
 python scripts/ats.py create build --command "gradle build" --level L1

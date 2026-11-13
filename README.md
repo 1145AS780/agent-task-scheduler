@@ -72,6 +72,18 @@ Every step is a task behind a permission gate, so it reuses the task layer's app
 
 ## Quick start
 
+First run on a fresh clone: `ats.py` refuses to start until the trust root exists
+(`guard_check_failed` / `manifest_missing`). Create it once per `ATS_ROOT` — the
+passphrase is read from stdin and never lands in argv:
+
+```bash
+echo "your-passphrase" | python scripts/ats_guard.py init --confirm --passphrase-stdin
+echo "your-passphrase" | python scripts/ats_guard.py seal   --confirm --passphrase-stdin
+python scripts/ats_guard.py verify     # {"ok": true, "checked": 9, "problems": []}
+```
+
+Then:
+
 ```bash
 # Create a task (permission level defaults to L1)
 python scripts/ats.py create build --command "gradle build" --level L1
