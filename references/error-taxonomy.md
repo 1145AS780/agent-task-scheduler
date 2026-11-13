@@ -1,4 +1,4 @@
-# 错误分类与重试矩阵 — agent-task-scheduler v2.9.1
+# 错误分类与重试矩阵 — agent-task-scheduler v3.1.1
 
 本文把调度器可能产生的一切「不正常」拆成可判别的类别，给出**判别依据**（退出码 / JSON 字段 / 事件 / 文件）、**含义**与**处置动作**，并说明哪些错误可以交给 `retry` 自动消化、哪些必须人工改代码。
 
@@ -95,9 +95,12 @@ if ($out.task.status -ne "succeeded") { Write-Host "任务失败: $($out.task.st
 | `digest_requires_single_url` | `download --sha256/--size` | 合并后条目数 > 1 | 多条目请在清单里逐条写 `sha256`/`size` |
 | `too_many_items` | `download` | 条目数 > 500 | 拆成多批任务 |
 | `name_conflict:<name>` | `download` | 不同 URL 映射到同一目标文件名（并发会互相覆盖） | 用 `save_as` 显式区分文件名 |
-| `manifest_not_found` / `manifest_empty` | `download --file` | 清单不存在 / 去除注释与空行后没有条目 | 检查路径；注释用 `#` |
-| `manifest_invalid` | `download --file` | `.json` 清单不是对象也不是数组，或对象缺 `items` 数组 | 用数组或 `{"outputs": "...", "items": [...]}` |
-| `item_missing_url` | `download --file` | 清单里某条缺 `url` | 补 `url` 字段/列 |
+| `manifest_not_found:<path>` / `manifest_empty:<path>` | `download --file` | 清单不存在 / 去除注释与空行后没有条目 | 检查路径；注释用 `#` |
+| `manifest_invalid:<path>` | `download --file` | `.json` 清单不是对象也不是数组，或对象缺 `items` 数组 | 用数组或 `{"outputs": "...", "items": [...]}` |
+| `item_missing_url:<path>` | `download --file` | 清单里某条缺 `url` | 补 `url` 字段/列 |
+| `manifest_no_match:<pattern>` | `download --file` | 值含 `*` `?` `[` 但 0 个文件匹配 | 检查通配写法和目录；ATS 不会把字面量 `*.txt` 当文件名 |
+| `manifest_too_many:<pattern>` | `download --file` | 单个通配匹配到的清单数 > 64 | 收窄通配；确需更多设 `ATS_DOWNLOAD_MANIFEST_MAX` |
+| `manifest_outputs_conflict:<path>` | `download --file` | 多份清单的 `outputs` 不一致且未写 `--out` | 写 `--out` 显式指定，或把清单 `outputs` 改成一致 |
 | `magnet_invalid` | `torrent --magnet` | 链接不以 `magnet:` 开头 | 补全磁力链 |
 | `torrent_not_found` | `torrent --torrent` | `.torrent` 文件不存在 | 检查路径；相对路径按**当前工作目录**解析 |
 | `aria2_not_found` | `torrent` | 创建时在 `ATS_ARIA2` / `PATH` / 常见安装目录都没找到 aria2c | 安装 aria2 或设 `ATS_ARIA2`（见 [SKILL.md](../SKILL.md) §4.4） |
@@ -106,7 +109,7 @@ if ($out.task.status -ne "succeeded") { Write-Host "任务失败: $($out.task.st
 
 `errors` 是数组，一次可以返回**多条**。每个元素都是稳定的字符串键，含出错的 stage / step 定位。
 
-> [orchestration-spec.md](orchestration-spec.md) §3.2 把校验归并为 12 条**规则**（V1-V12）；下表按**原子错误键**展开为 19 行——一条规则可能对应多种键（例如「Stage id 合法」同时产出 `id_required` 与 `id_duplicate`）。两表互补，不冲突。
+> [orchestration-spec.md](orchestration-spec.md) §3.2 把校验归并为 12 条**规则**（V1-V12）+ 1 条钩子边界补充校验；下表按**原子错误键**展开为 20 行——一条规则可能对应多种键（例如「Stage id 合法」同时产出 `id_required` 与 `id_duplicate`）。两表互补，不冲突。
 
 | 规则 | `errors` 元素形态 | 含义 |
 | --- | --- | --- |
@@ -129,6 +132,7 @@ if ($out.task.status -ne "succeeded") { Write-Host "任务失败: $($out.task.st
 | V17 | `stage[<id>].step[<sid>].depends_on_self` | 自己依赖自己 |
 | V18 | `stage[<id>].step[<sid>].depends_on_unknown:<dep>` | 依赖了**同 Stage 内**不存在的 step |
 | V19 | `stage[<id>].depends_on_cycle` | 同 Stage 内依赖成环 |
+| V20 | `stage[<id>].step[<sid>].hook_not_supported` | Step `command` 里写了 `@enc` 钩子（orchestration-spec 的「补充」校验）：Step 走 `shell=True` 直接执行、没有钩子后置，静默当普通参数会让人误以为转换发生了，所以在提交阶段就整单拒绝 |
 
 > 注意 V18 的关键词是「同 Stage 内」。跨 Stage 写 `depends_on` 一定会命中 `depends_on_unknown`，这是最常见的一条报错。正确做法是把依赖关系改成 Stage 顺序。
 
@@ -171,6 +175,10 @@ if ($out.task.status -ne "succeeded") { Write-Host "任务失败: $($out.task.st
 | `already_approved` | `approve` 一条已批准的记录 | `approval_id` | 直接执行，无需再批 |
 | `already_rejected` | `approve` 一条已拒绝的记录 | `approval_id` | 拒绝不可翻案，重新发起 |
 | `already_expired` | `approve` 一条已过期的记录 | `approval_id` | Plan 层会自动重发；Task 层需重新 `run` 触发新审批 |
+| `denied_injection` | `run` 时静态预检判定命令含注入特征（编码载荷解码后也算，`@enc` 钩子参数也在判定文本内） | `preflight.verdict`、`preflight.tags`、`preflight.confidence`、`override_allowed`、`approval_id` | 改命令；`policy.denied_injection_allow_override` 为真时审批单是 `pending`，可人工放行 |
+| `guard_check_failed` | 启动准入失败：核心脚本摘要不符 / 清单缺失 / 密钥丢失 | `detail.stage`、`detail.next_action`、`detail.hint` | 按 `next_action` 走：`seal`（改过脚本，口令重封签）/ `init`（全新 root）/ `restore_key`（密钥丢失，seal 也修不好，需 git 恢复或人手动删两文件重建） |
+| `passphrase_required` | 需要口令但缺失 / 不匹配 / 密钥文件不在 | `detail.error`：`passphrase_missing` / `passphrase_mismatch` / `key_missing` | 用 `--passphrase-stdin` 从标准输入给一行口令（口令不进 argv） |
+| `guard_skip_approval_required` | `--skip-guard` 没带有效的 L3 审批 | `approval_id`、`required_level` | `approve <id>` 后带 `--guard-approval <id>` 重试；`--skip-guard` 与 `--guard-approval` 缺一不可 |
 
 `approval_required` 时附带的 `approval_error` 取值，是**真正原因**：
 
@@ -181,6 +189,8 @@ if ($out.task.status -ne "succeeded") { Write-Host "任务失败: $($out.task.st
 | `expired` | 记录存在但已过有效期（含 `status=approved` 但 `expires_at` 已过） | 重新发起审批 |
 | `rejected` | 该审批已被拒绝 | 重新发起（同 id 永久失效） |
 | `mismatch` | 审批绑定的 `command` 与当前命令原文不一致 | 为**新的命令文本**重新申请审批 |
+| `artifact_changed` | 审批创建时绑定的脚本文件（`.py` / `.ps1` / `.sh` / `.bat` / `.cmd` / `.js` / `.mjs`）内容在批准后被改过或已删除 | 重新 `run` 触发新审批；批准绑定的是**当时那份内容**，换内容等于换命令 |
+| `denied_injection` | 该审批单本身是「预检判定注入」时留下的 `denied_injection` 记录，未获人工覆盖 | 重新 `run` 走正常审批；或按 `denied_injection_allow_override` 策略人工放行 |
 | `insufficient_level` | 身份不足以批准（只在 `approve` 阶段出现） | 提升批准者等级 |
 
 `approve` 的退出码细则：单条 `approve <id>` 失败时，`insufficient_level` → **4**，`missing` / `expired` / `already_approved` / `already_rejected` / `already_expired` → **3**；`approve --all` 一律 **0**（批量语义，逐项成败看 `approvals[].ok`）。所以判断批准是否生效，优先看 `ok`，其次才是退出码。
@@ -225,6 +235,9 @@ if ($out.task.status -ne "succeeded") { Write-Host "任务失败: $($out.task.st
 | `encoder_not_found` | `ATS_ENCODER_PATH`、`<cwd>/tools/`、`<当前目录>/tools/` 都没找到 `encoding_converter.py` | 设 `ATS_ENCODER_PATH` 或把转换器放到任务 `cwd` 的 `tools/` 下 |
 | `hook_timeout` | 钩子执行超过任务的 `timeout` 被强杀 | 放宽 `--timeout` 或缩小转换范围 |
 | `hook_spawn_failed` | 启动转换器进程抛 `OSError` | 检查 Python 解释器与转换器路径 |
+| `hook_glob_no_match` | 钩子里的通配路径在任务 `cwd` 下匹配 0 个文件（**不会**把字面量当文件名交给转换器） | 检查模式与 `cwd`，或去掉通配写明确路径 |
+| `hook_glob_too_many` | 通配匹配数超过上限（默认 256） | 缩小模式；确实要多跑就调 `ATS_HOOK_GLOB_MAX` |
+| `hook_glob_ambiguous` | 出现多个通配路径，或通配与手写路径混写 | 只保留一个通配位置参数，其余拆成多条任务 |
 
 `supervisor_lost` 的成因：机器重启、进程被外部杀、`taskkill` 打到父进程但没打到子进程。它**不代表命令失败**，只是「没人记账了」。处置：`run --force` 重跑。
 
@@ -382,11 +395,16 @@ for ($i = 1; $i -le $max; $i++) {
 └─ 退出码 4
     └─ 读 error 与 approval_error
         ├─ denied_policy      → 改 max_level 或降 level（审批无用）
+        ├─ denied_injection   → 看 preflight.tags 定位危险特征；override_allowed 为真才可人工放行
+        ├─ guard_check_failed → 看 detail.next_action：seal / init / restore_key（见 3.4 与 SKILL.md §5.7）
+        ├─ passphrase_required→ 用 --passphrase-stdin 给口令；key_missing 则须 git 恢复密钥
+        ├─ guard_skip_approval_required → approve 后带 --guard-approval 重试
         └─ approval_required  → 按 approval_error 分支
             ├─ missing  → 拿 id → approve → 带 --approval 重跑
             ├─ pending  → approve
             ├─ expired  → 重新触发，拿新 id
             ├─ rejected → 重新触发
+            ├─ artifact_changed → 脚本内容变了，按新内容重新申请
             └─ mismatch → 命令变了，按新文本重新申请
 ```
 
@@ -445,6 +463,9 @@ status / counts 是什么？
 | `run` 返回 `approval_required`，但没人批准 | 正常拦截 | `approve <id>` 或 `approve --all` |
 | 批准了还是被拦，`approval_error=mismatch` | 命令文本改过（哪怕多一个空格） | 重新申请；审批绑定原文 |
 | 批准了还是被拦，`approval_error=expired` | 超过 `approval_ttl_seconds` | 重新触发；或调大 TTL |
+| 批准了还是被拦，`approval_error=artifact_changed` | 命令里引用的脚本在批准后被改过/删了 | 重新申请；审批绑定的是当时那份脚本内容 |
+| 所有子命令都返回 `guard_check_failed` | 核心脚本被改过、清单缺失、或密钥丢失 | 按 `detail.next_action`：`seal` / `init` / `restore_key` |
+| `approve` 返回 `passphrase_required` 且 `detail.error=key_missing` | 密钥文件丢了（seal 也修不好） | 从 git 恢复两个 guard 文件；或人手动删两者后重跑 init+seal |
 | Plan 一直 `paused` 且 `approval_id` 不变 | 审批仍是 `pending`（`pending` 不会重发） | `approve <approval_id>` 后再 `resume --approval <id>` |
 | Plan `failed` 但所有 step `succeeded` | 曾被 `no_ready_steps` 判死锁（spec 被改过） | 删 plan 重新提交 |
 | 下游全 `skipped(dependency)`，上游 `succeeded` | 上游有多个依赖，其中一个失败了 | 查 `blocked_by` 指向的那个 |

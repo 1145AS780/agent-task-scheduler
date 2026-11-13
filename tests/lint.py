@@ -8,13 +8,16 @@
   4. 文件以换行结尾
 
 退出码 0 表示全部通过。
+
+第 1 项用内建 compile() 而不是 py_compile：py_compile 必须把 .pyc 落到磁盘，
+而 ats_preflight.py 同时含 base64 解码调用与 eval/exec 字面量（用于识别编码载荷），
+落盘的 pyc 会被杀软启发式误判成 Trojan/Python.ShellLoader。compile() 只在内存里
+生成 code object，语法校验语义等价，且不产生任何 pyc。
 """
 from __future__ import annotations
 
-import py_compile
 import re
 import sys
-import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -33,13 +36,13 @@ def py_files():
 
 
 def check_compiles(files):
-    with tempfile.TemporaryDirectory(prefix="ats-lint-") as tmp:
-        for f in files:
-            cfile = Path(tmp) / (f.stem + ".pyc")
-            try:
-                py_compile.compile(str(f), cfile=str(cfile), doraise=True)
-            except py_compile.PyCompileError as exc:
-                problems.append("%s: 编译失败: %s" % (f.relative_to(REPO), exc.msg))
+    for f in files:
+        try:
+            compile(f.read_bytes(), str(f), "exec")
+        except SyntaxError as exc:
+            problems.append("%s: 编译失败: %s" % (f.relative_to(REPO), exc))
+        except ValueError as exc:
+            problems.append("%s: 源码无法编译: %s" % (f.relative_to(REPO), exc))
 
 
 def check_tabs(f):

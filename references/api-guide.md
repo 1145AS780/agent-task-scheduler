@@ -1,4 +1,4 @@
-# API 指南 — agent-task-scheduler
+# API 指南 — agent-task-scheduler v3.1.1
 
 本文分两半：**前半是对外协议**（外部人类 / Agent 怎么调、怎么读 JSON、怎么处理退出码与审批），
 **后半是内部扩展点**（新增策略键、审批模式、子命令、UI 动作时要同步改哪些地方）。
@@ -80,7 +80,7 @@ HTTP 控制台（`scripts/ats_ui.py`）统一为 `{"ok": bool, ...}`，失败带
 | `status <id>` | 精简状态 | `task` | 最常用 |
 | `stop <id>` | 停止任务 | `task` | 走 `gate_operation`，等级 L1 |
 | `delete <id>` | 删除任务 | — | 走 `gate_operation`，等级 L2 |
-| `approve <id>...` / `--all` | 批准或拒绝 | `approvals[]`, 每项含 `ok` | `--reject`、`--note` |
+| `approve <id>...` / `--all` | 批准或拒绝（要口令） | `approvals[]`, 每项含 `ok` | `--reject`、`--note`、`--passphrase-stdin` |
 | `approval prune` | 清理已决议审批 | 计数 | `--dry-run`、`--older-than SEC` |
 | `events` | 消费事件流 | 事件数组 | `--lines`、`--json` |
 | `logs` | 调度器日志 | 文本 / JSON | `--plain`、`--json` |
@@ -168,6 +168,9 @@ python scripts/ats.py run deploy1 --approval $apId --wait
 `approve` 时校验 `rank(actor_level) >= rank(required_level)`，不足返回
 `ok=false` + `insufficient_level` + 退出码 `4`。此时不要重试同一条命令，先提升
 `ATS_ACTOR_LEVEL`。
+
+口令关在身份关之前：没有正确口令直接返回 `passphrase_required`（退出码 `4`），
+不会进入身份比较。口令只从 `--passphrase-stdin` 或终端交互读，不读 argv。
 
 ---
 
@@ -261,6 +264,11 @@ python scripts/ats.py run deploy1 --approval $apId --wait
 `plan.rerun` / `plan.delete` / `schedule.tick`
 
 未知 action 返回 `{"ok": false, "error": "bad_action"}`，HTTP 400。
+
+`approval.resolve` 与 `policy.set` 额外要求请求体带 `passphrase`：缺失时控制台直接返回
+`{"ok": false, "exit_code": 4, "result": {"error": "passphrase_required"}}`，不启动子进程；
+带值时控制台只把它写进子进程 stdin 并附 `--passphrase-stdin`，**绝不拼进 argv**，
+请求体也不写日志、不落盘。口令错误由 `ats.py` 判为 `passphrase_mismatch`，控制台原样回传。
 
 ---
 

@@ -29,6 +29,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
+sys.dont_write_bytecode = True
+
 try:
     import ats_mcp
 except Exception:  # 同目录缺 ats_mcp.py 时端点仍可创建，只是 available=false

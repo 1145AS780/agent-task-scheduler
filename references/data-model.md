@@ -1,4 +1,4 @@
-# 数据模型 — agent-task-scheduler v2.9.1
+# 数据模型 — agent-task-scheduler v3.1.1
 
 本文列出所有落盘 JSON 结构的字段、类型与语义。字段以实际脚本为准。
 
@@ -52,12 +52,12 @@ scheduler.log（全局）
 | --- | --- | --- |
 | `id` | string | 任务 ID，`t-xxxxxx` / `dl-xxxxxx` / `tor-xxxxxx` 或用户指定 |
 | `kind` | string \| 缺省 | 任务种类；缺省（普通命令）时无此字段，下载任务为 `"download"`，种子任务为 `"torrent"`，指令包条目为 `"pack"` |
-| `command` | string | 命令原文（审批与重跑都以它为准）；下载任务是 `download N item(s) -> <out>`，种子任务是 `torrent <btih 前 16 位或文件名> -> <out>`，指令包条目是切分后 `strip()` 的单条命令；带 `@enc` 钩子时这里只存**主命令** |
+| `command` | string | 命令原文（审批与重跑都以它为准）；下载任务是 `download N item(s) -> <out>`，种子任务是 `torrent <btih 前 16 位或文件名> -> <out>`，指令包条目是切分后 `strip()` 的单条命令；带 `@enc` 钩子时这里只存**主命令**，而审批 / 预检 / 等级判定绑定的是「主命令 + `@enc` 参数」的拼合文本 |
 | `argv` | string[] \| null | 原生 argv（不经 shell）；下载任务直启 `ats_download.py`，种子任务直启 `ats_torrent.py` |
 | `download` | object \| null | 下载元数据：`spec` / `outputs` / `items` / `concurrency` / `rate_limit` / `retry` |
 | `torrent` | object \| null | 种子元数据：`spec` / `source`（`"magnet"` 或 `"torrent"`）/ `outputs` / `seed_time` / `max_download` / `max_upload` / `aria2` |
 | `pack` | object \| null | 指令包元数据：`pack_id` / `index`（1 起）/ `total`；仅 `kind="pack"` 出现 |
-| `post_hook` | object \| null | 命令成功后钩子；仅命令文本带 `@enc` 时出现。登记时：`type`（目前仅 `"enc"`）/ `args`（原样传给转换器的参数串）；执行后追加 `status`（`ok`/`failed`）/ `exit_code` / `log` / `error_type`（`encoder_not_found`/`hook_timeout`/`hook_spawn_failed`）/ `started_at` / `ended_at` |
+| `post_hook` | object \| null | 命令成功后钩子；仅命令文本带 `@enc` 时出现。登记时：`type`（目前仅 `"enc"`）/ `args`（原始参数串，执行时按空白分词、引号包裹段保持完整，再以 argv 列表交给转换器，不经 shell）；执行后追加 `status`（`ok`/`failed`）/ `exit_code` / `log` / `error_type`（`encoder_not_found`/`hook_timeout`/`hook_spawn_failed`/`hook_glob_no_match`/`hook_glob_too_many`/`hook_glob_ambiguous`）/ `started_at` / `ended_at`；参数含通配路径时另有 `glob`（通配原文）/ `expanded`（展开个数）/ `skipped_symlinks`（跳过的符号链接数）/ `runs`（展开多个时逐条的 `path` + `exit_code`）/ `failed_on`（第一个失败的路径） |
 | `cwd` | string \| null | 工作目录 |
 | `level` | string | L0-L3 |
 | `timeout` | int | 秒；0 = 不限 |
@@ -105,6 +105,7 @@ scheduler.log（全局）
 | `outputs` | string | 当前目录 | 输出目录（绝对路径） |
 | `items` | object[] | — | 每条：`url` / `save_as` / `sha256` / `size` / `headers` |
 | `deduped` | int | 0 | 被合并掉的重复条目数 |
+| `manifests` | string[] | 缺省不写 | 实际读入的清单路径（`--file` 通配展开后的结果，按字典序）；无 `--file` 时该键不出现 |
 | `concurrency` | int | 2 | 线程池大小 |
 | `rate_limit` | int | 0 | 全局字节/秒，0 不限 |
 | `retry` | int | 2 | 每项重试次数（总尝试 = retry + 1） |

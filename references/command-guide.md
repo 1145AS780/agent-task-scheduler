@@ -1,4 +1,4 @@
-# 命令书写与调用规范 — agent-task-scheduler v2.9.1
+# 命令书写与调用规范 — agent-task-scheduler v3.1.1
 
 本文面向「由 Agent 调用调度器脚本」这一使用场景，规定**怎么把命令传进去、怎么把结果读出来、怎么避免被 shell 吃掉引号**。几乎所有「调度器行为诡异」的事故都源于本文某一条被违反。
 
@@ -197,7 +197,7 @@ python scripts/ats.py create l1 --command 'pytest -q > reports\out.txt 2>&1'
 
 ### 3.7 `@enc` 钩子与引号
 
-`@enc` 是命令文本的一部分，`create` / `pack` 落盘时会被拆走，所以引号规则与普通命令完全一样：钩子里的路径含空格时仍按 §3.1-§3.3 处理；含双引号、`$`、`%`、`&` 时改用 spec。
+`@enc` 是命令文本的一部分，`create` / `pack` 落盘时会被拆走；执行钩子时**不经 shell**：参数串按空白分词（单/双引号包裹的段保持完整）后作为 argv 列表交给转换器。所以 `;` `|` `>` `&` `$` `%` 在钩子参数里都只是普通字符，不会被当成第二条命令；含空格或特殊字符的路径用引号包裹即可。
 
 ```powershell
 # 外层单引号，主命令与钩子整条传入
@@ -209,8 +209,32 @@ python scripts/ats.py create --spec enc.json
 
 - `@enc` 必须**独立成 token**（前后为空白、行首或行尾）：`--from gbk @enc --to utf-8` 这种放中间的写法不会被拆分，而是原样进主命令
 - 转换器的 `path` 是**位置参数**，不要写 `--path`
-- 审批绑定的是**主命令**（钩子已剥离）；钩子随任务等级执行，不额外触发审批
-- 钩子参数串由 supervisor 以 `shell=True` 交给转换器，不要再套一层引号
+- 等级推导、预检与审批绑定用的是**「主命令 + `@enc` 参数」的完整原文**：钩子参数里的危险特征会抬高本次任务等级，`echo hi @enc x; del f` 登记 L3 而不是 L0
+- 钩子参数不需要也不应该再套一层 shell 引号转义——引号只用来分隔含空格的参数，引号本身不进 argv
+- `@enc` **只在 Task 层生效**（`create` / `pack`）。Plan 的 Step 由 `ats_plan.py` 用 `shell=True` 直接执行、没有钩子后置，所以 `submit_plan` / `submit_schedule` 会在校验阶段报 `stage[..].step[..].hook_not_supported` 并整单拒绝；要转码请拆成独立 Task，或在 Step 命令里显式调 `tools/encoding_converter.py`
+
+### 3.8 `@enc` 的通配路径（一条钩子覆盖多个文件）
+
+钩子不经 shell，所以 `*` **不会**被系统自动展开——由 `ats.py` 在钩子执行时自己展开（`glob`，相对任务的 `cwd`，`**` 需显式写）。展开出的每个路径各调一次转换器（转换器契约是单个位置路径），**遇非 0 退出码即停**。
+
+```powershell
+# 把 logs 下所有 .log 从 gbk 转成 utf-8：一条任务即可
+python scripts/ats.py create enc-all --level L1 --cwd D:\proj --command 'build.bat @enc --from gbk --to utf-8 logs\*.log'
+```
+
+| 约束 | 行为 |
+| --- | --- |
+| 可展开的 token | 只限**位置参数**且含 `*` `?` `[`；`--from gbk` 这类 flag 及其值一律不动（`--include *.log` 会原样传给转换器）。以 `-` 开头的 token 永远不会被当成「值」，所以 `--dry-run --from gbk ... logs\*.log` 这种「无值开关 + 真 flag」的写法不会把 `--from` 记成值、把 `gbk` 记成位置参数而误报 `hook_glob_ambiguous` |
+| 只能一个通配 | 出现两个通配、或通配与手写路径混写 → `hook_glob_ambiguous`，不猜 |
+| 0 匹配 | `hook_glob_no_match`，任务 `failed`；**绝不**把字面量 `*.log` 当文件名交给转换器 |
+| 上限 | 默认 256 个，超出 `hook_glob_too_many`；`ATS_HOOK_GLOB_MAX` 可调 |
+| 符号链接 | 跳过并计数（`skipped_symlinks`），避免顺着链接改到 `cwd` 之外 |
+| 顺序 | 结果排序后逐条执行，同一任务重复跑顺序一致 |
+| 可审计 | `hook-enc.log` 头部写 `glob <模式> -> N path(s)` 与完整路径清单；多条时每段前有 `--- run i/N: <path>` |
+| 逐条超时 | `timeout` 是**每次调用**的超时，N 个文件的总耗时上限约为 N×`timeout` |
+| 部分失败 | 停在第一个失败的文件，`post_hook.failed_on` 记下是哪个，`runs` 列出已跑各条的退出码 |
+
+先预览再落盘：转换器自带 `--dry-run`，把它写进钩子参数即可（`@enc --from gbk --to utf-8 logs\*.log --dry-run`），确认展开清单与改动范围后再去掉。
 
 ---
 
@@ -331,6 +355,7 @@ python scripts/ats.py run deploy1 --approval $apId --wait
 
 要点：
 
+- **`approve` 要口令**。非交互通道必须加 `--passphrase-stdin`（口令走标准输入一行，不进 argv），否则返回 `passphrase_required`。`--reject` 同样要口令。看门狗与口令闸门见 `SKILL.md` 5.7。
 - **不要自己编造 approval_id**。格式是 `ap-<8位hex>`，但不存在于 `approvals/` 的 id 会返回 `approval_error=missing`。
 - **不要复用别人的 approval_id**。审批绑定 `command`，命令不同就 `mismatch`。
 - **`approve --all` 只在明确「所有挂起审批都可以批」时用**。它会把所有 `pending` 一次性批掉，无法回滚。
@@ -552,10 +577,17 @@ python scripts/ats.py logs --lines 100 --json | ConvertFrom-Json
 ```powershell
 # 清单可以是 .json / .txt（URL<TAB>文件名）/ .csv（url,文件名）
 python scripts/ats.py download --file urls.txt --out D:\dl --concurrency 4 --rate 524288
+
+# 多份清单合并 / 通配（值含 * ? [ 才展开，由 ats.py 用 glob 展开，不经 shell）
+python scripts/ats.py download --file "manifests\*.txt" --out D:\dl
+python scripts/ats.py download --file a.json --file b.csv --out D:\dl
 python scripts/ats.py check dl-1a2b3c          # 按 next_poll 轮询
 Get-Content "$root\tasks\dl-1a2b3c\stdout.log" -Encoding UTF8 | Select-Object -Last 1
 ```
 
+- 通配**只在 `--file` 的值上生效**，字面路径照旧；0 匹配报 `manifest_no_match:<pattern>`（不会把 `*.txt` 当文件名），超 64 份报 `manifest_too_many:<pattern>`
+- 多份清单 `outputs` 不一致且没写 `--out` → `manifest_outputs_conflict:<path>`；写了 `--out` 以它为准
+- 先跑一遍 `--file` 通配看 `items` 数量对不对，别直接上 `**\*.txt` 这种宽范围（同一目录下的 README 也可能被当成清单）
 - **不要再用 `Invoke-WebRequest` 包一层**：Worker 已封装 Range 续传、重试、校验，外包一层反而会丢掉 `.part`
 - 断了就直接再跑一次同样的命令：已完成的文件按 `sha256`/`size` 校验后跳过（`status: existing`），未完成的从 `.part` 续传
 - 想看每项结果就解析 `stdout.log` 的最后一行 `summary`（`total` / `succeeded` / `failed` / `items`）

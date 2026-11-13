@@ -1,4 +1,4 @@
-# 常见错误用法 — agent-task-scheduler v2.9.1
+# 常见错误用法 — agent-task-scheduler v3.1.1
 
 本文收集「看起来能用、实际一定会出问题」的用法。每一条都给**症状**（你在哪里看到它）、**为什么错**、**正确做法**。按主题分组，可以直接按你遇到的现象检索。
 
@@ -312,6 +312,40 @@ Get-ChildItem .ats\approvals\*.json | ForEach-Object {
 **为什么错**：`@enc` 只有独立成 token 且在**命令末尾**时才会被拆出；放在中间会被当成主命令的一部分，原样传给 shell（多数命令会报未知参数）。
 
 **正确做法**：写成 `<主命令> @enc <转换器参数>`，钩子只放最后。
+
+### 3.11 把 `@enc` 写进 Plan 的 Step
+
+**症状**：Step `command` 写成 `"build.bat @enc --from gbk --to utf-8 logs"`；提交被拒并返回 `stage[..].step[..].hook_not_supported`（早期版本则更糟：Step 静默 `succeeded`，`@enc ...` 只是作为额外参数传给了命令，转换根本没发生）。
+
+**为什么错**：`@enc` 是 Task 层（`create` / `pack`）的后置钩子，由 supervisor 在主命令退出码为 0 之后执行；Plan 的 Step 是 `ats_plan.py` 用 `shell=True` 直接 spawn，没有拆分、也没有钩子后置。所以 Step 里写钩子语法只会有两种结局：命令报未知参数，或命令忽略多余参数而让人误以为转换发生了。
+
+**正确做法**：两种都行——
+- 转码拆成独立 Task：`python scripts/ats.py create enc1 --command 'build.bat @enc --from gbk --to utf-8 logs'`，再用 `depends_on` 无关的 Plan 顺序调度（Plan 只负责调度，Task 负责钩子）
+- 或在 Step 命令里显式调转换器：`python tools/encoding_converter.py --from gbk --to utf-8 logs`
+
+### 3.12 在 `@enc` 里把通配和手写路径混着写
+
+**症状**：`@enc --from gbk --to utf-8 logs/*.log extra.log` 钩子报 `hook_glob_ambiguous`，任务 `failed`。
+
+**为什么错**：展开后到底是「把 extra.log 加到每个通配结果里」还是「先展开再整体传一次」，没有唯一解释；ATS 不猜，直接拒绝。同理写两个通配（`logs/*.log backups/*.log`）也会被拒。
+
+**正确做法**：一个钩子只放**一个**通配位置参数；要同时处理两批文件，拆成两个任务（或用 Plan 串起来）。另外记住 0 匹配报 `hook_glob_no_match` 而不是静默放过——通配写错时任务会红，这是有意的。
+
+### 3.13 拿通配当「删除/覆盖范围」用而不先预览
+
+**症状**：`@enc --from gbk --to utf-8 **/*.txt` 一跑，把整棵树里的文件就地转码，事后才发现有不该动的。
+
+**为什么错**：通配展开的边界由模式决定，写宽了就一次改很多文件；`**` 还会递归。展开清单只在 `hook-enc.log` 里，跑完才看等于事后追悔。
+
+**正确做法**：先带转换器的 `--dry-run` 跑一次，确认 `hook-enc.log` 头部的 `glob <模式> -> N path(s)` 清单与预期一致，再去掉 `--dry-run` 正式执行；范围大时把模式收窄到具体子目录。
+
+### 3.14 拿通配把整目录当清单喂给 `download`
+
+**症状**：`download --file "D:\notes\*.txt"` 把同目录里不是清单的 txt（笔记、README、导出日志）也读进来，结果 `bad_url` 或下一堆莫名其妙的东西。
+
+**为什么错**：`--file` 的通配是**按扩展名匹配文件名**，不是「只匹配清单格式」。`.txt` 清单的解析规则是「每行 URL[制表符 文件名]」，所以任何以 `http` 开头的行都会被当成下载项；读进来的每一份都算输入，ATS 不会替你判断哪份「看起来像清单」。
+
+**正确做法**：把清单放独立目录（如 `manifests\`）再通配；先看返回里的 `download.items` 与 `manifests` 数量对不对，再让它真下。别用 `**\*.txt` 这类递归宽模式——匹配到 0 个会报 `manifest_no_match`，匹配到一堆却可能悄悄混进无关文件。
 
 ---
 

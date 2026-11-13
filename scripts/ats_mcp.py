@@ -76,6 +76,7 @@ def _child_env():
     # 子进程统一 UTF-8 输出，避免中文 Windows 的 GBK/OEM 编码问题
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
 
 
@@ -410,7 +411,10 @@ TOOLS = [
                         "long-running and must not hold the conversation turn, or when a "
                         "high-risk command needs an L0-L3 approval gate. Returns task id and state."),
         "inputSchema": _schema({
-            "command": {"type": "string", "description": "Shell command to run later."},
+            "command": {"type": "string",
+                        "description": ("Shell command to run later. Append ` @enc <converter args>` "
+                                        "to register an encoding conversion as a post-hook that "
+                                        "runs only if the main command exits 0.")},
             "task_id": {"type": "string", "description": "Optional stable id; auto-generated if omitted."},
             "cwd": {"type": "string", "description": "Working directory for the command."},
             "level": {"type": "string", "enum": ["L0", "L1", "L2", "L3"],
@@ -480,7 +484,9 @@ TOOLS = [
         "name": "approval_resolve",
         "description": ("Approve or reject pending approvals. approval_ids come from task_run "
                         "(approval_required) or task_status (approval_id). Set all=true to resolve "
-                        "every pending approval, and reject=true to deny."),
+                        "every pending approval, and reject=true to deny. Requires the human "
+                        "passphrase, so this call returns passphrase_required by design: resolve "
+                        "approvals in the console or CLI where a human can type the passphrase."),
         "inputSchema": _schema({
             "approval_ids": {"type": "array", "items": {"type": "string"}},
             "all": {"type": "boolean", "default": False},

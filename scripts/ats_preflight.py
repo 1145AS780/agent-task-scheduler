@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import os
 import re
 import shlex
@@ -222,7 +223,7 @@ class _PyScan(ast.NodeVisitor):
 # ---------------------------------------------------------------- 静态层：shell 词法
 
 SHELL_DELETE_RE = re.compile(
-    r"(?i)(?:^|[\s;&|])(?:rm|rmdir|del|erase|rd\s+/s|remove-item)\s")
+    r"(?i)(?:^|[\s;&|\"'(])(?:rm|rmdir|del|erase|rd\s+/s|remove-item)\s")
 SHELL_WRITE_RE = re.compile(
     r"(?i)\b(set-content|out-file|copy-item|move-item|robocopy|xcopy|tee-object)\b")
 SHELL_NET_RE = re.compile(
@@ -230,7 +231,10 @@ SHELL_NET_RE = re.compile(
     r"start-bitstransfer|nc|ncat|telnet|ssh|scp|ftp|aria2c)\s")
 SHELL_PRIV_RE = re.compile(
     r"(?i)\b(runas|sudo|setcap|start-process\s+-verb\s+runas|reg\s+add|"
-    r"reg\s+delete|sc\s+create|schtasks|net\s+user|takeown|icacls|diskpart|format\s+[a-z]:)\b")
+    r"reg\s+delete|sc\s+create|sc\s+delete|schtasks|takeown|icacls|"
+    r"diskpart|format\s+[a-z]:|bcdedit|vssadmin\s+delete|wbadmin\s+delete|"
+    r"wevtutil\s+cl|bitsadmin[^\n]*(?:/add|/transfer|/create|/set)|"
+    r"net\s+(user|localgroup)[^\n]*(?:/add|/delete))\b")
 SHELL_REDIRECT_RE = re.compile(r"(?:^|[^<&>])(>>?)\s*(\"[^\"]+\"|'[^']+'|[^\s|;&]+)")
 
 
@@ -254,6 +258,104 @@ def _scan_shell_text(text, tags, evidence, source="shell", filename=None, lineno
         evidence.append({"tag": TAG_FS_WRITE_OUTSIDE, "source": source, "file": filename,
                          "line": lineno, "detail": "redirect > %s" % target,
                          "outside": outside})
+
+
+# ---------------------------------------------------------------- 静态层：编码载荷解码
+
+PS_ENCODED_RE = re.compile(
+    r"(?i)\b(?:powershell|pwsh)(?:\.exe)?\b[^\n]*?(?:-|/)"
+    r"(?:encodedcommand|enc|ec|e)\s+(\"[^\"]+\"|'[^']+'|[A-Za-z0-9+/=]{16,})")
+CERTUTIL_DECODE_RE = re.compile(r"(?i)\bcertutil(?:\.exe)?\b[^\n]*?-decode\b")
+FROM_B64_RE = re.compile(
+    r"(?i)frombase64string\s*\(\s*(\"[^\"]+\"|'[^']+'|[^)\s]+)\s*\)")
+B64_CLI_RE = re.compile(r"(?i)\b(?:base64|openssl\s+base64)\b[^\n]*?(?:-d|--decode)\b")
+PY_B64DECODE_RE = re.compile(
+    r"(?i)\b(?:b64decode|decodebytes)\s*\(\s*(\"[^\"]+\"|'[^']+'|[^)\s]+)")
+
+
+def _printable_ratio(text):
+    if not text:
+        return 0.0
+    ok = sum(1 for ch in text if ch.isprintable() or ch in "\r\n\t")
+    return ok / float(len(text))
+
+
+def _b64_variants(token):
+    """把候选 base64 串解码成可读文本；解不出或全是乱码时返回空列表。
+
+    只做解码，不执行、不落盘。UTF-16LE 优先，覆盖 PowerShell 的
+    -EncodedCommand 编码方式；再试 UTF-8 覆盖常见脚本载荷。
+    """
+    token = str(token or "").strip().strip("\"'")
+    if len(token) < 8:
+        return []
+    pad = token + "=" * (-len(token) % 4)
+    try:
+        raw = base64.b64decode(pad, validate=False)
+    except Exception:                    # noqa: BLE001
+        return []
+    out = []
+    for encoding in ("utf-16-le", "utf-8"):
+        try:
+            text = raw.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+        if _printable_ratio(text) >= 0.8:
+            out.append(text)
+    return out
+
+
+def _add_encoded(tags, evidence, detail, decoded, source):
+    tags.add(TAG_OBFUSCATED_EVAL)
+    evidence.append({"tag": TAG_OBFUSCATED_EVAL, "source": source,
+                     "file": None, "line": None,
+                     "detail": "%s -> %s" % (detail, decoded[:120].replace("\n", " ")),
+                     "outside": False})
+
+
+def _decode_layers(text, tags, evidence, depth=0):
+    """识别编码入口、解出明文后递归扫描；解不出的仍交人工。
+
+    覆盖 PowerShell -EncodedCommand/-e、.NET FromBase64String、Python
+    b64decode、certutil -decode、base64 -d 五类入口。前三类能静态解出
+    明文并继续按 shell 词法扫描；后两类只有「发生了解码」这一条证据，
+    也足以把置信度抬到 high，让命令转人工审批。
+    """
+    if not text or depth > 2:
+        return
+    for match in PS_ENCODED_RE.finditer(text):
+        for decoded in _b64_variants(match.group(1)):
+            _add_encoded(tags, evidence, "powershell -EncodedCommand", decoded, "decode-ps")
+            _scan_shell_text(decoded, tags, evidence, source="decoded-ps")
+            _decode_layers(decoded, tags, evidence, depth + 1)
+    for pattern, detail, source in (
+            (FROM_B64_RE, "FromBase64String", "decode-dotnet"),
+            (PY_B64DECODE_RE, "python b64decode", "decode-py")):
+        for match in pattern.finditer(text):
+            for decoded in _b64_variants(match.group(1)):
+                _add_encoded(tags, evidence, detail, decoded, source)
+                _scan_shell_text(decoded, tags, evidence, source=source)
+                _decode_layers(decoded, tags, evidence, depth + 1)
+    for _match in CERTUTIL_DECODE_RE.finditer(text):
+        _add_encoded(tags, evidence, "certutil -decode", "<file>", "decode-certutil")
+    for _match in B64_CLI_RE.finditer(text):
+        _add_encoded(tags, evidence, "base64 -d", "<pipe>", "decode-cli")
+
+
+def decoded_texts(command, limit=8):
+    """静态解出命令里的编码载荷明文，供等级推导复用（只解码，不执行、不落盘）。"""
+    text = str(command or "")
+    candidates = []
+    for pattern in (PS_ENCODED_RE, FROM_B64_RE, PY_B64DECODE_RE):
+        candidates.extend(m.group(1) for m in pattern.finditer(text))
+    out = []
+    for token in candidates:
+        for decoded in _b64_variants(token):
+            if decoded not in out:
+                out.append(decoded)
+            if len(out) >= limit:
+                return out
+    return out
 
 
 # ---------------------------------------------------------------- 静态层：入口
@@ -332,6 +434,7 @@ def static_review(command, context=None):
         parsed.append({"file": name, "ok": True})
 
     _scan_shell_text(str(command or ""), tags, evidence, source="shell-lex")
+    _decode_layers(str(command or ""), tags, evidence)
 
     confidence = _confidence(tags, evidence)
     return {

@@ -1,4 +1,4 @@
-# 编排规格 — agent-task-scheduler v2.9.1
+# 编排规格 — agent-task-scheduler v3.1.1
 
 本文是 Plan / Schedule 层的权威规格。实现以 `scripts/ats_plan.py` 为准；若文档与实现不一致，以脚本行为为准并修正文档。
 
@@ -97,8 +97,15 @@
 | V10 | 不得自依赖 | `depends_on_self` |
 | V11 | 依赖必须存在于同 Stage | `depends_on_unknown:<id>` |
 | V12 | 同 Stage 内无环（Kahn 排序长度检查） | `depends_on_cycle` |
+| 补充 | Step `command` 不含 `@enc` 钩子 | `hook_not_supported` |
 
 一次可返回多条错误，`errors` 为字符串数组。
+
+**`hook_not_supported` 的原因**：`@enc` 是 Task 层（`create` / `pack`）的后置钩子；Plan 的 Step 由
+`ats_plan.py` 用 `shell=True` 直接执行，没有拆分与钩子后置。若放行，`@enc ...` 只会被
+当普通参数传给命令 —— 命令多数会报未知参数，少数会静默成功，但**转换根本没发生**。
+所以提交阶段就拒绝整单，转码请拆成独立 Task（`create` 带 `@enc`）或在 Step 里显式调
+`tools/encoding_converter.py`。
 
 ### 3.3 物化
 

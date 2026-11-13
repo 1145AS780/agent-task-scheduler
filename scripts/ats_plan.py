@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""agent-task-scheduler — Plan / Schedule 层执行器 (v2.7)
+"""agent-task-scheduler — Plan / Schedule 层执行器 (v3.1.1)
 
 命令：
   submit_plan --spec plan.json [--id ID]
@@ -55,6 +55,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ats  # noqa: E402
 
@@ -253,6 +254,11 @@ def validate_spec(spec):
             ids.add(step_id)
             if not step.get("command"):
                 errors.append("stage[%s].step[%s].command_required" % (stage_id, step_id))
+            elif ats.HOOK_PATTERN.search(str(step.get("command"))):
+                # Step 走 shell=True 直接执行，没有 Task 层那套 @enc 拆分与钩子后置。
+                # 静默把 @enc 当普通参数传给命令，会让人以为转换发生了、其实没有。
+                errors.append("stage[%s].step[%s].hook_not_supported"
+                              % (stage_id, step_id))
             level = str(step.get("level") or ats.DEFAULT_TASK_LEVEL).upper()
             if level not in ats.LEVEL_RANK:
                 errors.append("stage[%s].step[%s].level_invalid" % (stage_id, step_id))
@@ -722,7 +728,7 @@ def ensure_step_permission(root, plan, sdir, stage, step, approval):
         return "denied", gate
 
     # approval_required：缺失/过期时创建审批；pending 不重发（避免刷屏）
-    check = ats.approval_check(root, state.get("approval_id"), command)
+    check = ats.approval_check(root, state.get("approval_id"), command, context)
     if check["error"] in ("missing", "expired"):
         old = check.get("record")
         replaced = bool(old)
@@ -1912,7 +1918,7 @@ def cmd_prune(root, args):
 def build_parser():
     ap = argparse.ArgumentParser(
         prog="ats_plan.py",
-        description="agent-task-scheduler — Plan / Schedule 层执行器 (v2.7)",
+        description="agent-task-scheduler — Plan / Schedule 层执行器 (v3.1.1)",
     )
     ap.add_argument("--root", default=None, help="ATS_ROOT，默认 <cwd>/.ats")
     sub = ap.add_subparsers(dest="command_name")
@@ -2006,6 +2012,15 @@ HANDLERS = {
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # 与 ats.py 同一套启动准入：ats_plan 也会真正执行命令，不能绕过看门狗。
+    skip_guard, guard_approval, passphrase, argv = ats._extract_guard_flags(argv)
+    ats.GUARD_PASSPHRASE = passphrase or None
+    root = ats.ats_root(ats._pre_scan_root(argv))
+    denied = ats.guard_handshake(root, skip_guard=skip_guard, guard_approval=guard_approval)
+    if denied is not None:
+        ats.print_json(denied["payload"], denied["code"])
+        return denied["code"]
     parser = build_parser()
     args = parser.parse_args(argv)
     if not args.command_name:

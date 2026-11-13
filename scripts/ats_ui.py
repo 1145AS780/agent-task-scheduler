@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ats_ui.py — agent-task-scheduler 人类用本地 Web 面板 (v2.9.1)
+"""ats_ui.py — agent-task-scheduler 人类用本地 Web 面板 (v3.1.1)
 
 只读监控 + 运行控制 + 审批 + 创建编排。纯标准库，无第三方依赖。
 
@@ -24,7 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "2.9.1"
+VERSION = "3.1.1"
 SERVER_START = int(time.time())
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -34,6 +34,7 @@ PLAN = SCRIPT_DIR / "ats_plan.py"
 
 ROOT = Path.cwd() / ".ats"
 PORT = 8765
+sys.dont_write_bytecode = True
 sys.path.insert(0, str(SCRIPT_DIR))
 try:                                    # MCP HTTP 端点；工具表复用同目录 ats_mcp.py
     import ats_mcp_http as mcp_http
@@ -102,14 +103,16 @@ def tail_text(path, lines):
     return "\n".join(data[-int(lines):]) if lines and lines > 0 else "\n".join(data)
 
 
-def run_cli(script, argv, timeout=90):
+def run_cli(script, argv, timeout=90, stdin_text=None):
     cmd = [sys.executable, str(script)] + [str(x) for x in argv]
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                              errors="replace", timeout=timeout, env=env)
+                              errors="replace", timeout=timeout, env=env,
+                              input=stdin_text)
     except subprocess.TimeoutExpired:
         return {"code": -1, "data": {"error": "cli_timeout", "timeout": timeout},
                 "stdout": "", "stderr": ""}
@@ -353,6 +356,24 @@ def require(payload, key):
     return value
 
 
+def passphrase_error(action):
+    """口令缺失时的统一返回体，形状与 action_result 一致，前端 errText 可直接读。"""
+    return {"ok": False, "action": action, "async": False, "exit_code": 4,
+            "result": {"error": "passphrase_required",
+                       "hint": "审批与策略写入必须持口令：在页面顶部填好后重试"}}
+
+
+def passphrase_stdin(payload):
+    """取页面填的口令，返回 (argv 追加项, 子进程 stdin 文本)。
+
+    口令只经 stdin 交给子进程，绝不拼进 argv —— argv 会进进程列表与日志。
+    """
+    passphrase = str(payload.get("passphrase") or "")
+    if not passphrase:
+        return None, None
+    return ["--passphrase-stdin"], passphrase + "\n"
+
+
 def dispatch(root, payload):
     action = payload.get("action") or ""
 
@@ -444,6 +465,9 @@ def dispatch(root, payload):
 
     if action == "approval.resolve":
         ids = payload.get("ids") or []
+        flag, stdin_text = passphrase_stdin(payload)
+        if flag is None:
+            return passphrase_error(action)
         argv = ["--root", str(root), "approve"]
         if payload.get("all"):
             argv.append("--all")
@@ -457,12 +481,16 @@ def dispatch(root, payload):
             argv += ["--note", str(payload["note"])]
         if payload.get("override"):
             argv.append("--override")
-        return action_result(run_cli(ATS, argv, 30), action)
+        argv += flag
+        return action_result(run_cli(ATS, argv, 30, stdin_text=stdin_text), action)
 
     if action == "policy.set":
         patch = payload.get("patch") or {}
         if not isinstance(patch, dict):
             raise ValueError("patch 必须是对象")
+        flag, stdin_text = passphrase_stdin(payload)
+        if flag is None:
+            return passphrase_error(action)
         argv = ["--root", str(root), "policy"]
         for key, value in patch.items():
             if isinstance(value, (dict, list)):
@@ -470,7 +498,8 @@ def dispatch(root, payload):
             elif isinstance(value, bool):
                 value = "true" if value else "false"
             argv += ["--set", str(key), str(value)]
-        result = action_result(run_cli(ATS, argv, 30), action)
+        argv += flag
+        result = action_result(run_cli(ATS, argv, 30, stdin_text=stdin_text), action)
         invalidate_policy_cache()
         return result
 
@@ -595,6 +624,8 @@ header{position:sticky;top:0;z-index:20;display:flex;align-items:center;justify-
 h1{margin:0;font-size:17px;font-weight:650}
 .sub{font-size:12px;color:var(--muted);font-family:ui-monospace,Consolas,monospace}
 .head-right{display:flex;align-items:center;gap:10px}
+.passinput{width:190px;padding:6px 9px;border-radius:6px;font-size:13px}
+.passinput:focus{border-color:rgba(61,219,192,.55);outline:none}
 .live{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3px rgba(62,207,142,.15)}
 .live.off{background:var(--bad);box-shadow:0 0 0 3px rgba(255,107,107,.15)}
 .live.warn{background:var(--warn);box-shadow:0 0 0 3px rgba(240,180,41,.18)}
@@ -714,6 +745,8 @@ pre.log{background:#0b0f15;border:1px solid var(--line);border-radius:8px;paddin
   </div>
   <div class="head-right">
     <span class="live" id="liveDot"></span><span class="sub" id="liveText">连接中</span>
+    <input type="password" id="uiPass" class="passinput" autocomplete="off"
+           placeholder="口令（审批 / 策略写入）" title="只存在本页内存，不进 URL、不落盘">
     <select id="interval" style="width:auto">
       <option value="2000">2 秒</option><option value="3000" selected>3 秒</option>
       <option value="5000">5 秒</option><option value="10000">10 秒</option>
@@ -788,6 +821,7 @@ pre.log{background:#0b0f15;border:1px solid var(--line);border-radius:8px;paddin
       <div class="actions"><button class="primary" id="btnSavePolicy">保存审批策略</button>
         <span class="hint" id="policyHint"></span></div>
       <div class="hint">生效方式：下一次 run 立即生效（policy.json 热读）。</div>
+      <div class="hint">策略写入与批准/拒绝都要口令：口令填在页面顶部输入框，只存本页内存，经 stdin 交给子进程，不进命令行参数。</div>
     </div>
     <div class="cards" id="approvalBody"></div>
   </section>
@@ -816,7 +850,7 @@ pre.log{background:#0b0f15;border:1px solid var(--line);border-radius:8px;paddin
         <div class="field"><label>描述（可空）</label><input id="tDesc"></div>
         <div class="field"><label>环境变量（每行 K=V，可空）</label><textarea id="tEnv" rows="2"></textarea></div>
         <div class="actions"><button class="primary" id="btnCreateTask">创建任务</button></div>
-        <div class="hint">创建后需在任务列表中运行；@enc 只在主命令退出码为 0 时执行。</div>
+        <div class="hint">创建后需在任务列表中运行；@enc 只在主命令退出码为 0 时执行。@enc 的位置路径可写通配（如 <code>logs\*.log</code>），由 ATS 按任务 cwd 展开后逐条调用转换器；0 匹配会报 <code>hook_glob_no_match</code>，通配与手写路径混写会被拒。</div>
       </div>
 
       <div class="card">
@@ -845,7 +879,7 @@ pre.log{background:#0b0f15;border:1px solid var(--line);border-radius:8px;paddin
           <div class="field"><label>提交后</label><input value="在“计划”页执行" disabled></div>
         </div>
         <div class="actions"><button class="primary" id="btnSubmitPlan">提交 Plan</button></div>
-        <div class="hint">一次性计划提交后用 run_plan 执行；周期计划提交后用“驱动周期”触发。</div>
+        <div class="hint">一次性计划提交后用 run_plan 执行；周期计划提交后用“驱动周期”触发。Step 的 command 不支持 <code>@enc</code> 钩子（Plan 层无钩子后置），提交会被拒并提示 <code>hook_not_supported</code>；需要转码请拆成独立任务或在 Step 里直接调 <code>tools/encoding_converter.py</code>。</div>
       </div>
     </div>
   </section>
@@ -891,7 +925,7 @@ function dur(a,b,c){
 }
 function pill(s){ return '<span class="pill s-'+esc(s||'pending')+'">'+esc(s||'-')+'</span>'; }
 function toast(msg, kind){ const el=document.createElement('div'); el.className='toast '+(kind||''); el.textContent=msg; $('#toasts').appendChild(el); setTimeout(()=>{el.style.opacity='0';el.style.transition='opacity .3s';setTimeout(()=>el.remove(),350)},4200); }
-function errText(d){ const r=d.result||{}; let m=r.error||r.reason||d.message||('退出码 '+d.exit_code); if(r.hint) m+='（'+r.hint+'）'; if(r.approval_id) m+='，审批 '+r.approval_id; return m; }
+function errText(d){ const r=d.result||{}; let m=r.error||r.reason||d.message||('退出码 '+d.exit_code); const es=Array.isArray(r.errors)?r.errors.map(String):[]; if(es.length) m+='：'+es.slice(0,4).join('；')+(es.length>4?(' …共 '+es.length+' 条'):''); if(r.hint) m+='（'+r.hint+'）'; if(r.approval_id) m+='，审批 '+r.approval_id; return m; }
 
 async function api(path, opts, timeoutMs){
   const ctl = new AbortController();
@@ -1185,17 +1219,17 @@ function renderApprovals(){
       + (a.resume?'<div class="hint">批准后恢复：<span class="mono">'+esc(a.resume)+'</span></div>':'')
       + '</div>';
   }).join('') : '<div class="empty">没有待处理审批</div>';
-  $('#approvalBody').querySelectorAll('[data-approve]').forEach(b => b.onclick = () => act('approval.resolve',{ids:[b.dataset.approve]},'批准 '+b.dataset.approve+'？'));
+  $('#approvalBody').querySelectorAll('[data-approve]').forEach(b => b.onclick = () => actSecure('approval.resolve',{ids:[b.dataset.approve]},'批准 '+b.dataset.approve+'？'));
   $('#approvalBody').querySelectorAll('[data-reject]').forEach(b => b.onclick = () => {
     const note = prompt('拒绝原因（可空）：','');
     if(note===null) return;
-    act('approval.resolve',{ids:[b.dataset.reject],reject:true,note},'拒绝 '+b.dataset.reject+'？');
+    actSecure('approval.resolve',{ids:[b.dataset.reject],reject:true,note},'拒绝 '+b.dataset.reject+'？');
   });
   $('#approvalBody').querySelectorAll('[data-override]').forEach(b => b.onclick = () => {
     const note = prompt('强制放行备注（必填，将写入审批记录）：','');
     if(note===null) return;
     if(!note.trim()) return toast('强制放行必须填写备注','bad');
-    act('approval.resolve',{ids:[b.dataset.override],override:true,note},'确认强制放行 '+b.dataset.override+'？此操作会忽略预演证据并执行命令。');
+    actSecure('approval.resolve',{ids:[b.dataset.override],override:true,note},'确认强制放行 '+b.dataset.override+'？此操作会忽略预演证据并执行命令。');
   });
 }
 
@@ -1239,9 +1273,11 @@ async function savePolicy(){
     win32_isolation: $('#polIso').checked
   };
   $('#policyHint').textContent = '保存中…';
+  const pass = uiPass();
+  if(!pass){ $('#policyHint').textContent = '未填口令，未保存'; return; }
   try{
     const d = await api('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({action:'policy.set',patch})}, 60000);
+      body: JSON.stringify({action:'policy.set',patch,passphrase:pass})}, 60000);
     if(d.ok){
       POLICY_SIG = '';
       $('#policyHint').textContent = '已保存 '+new Date().toLocaleTimeString('zh-CN',{hour12:false});
@@ -1270,6 +1306,19 @@ function renderEvents(){
     const body = keys.map(k => k+'='+rest[k]).join(' · ');
     return '<div class="ev"><div class="t">'+esc(e.iso||ts(e.ts))+'</div><div class="type">'+esc(e.type||'-')+'</div><div class="body">'+esc(body)+'</div></div>';
   }).join('') : '<div class="empty">暂无事件</div>';
+}
+
+function uiPass(){
+  const el = $('#uiPass');
+  const v = el ? el.value.trim() : '';
+  if(!v){ toast('请先在页面顶部填入口令：审批与策略写入都要口令','warn'); if(el) el.focus(); }
+  return v;
+}
+
+async function actSecure(action, payload, confirmMsg){
+  const pass = uiPass();
+  if(!pass) return;
+  return act(action, Object.assign({}, payload, {passphrase: pass}), confirmMsg);
 }
 
 async function act(action, payload, confirmMsg){

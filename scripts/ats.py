@@ -6,7 +6,7 @@
   create <id> --command "..." [--cwd DIR] [--level L0..L3] [--timeout SEC]
                 [--env K=V ...] [--no-shell] [--spec FILE] [--force]
   run <id> [--approval AP] [--wait]
-  download --url URL... | --file MANIFEST [--out DIR] [--name NAME]
+  download --url URL... | --file MANIFEST... [--out DIR] [--name NAME]
                 [--sha256 HEX] [--size N] [--header "K: V"] [--proxy URL]
                 [--concurrency N] [--rate BPS] [--retry N] [--backoff SEC]
                 [--no-resume] [--overwrite] [--insecure] [--level L] [--wait]
@@ -37,6 +37,8 @@
 from __future__ import annotations
 
 import argparse
+import glob
+import hashlib
 import json
 import os
 import re
@@ -46,6 +48,8 @@ import sys
 import time
 import uuid
 from pathlib import Path
+
+sys.dont_write_bytecode = True
 
 try:                                    # 预演模块缺失时退化为纯权限门行为
     import ats_preflight
@@ -70,6 +74,17 @@ EXIT_OK = 0
 EXIT_USAGE = 2
 EXIT_CONFLICT = 3
 EXIT_DENIED = 4
+
+# —— 看门狗（ats_guard.py）：启动准入、跳过审批、运行期句柄与策略快照
+GUARD_FILE = "ats_guard.py"
+GUARD_MANIFEST = "ats_guard_manifest.json"
+GUARD_MANIFEST_ENV = "ATS_GUARD_MANIFEST"
+GUARD_SKIP_COMMAND = "__ats_guard_skip__"
+GUARD_SKIP_LEVEL = "L3"                # 跳过看门狗的最低审批等级，只允许调高
+GUARD_PASSPHRASE = None                # 启动时从 stdin 读入，绝不进 argv
+GUARD_HANDLES = []                     # 运行期持有的核心脚本只读句柄
+GUARD_SKIP_ACTIVE = False              # 本次进程是否以 --skip-guard 放行
+GUARD_POLICY_SNAPSHOT = None           # 握手时冻结的策略快照
 
 DEFAULT_LEASE_AUTONOMY = {
     "enabled": False,
@@ -97,6 +112,8 @@ POLICY_DEFAULTS = {
     "win32_isolation": False,
     "preflight_fail_closed": True,
     "operation_levels": {"stop": "L2", "delete": "L3"},
+    # —— 看门狗跳过审批的等级；只允许比 L3 更高，不允许调低
+    "guard_skip_level": GUARD_SKIP_LEVEL,
 }
 
 POLICY_ENV = {
@@ -116,6 +133,7 @@ POLICY_ENV = {
     "win32_isolation": "ATS_WIN32_ISOLATION",
     "preflight_fail_closed": "ATS_PREFLIGHT_FAIL_CLOSED",
     "operation_levels": "ATS_OPERATION_LEVELS",
+    "guard_skip_level": "ATS_GUARD_SKIP_LEVEL",
 }
 
 INT_POLICY_KEYS = ("approval_ttl_seconds", "keep_runs_per_plan", "stall_seconds",
@@ -123,6 +141,14 @@ INT_POLICY_KEYS = ("approval_ttl_seconds", "keep_runs_per_plan", "stall_seconds"
 BOOL_POLICY_KEYS = ("preflight_dry_run", "denied_injection_allow_override", "win32_isolation",
                     "preflight_fail_closed")
 APPROVAL_MODES = ("auto", "ask", "deny-only")
+
+# 放松型键：改这些等于放宽执行许可，必须持口令（任何 --set 都要求口令，
+# 这里只是把「会放宽的键」在拒绝载荷里点名，便于人判断风险）
+RESTRICTED_POLICY_KEYS = ("max_level", "actor_level", "allow_rules", "approval_mode",
+                          "approval_mode_by_level", "operation_levels",
+                          "denied_injection_allow_override", "win32_isolation",
+                          "preflight_fail_closed", "preflight_dry_run",
+                          "lease_autonomy", "lease_file", "guard_skip_level")
 
 
 # ---------------------------------------------------------------- 基础 IO
@@ -303,7 +329,13 @@ DERIVE_L3_PATTERN = re.compile(
     r"\bsc\s+delete\b|"
     r"\bbcdedit\b|"
     r"\bdiskpart\b|"
-    r"\brobocopy[^\n]*/mir\b)",
+    r"\brobocopy[^\n]*/mir\b|"
+    r"\bcertutil[^\n]*-decode\b|"
+    r"\bvssadmin\s+delete\b|"
+    r"\bwbadmin\s+delete\b|"
+    r"\bwevtutil\s+cl\b|"
+    r"\bbitsadmin[^\n]*(?:/add|/transfer|/create|/set)\b|"
+    r"\bnet\s+(user|localgroup)[^\n]*(?:/add|/delete)\b)",
     re.IGNORECASE)
 DERIVE_L2_PATTERN = re.compile(
     r"([A-Za-z]:\\|/etc/|/usr/|/bin/|\.ssh|"
@@ -312,17 +344,32 @@ DERIVE_L2_PATTERN = re.compile(
     re.IGNORECASE)
 
 
+def _risk_texts(command):
+    """原文 + 静态解出的编码载荷：等级推导要看得到编码里面的东西。
+
+    只看原文时 `powershell -EncodedCommand <base64>` 会被当成普通字符串，
+    危险命令就此洗成 L1 静默直通；解码只做纯文本还原，不执行、不落盘。
+    """
+    texts = [str(command or "")]
+    if ats_preflight is not None:
+        try:
+            texts.extend(ats_preflight.decoded_texts(command))
+        except Exception:                # noqa: BLE001
+            pass
+    return texts
+
+
 def derive_level(command, default=None) -> str:
     """未传 --level 时按命令文本推等级：只抬高风险，判不准回落到 default。
 
-    只做正则匹配，看不懂 base64、变量拼接与脚本内部行为；
+    正则匹配原文与静态解码后的载荷；仍看不懂变量拼接与脚本内部行为，
     它的用途是把明显的危险命令抬进审批，不是识别恶意。
     """
-    text = str(command or "")
-    if DERIVE_L3_PATTERN.search(text):
-        return "L3"
-    if DERIVE_L2_PATTERN.search(text):
-        return "L2"
+    for text in _risk_texts(command):
+        if DERIVE_L3_PATTERN.search(text):
+            return "L3"
+        if DERIVE_L2_PATTERN.search(text):
+            return "L2"
     return str(default or DEFAULT_TASK_LEVEL).upper()
 
 
@@ -335,11 +382,11 @@ DERIVE_FLOOR_L2_PATTERN = re.compile(
 
 def hard_floor_level(command):
     """硬危险特征的下限等级；路径类启发式不参与，避免误伤普通绝对路径。"""
-    text = str(command or "")
-    if DERIVE_L3_PATTERN.search(text):
-        return "L3"
-    if DERIVE_FLOOR_L2_PATTERN.search(text):
-        return "L2"
+    for text in _risk_texts(command):
+        if DERIVE_L3_PATTERN.search(text):
+            return "L3"
+        if DERIVE_FLOOR_L2_PATTERN.search(text):
+            return "L2"
     return None
 
 
@@ -374,7 +421,14 @@ def policy(root, data=None):
 
     返回 dict，键集合固定为 POLICY_DEFAULTS 的键；lease_autonomy 与 lease_file
     是「存活租约免审」的两个开关，默认关闭，必须显式配置才生效。
+
+    看门狗握手成功后会把本次读到的策略冻结进 GUARD_POLICY_SNAPSHOT：运行中
+    原地改写 policy.json 不影响本次决策（改策略要重封签，见 cmd_policy）。
     """
+    if data is None:
+        snap = GUARD_POLICY_SNAPSHOT
+        if snap and snap.get("root") == _policy_root_key(root):
+            return _copy_policy(snap.get("data") or {})
     pol = {key: (dict(value) if isinstance(value, dict) else
                  list(value) if isinstance(value, (list, tuple)) else value)
            for key, value in POLICY_DEFAULTS.items()}
@@ -430,7 +484,31 @@ def policy(root, data=None):
     pol["operation_levels"] = normalize_level_map(pol.get("operation_levels"))
     pol["lease_autonomy"] = normalize_lease_autonomy(pol.get("lease_autonomy"))
     pol["lease_file"] = str(pol.get("lease_file") or "").strip()
+    pol["guard_skip_level"] = normalize_floor_level(pol.get("guard_skip_level"),
+                                                    GUARD_SKIP_LEVEL)
     return pol
+
+
+def _policy_root_key(root):
+    """策略快照的归属键：同一 root 的不同路径写法要收敛到同一个键。"""
+    try:
+        return str(Path(root).resolve())
+    except Exception:                    # noqa: BLE001
+        return str(root)
+
+
+def _copy_policy(data):
+    return {key: (dict(value) if isinstance(value, dict) else
+                  list(value) if isinstance(value, (list, tuple)) else value)
+            for key, value in (data or {}).items()}
+
+
+def normalize_floor_level(value, floor) -> str:
+    """归一化「只允许调高」的等级：非法值退回 floor，低于 floor 一律抬到 floor。"""
+    level = str(value or "").upper()
+    if level not in LEVEL_RANK:
+        return floor
+    return level if level_rank(level) >= level_rank(floor) else floor
 
 
 def level_rank(level) -> int:
@@ -599,6 +677,73 @@ def approval_instance_match(record, context):
     return False
 
 
+def _normalize_command(text) -> str:
+    """命令归一化：只折叠空白，不改变语义。
+
+    审批单上记的是人看到的那条命令，重试时多敲几个空格不该判 mismatch；
+    但脚本名、参数一个字符都不能变。
+    """
+    return " ".join(str(text or "").split())
+
+
+SCRIPT_SUFFIXES = (".py", ".ps1", ".sh", ".bat", ".cmd", ".js", ".mjs")
+
+
+def artifact_digests(command, context=None):
+    """命令里能静态定位的脚本文件指纹；把审批绑到「批准那一刻的内容」。
+
+    只认后缀白名单且确实存在的文件：`echo hi`、`python -c "..."`、
+    `git status` 这类没有可绑定实体的命令返回空列表。
+
+    命令带 `@enc` 钩子时只看 `@enc` 之前的主命令：钩子参数是交给转换器的
+    数据路径（常见就是待转码的 .py/.sh），既不执行也不是审批的执行体，
+    算进指纹会让转码目标内容一变就误报 artifact_changed。
+    """
+    context = dict(context or {})
+    cwd = context.get("cwd")
+    text = str(command or "")
+    m = HOOK_PATTERN.search(text)
+    if m:
+        text = text[:m.start()]
+    out = []
+    for token in text.split():
+        token = token.strip("\"'")
+        if not token.lower().endswith(SCRIPT_SUFFIXES):
+            continue
+        path = Path(token)
+        if not path.is_absolute():
+            if not cwd:
+                continue
+            path = Path(cwd) / path
+        digest = _sha256_file(path)
+        if digest is None:
+            continue
+        try:
+            resolved = str(path.resolve())
+        except OSError:
+            resolved = str(path)
+        out.append({"path": resolved, "sha256": digest})
+    return out
+
+
+def artifact_changed(record, command, context=None) -> bool:
+    """审批时记下的脚本指纹与现在是否一致。
+
+    老记录（没有 artifacts 字段）不参与判定，保持旧行为；
+    新记录一律比对，脚本被换掉或删掉都算变化。
+    """
+    recorded = record.get("artifacts")
+    if recorded is None:
+        return False
+    current = artifact_digests(command, context)
+    if len(current) != len(recorded):
+        return True
+    for old, new in zip(recorded, current):
+        if old.get("path") != new.get("path") or old.get("sha256") != new.get("sha256"):
+            return True
+    return False
+
+
 def create_approval(root, command, required_level, context=None, ttl=None, resume=None,
                     preflight=None, status="pending"):
     context = dict(context or {})
@@ -610,6 +755,8 @@ def create_approval(root, command, required_level, context=None, ttl=None, resum
     if reuse:
         if preflight is not None:
             reuse["preflight"] = preflight
+        if "artifacts" not in reuse:
+            reuse["artifacts"] = artifact_digests(command, context)
         if status == "denied_injection" and reuse.get("status") == "pending":
             reuse["status"] = "denied_injection"
         save_approval(root, reuse)
@@ -635,6 +782,7 @@ def create_approval(root, command, required_level, context=None, ttl=None, resum
         "task_instance": context.get("task_instance"),
         "task_created_at": context.get("task_created_at"),
         "resume": resume or context.get("resume"),
+        "artifacts": artifact_digests(command, context),
     }
     if preflight is not None:
         record["preflight"] = preflight
@@ -651,8 +799,8 @@ def create_approval(root, command, required_level, context=None, ttl=None, resum
     return record
 
 
-def approval_check(root, approval_id, command):
-    """返回 {"ok", "error", "record"}；error ∈ missing/pending/rejected/expired/mismatch。"""
+def approval_check(root, approval_id, command, context=None):
+    """返回 {"ok", "error", "record"}；error ∈ missing/pending/rejected/expired/mismatch/artifact_changed。"""
     record = load_approval(root, approval_id)
     if not record:
         return {"ok": False, "error": "missing", "record": None}
@@ -668,13 +816,15 @@ def approval_check(root, approval_id, command):
         error = "expired"
     elif status != "approved":
         error = "pending"
-    elif record.get("command") != command:
+    elif _normalize_command(record.get("command")) != _normalize_command(command):
         error = "mismatch"
+    elif artifact_changed(record, command, context):
+        error = "artifact_changed"
     return {"ok": error is None, "error": error, "record": record}
 
 
-def approval_allows(root, approval_id, command) -> bool:
-    return approval_check(root, approval_id, command)["ok"]
+def approval_allows(root, approval_id, command, context=None) -> bool:
+    return approval_check(root, approval_id, command, context)["ok"]
 
 
 def mark_approval_expired(root, record):
@@ -897,6 +1047,9 @@ def permission_gate(root, command, approval_id=None, context=None):
     hard = hard_floor_level(command)
     if hard and level_rank(hard) > level_rank(required):
         required = hard
+    # 跳过看门狗不降低任何执行等级：本次进程里所有命令的下限抬到 guard_skip_level
+    if GUARD_SKIP_ACTIVE:
+        required = normalize_floor_level(required, pol.get("guard_skip_level") or GUARD_SKIP_LEVEL)
     actor = str(pol.get("actor_level") or DEFAULT_ACTOR_LEVEL).upper()
     cap = str(pol.get("max_level") or DEFAULT_MAX_LEVEL).upper()
     result = {
@@ -914,7 +1067,7 @@ def permission_gate(root, command, approval_id=None, context=None):
         "approval_mode": None,
     }
     rule = whitelist_match(root, context.get("whitelist_text") or command)
-    if rule and not hard:
+    if rule and not hard and not GUARD_SKIP_ACTIVE:
         result.update(allowed=True, reason="whitelist", whitelist=rule)
         return result
     if rule:
@@ -936,7 +1089,7 @@ def permission_gate(root, command, approval_id=None, context=None):
                       approval_id=lease["approval_id"], approval=lease["approval"],
                       lease=lease)
         return result
-    check = approval_check(root, approval_id, command)
+    check = approval_check(root, approval_id, command, context)
     if check["ok"] and not approval_instance_match(check["record"], context):
         check = {"ok": False, "error": "mismatch", "record": check["record"]}
     result["approval"] = check["record"]
@@ -991,6 +1144,9 @@ def gate_operation(root, level, label, approval_id=None, context=None):
     actor = str(pol.get("actor_level") or DEFAULT_ACTOR_LEVEL).upper()
     cap = str(pol.get("max_level") or DEFAULT_MAX_LEVEL).upper()
     level = str(level).upper()
+    # 跳过看门狗不降低任何执行等级：操作型闸门同样抬到 guard_skip_level
+    if GUARD_SKIP_ACTIVE:
+        level = normalize_floor_level(level, pol.get("guard_skip_level") or GUARD_SKIP_LEVEL)
 
     if level_rank(level) > level_rank(cap):
         return {"allowed": False, "reason": "denied_policy", "error": "denied_policy",
@@ -1013,7 +1169,7 @@ def gate_operation(root, level, label, approval_id=None, context=None):
                 "label": label, "level": level, "approval_id": lease["approval_id"],
                 "approval": lease["approval"], "lease": lease}
 
-    check = approval_check(root, approval_id, label)
+    check = approval_check(root, approval_id, label, context)
     if check["ok"] and not approval_instance_match(check["record"], context):
         check = {"ok": False, "error": "mismatch", "record": check["record"]}
     if check["ok"]:
@@ -1331,7 +1487,8 @@ def cmd_create(root, args):
         key, value = item.split("=", 1)
         env[key] = value
 
-    level = floor_level(args.level or spec.get("level"), command)
+    level = floor_level(args.level or spec.get("level"),
+                        hook_gate_text(command, post_hook))
     if level not in LEVEL_RANK:
         print(json.dumps({"error": "bad_level", "level": level}, ensure_ascii=False))
         return EXIT_USAGE
@@ -1429,6 +1586,45 @@ def split_post_hook(command):
     return main, {"type": "enc", "args": args}
 
 
+def hook_gate_text(command, hook):
+    """权限门与等级推导看到的完整原文：主命令 + `@enc` 参数。
+
+    钩子参数不参与 shell 执行（见 split_hook_args），但它是用户写下的原文。
+    不把它纳入判定，`echo hi @enc x; rm -rf /` 就能搭 L0 主命令的车直通执行。
+    """
+    if not hook or hook.get("error"):
+        return command
+    return "%s @enc %s" % (command, hook.get("args") or "")
+
+
+def split_hook_args(text):
+    """按空白切分钩子参数，单/双引号包裹的段保持完整。
+
+    只分词，不解释 `; | > & $ ` 这类 shell 元字符 —— 钩子用 argv 列表执行，
+    它们只会作为普通参数交给转换器，不会变成第二条命令。
+    """
+    tokens, buf, quote = [], [], None
+    for ch in text or "":
+        if quote:
+            if ch == quote:
+                quote = None
+            else:
+                buf.append(ch)
+            continue
+        if ch in ('"', "'"):
+            quote = ch
+            continue
+        if ch.isspace():
+            if buf:
+                tokens.append("".join(buf))
+                buf = []
+            continue
+        buf.append(ch)
+    if buf:
+        tokens.append("".join(buf))
+    return tokens
+
+
 def resolve_encoder(task):
     """定位 encoding_converter.py：ATS_ENCODER_PATH > <cwd>/tools > 当前目录/tools。"""
     env_path = os.environ.get("ATS_ENCODER_PATH")
@@ -1443,13 +1639,123 @@ def resolve_encoder(task):
     return None
 
 
+HOOK_GLOB_CHARS = ("*", "?", "[")
+DEFAULT_HOOK_GLOB_MAX = 256
+
+
+def _hook_arg_roles(tokens):
+    """标注每个钩子参数的角色：`flag` / `value` / `positional`。
+
+    只用于判断「哪个 token 是路径」，不参与执行：以 `-` 开头的是 flag，
+    `--x` 后面紧跟的 token 是它的值（`--x=v` 自带值，不吞下一个）。
+    前一个 flag 是否吃值无法从参数串本身推断（转换器的 flag 表未知），所以
+    以 `-` 开头的 token **永远不会**被当成值——否则 `--dry-run --from gbk`
+    这种「无值开关 + 真 flag」的写法会把 `--from` 记成值、把 `gbk` 记成位置
+    参数，进而让后面的通配误报 hook_glob_ambiguous。
+    """
+    roles, want_value = [], False
+    for tok in tokens:
+        if tok.startswith("-"):
+            roles.append("flag")
+            want_value = "=" not in tok
+        elif want_value:
+            roles.append("value")
+            want_value = False
+        else:
+            roles.append("positional")
+    return roles
+
+
+def expand_hook_glob_args(task, tokens):
+    """把钩子参数里唯一的通配路径展开成实际路径（相对 task cwd）。
+
+    钩子不经 shell，`*` 不会被自动展开，所以由这里显式展开。返回 (参数列表, 信息 dict)；
+    信息里 `template` / `idx` / `paths` 供逐条调用使用，`error` 表示应当整单失败。
+
+    安全约束（本地文件同等权限下只能「不扩大爆炸半径」）：
+      * 只有含 `* ? [` 且角色是 `positional` 的 token 才展开，flag 与其值一律不动；
+      * 出现第二个 positional 时报 hook_glob_ambiguous —— 通配与手写路径混用含义不明，不猜；
+      * 匹配 0 个报 hook_glob_no_match —— 绝不把字面量 `*.log` 当文件名交给转换器；
+      * 匹配数超过上限（默认 256，`ATS_HOOK_GLOB_MAX` 可调）报 hook_glob_too_many；
+      * 跳过符号链接 / junction，避免顺着链接改到 cwd 之外；
+      * 结果排序后返回，同一任务重复执行时展开顺序一致。
+    """
+    info = {"glob": None, "idx": None, "template": tokens, "paths": [],
+            "expanded": 0, "skipped_symlinks": 0}
+    roles = _hook_arg_roles(tokens)
+    hits = [i for i, (tok, role) in enumerate(zip(tokens, roles))
+            if role == "positional" and any(ch in tok for ch in HOOK_GLOB_CHARS)]
+    if not hits:
+        return tokens, info
+    if len(hits) > 1:
+        info["error"] = "hook_glob_ambiguous"
+        info["detail"] = "钩子里只能有一个通配路径，实际 %d 个" % len(hits)
+        return tokens, info
+    idx = hits[0]
+    extra = [i for i, role in enumerate(roles) if role == "positional" and i != idx]
+    if extra:
+        info["error"] = "hook_glob_ambiguous"
+        info["detail"] = "通配路径不能与手写路径同时出现（第 %d 个参数）" % (extra[0] + 1)
+        return tokens, info
+
+    pattern = tokens[idx]
+    try:
+        limit = int(os.environ.get("ATS_HOOK_GLOB_MAX") or DEFAULT_HOOK_GLOB_MAX)
+    except (TypeError, ValueError):
+        limit = DEFAULT_HOOK_GLOB_MAX
+    if limit <= 0:
+        limit = DEFAULT_HOOK_GLOB_MAX
+
+    base = Path(task.get("cwd") or os.getcwd())
+    full = pattern if os.path.isabs(pattern) else str(base / pattern)
+    matches, skipped, overflow = [], 0, False
+    for hit in glob.iglob(full, recursive=True):
+        p = Path(hit)
+        if p.is_symlink():
+            skipped += 1
+            continue
+        matches.append(hit)
+        if len(matches) > limit:
+            overflow = True
+            break
+
+    info["glob"] = pattern
+    info["skipped_symlinks"] = skipped
+    if overflow:
+        info["error"] = "hook_glob_too_many"
+        info["detail"] = "通配 %s 匹配超过上限 %d 个，请缩小范围或用 ATS_HOOK_GLOB_MAX 调整" % (pattern, limit)
+        return tokens, info
+    if not matches:
+        info["error"] = "hook_glob_no_match"
+        info["detail"] = "通配 %s 在 %s 下没有匹配到任何文件" % (pattern, base)
+        return tokens, info
+
+    matches.sort()
+    info["idx"] = idx
+    info["template"] = tokens[:idx] + tokens[idx + 1:]
+    info["paths"] = matches
+    info["expanded"] = len(matches)
+    return info["template"][:idx] + matches + info["template"][idx:], info
+
+
 def run_post_hook(root, tdir, task, hook):
-    """主命令成功后的 @enc 转换步骤；结果写 hook-enc.log 并发事件。"""
+    """主命令成功后的 @enc 转换步骤；结果写 hook-enc.log 并发事件。
+
+    钩子参数里的通配符在这里展开（钩子不经 shell，`*` 不会自动展开）；
+    展开清单写进 hook-enc.log 头部，事后能核对「这次到底动了哪些文件」。
+    转换器的契约是单个位置路径，所以展开出多个目标时逐条调用、遇非 0 即停。
+    """
     started = now_ts()
     log_path = tdir / "hook-enc.log"
     encoder = resolve_encoder(task)
+    tokens, ginfo = expand_hook_glob_args(task, split_hook_args(hook.get("args") or ""))
     result = {"type": "enc", "args": hook.get("args"), "status": "failed",
               "exit_code": None, "log": str(log_path), "started_at": started}
+    if ginfo.get("glob"):
+        result["glob"] = ginfo["glob"]
+        result["expanded"] = ginfo.get("expanded") or 0
+    if ginfo.get("skipped_symlinks"):
+        result["skipped_symlinks"] = ginfo["skipped_symlinks"]
 
     if encoder is None:
         result["error_type"] = "encoder_not_found"
@@ -1459,28 +1765,59 @@ def run_post_hook(root, tdir, task, hook):
                 "可用环境变量 ATS_ENCODER_PATH 指定转换器路径\n", encoding="utf-8")
         except OSError:
             pass
+    elif ginfo.get("error"):
+        result["error_type"] = ginfo["error"]
+        result["message"] = ginfo.get("detail") or ""
+        try:
+            log_path.write_text("%s: %s\n" % (ginfo["error"], ginfo.get("detail") or ""),
+                                encoding="utf-8")
+        except OSError:
+            pass
     else:
-        cmdline = '"%s" "%s" %s' % (sys.executable, encoder, hook["args"])
+        targets = ginfo.get("paths") or [None]
         env = os.environ.copy()
         env.update({str(k): str(v) for k, v in (task.get("env") or {}).items()})
         timeout = int(task.get("timeout") or 0)
+        runs, code = [], 0
         try:
-            code = None
             with log_path.open("w", encoding="utf-8", errors="replace") as fh:
-                proc = subprocess.Popen(cmdline, cwd=task.get("cwd") or None, env=env,
-                                        stdin=subprocess.DEVNULL, shell=True,
-                                        stdout=fh, stderr=subprocess.STDOUT)
-                try:
-                    code = proc.wait(timeout=timeout if timeout > 0 else None)
-                except subprocess.TimeoutExpired:
-                    kill_pid(proc.pid)
+                if ginfo.get("glob"):
+                    fh.write("glob %s -> %d path(s)\n" % (ginfo["glob"], len(targets)))
+                    for path in targets:
+                        fh.write("  %s\n" % path)
+                    if ginfo.get("skipped_symlinks"):
+                        fh.write("  (跳过符号链接 %d 个)\n" % ginfo["skipped_symlinks"])
+                    fh.flush()
+                for i, target in enumerate(targets, 1):
+                    if target is None:
+                        cmdline = [sys.executable, str(encoder)] + tokens
+                    else:
+                        cmdline = ([sys.executable, str(encoder)]
+                                   + ginfo["template"][:ginfo["idx"]] + [target]
+                                   + ginfo["template"][ginfo["idx"]:])
+                        if len(targets) > 1:
+                            fh.write("--- run %d/%d: %s\n" % (i, len(targets), target))
+                            fh.flush()
+                    proc = subprocess.Popen(cmdline, cwd=task.get("cwd") or None, env=env,
+                                            stdin=subprocess.DEVNULL, shell=False,
+                                            stdout=fh, stderr=subprocess.STDOUT)
                     try:
-                        code = proc.wait(timeout=5)
+                        code = proc.wait(timeout=timeout if timeout > 0 else None)
                     except subprocess.TimeoutExpired:
-                        code = -1
-                    result["error_type"] = "hook_timeout"
+                        kill_pid(proc.pid)
+                        try:
+                            code = proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            code = -1
+                        result["error_type"] = "hook_timeout"
+                    runs.append({"path": target, "exit_code": code})
+                    if code != 0:
+                        result["failed_on"] = target
+                        break
             result["exit_code"] = code
             result["status"] = "ok" if code == 0 else "failed"
+            if len(targets) > 1:
+                result["runs"] = runs
         except OSError as e:
             result["error_type"] = "hook_spawn_failed"
             result["message"] = str(e)
@@ -1518,7 +1855,7 @@ def cmd_pack(root, args):
                            "hint": "钩子写法：<命令> @enc <转换器参数>；@enc 前后都要有内容"},
                           EXIT_USAGE)
 
-    level = pack_level(args.level, [c for c, _hook in parsed])
+    level = pack_level(args.level, [hook_gate_text(c, hook) for c, hook in parsed])
     if level not in LEVEL_RANK:
         return print_json({"error": "bad_level", "level": level}, EXIT_USAGE)
     timeout = args.timeout if args.timeout is not None else DEFAULT_TIMEOUT
@@ -1596,6 +1933,9 @@ def _start_task(root, task_id, approval=None, wait=False, force=False):
         if not task:
             return {"error": "not_found", "task_id": task_id}, EXIT_CONFLICT
         refresh_task(root, task)
+        # 权限门与预检看的是「主命令 + @enc 参数」的完整原文：钩子参数虽然只以
+        # argv 交给转换器，但它是用户写下的内容，审批要绑同一段文本才不会看漏。
+        gate_text = hook_gate_text(task.get("command") or "", task.get("post_hook"))
         if task.get("status") not in ("pending", "failed", "timeout", "succeeded", "killed"):
             return {"error": "state_conflict", "task_id": task["id"],
                     "status": task.get("status")}, EXIT_CONFLICT
@@ -1603,7 +1943,7 @@ def _start_task(root, task_id, approval=None, wait=False, force=False):
             return {"error": "rerun_requires_force", "task_id": task["id"],
                     "status": task.get("status")}, EXIT_CONFLICT
 
-        gate = permission_gate(root, task["command"], approval,
+        gate = permission_gate(root, gate_text, approval,
                                {"required_level": task.get("level") or DEFAULT_TASK_LEVEL,
                                 "source": "run", "task_id": task["id"],
                                 "task_instance": task.get("instance_id"),
@@ -1617,7 +1957,7 @@ def _start_task(root, task_id, approval=None, wait=False, force=False):
                       approval_id=approved_rec.get("id"))
         elif gate["allowed"] or gate["reason"] == "approval_required":
             preflight = preflight_review(
-                root, task["command"], task.get("level") or DEFAULT_TASK_LEVEL,
+                root, gate_text, task.get("level") or DEFAULT_TASK_LEVEL,
                 {"source": "run", "task_id": task.get("id"),
                  "task_instance": task.get("instance_id"),
                  "task_created_at": task.get("created_at"),
@@ -1627,7 +1967,7 @@ def _start_task(root, task_id, approval=None, wait=False, force=False):
         if preflight and preflight.get("verdict") == "deny_injection":
             allow_override = bool(policy(root).get("denied_injection_allow_override"))
             rec = create_approval(
-                root, task["command"], gate["required_level"],
+                root, gate_text, gate["required_level"],
                 {"source": "run", "task_id": task["id"],
                  "task_instance": task.get("instance_id"),
                  "task_created_at": task.get("created_at")},
@@ -1659,7 +1999,7 @@ def _start_task(root, task_id, approval=None, wait=False, force=False):
             if preflight:
                 payload["preflight"] = preflight
             if gate["reason"] == "approval_required":
-                rec = create_approval(root, task["command"], gate["required_level"],
+                rec = create_approval(root, gate_text, gate["required_level"],
                                       {"source": "run", "task_id": task["id"],
                                        "task_instance": task.get("instance_id"),
                                        "task_created_at": task.get("created_at")},
@@ -1865,6 +2205,8 @@ def cmd_supervise(root, args):
 # ---------------------------------------------------------------- 下载器
 
 DOWNLOAD_MAX_ITEMS = 500
+DOWNLOAD_MAX_MANIFESTS = 64
+MANIFEST_GLOB_CHARS = ("*", "?", "[")
 
 
 def _parse_headers(values):
@@ -1877,6 +2219,39 @@ def _parse_headers(values):
             return None, "bad_header"
         headers[key.strip()] = value.strip()
     return headers, None
+
+
+def _expand_manifest_args(values):
+    """把 `--file` 的通配展开成具体清单路径；返回 (paths, error)。
+
+    `--file` 只用于**读**清单，读它不会写任何文件（真正的写入目标是 `--out`），
+    所以这里不跳过符号链接——与 `@enc` 不同：那边的展开结果会被就地转码，
+    跳过链接是为了不顺着链接改到 cwd 之外；这里读一个链接只是读它指向的清单。
+
+    只展开含 `* ? [` 的值，字面路径原样保留（仍由 `_load_manifest` 报
+    `manifest_not_found`，行为与旧版一致）；0 匹配报 `manifest_no_match`，
+    绝不把字面量 `*.txt` 当成一个真实文件名；匹配数超过上限（默认 64，
+    `ATS_DOWNLOAD_MANIFEST_MAX` 可调）报 `manifest_too_many`。
+    """
+    try:
+        limit = int(os.environ.get("ATS_DOWNLOAD_MANIFEST_MAX") or DOWNLOAD_MAX_MANIFESTS)
+    except (TypeError, ValueError):
+        limit = DOWNLOAD_MAX_MANIFESTS
+    if limit <= 0:
+        limit = DOWNLOAD_MAX_MANIFESTS
+    paths = []
+    for value in values or []:
+        raw = str(value)
+        if not any(ch in raw for ch in MANIFEST_GLOB_CHARS):
+            paths.append(raw)
+            continue
+        matches = sorted(glob.iglob(raw, recursive=True))
+        if not matches:
+            return None, "manifest_no_match:%s" % raw
+        if len(matches) > limit:
+            return None, "manifest_too_many:%s" % raw
+        paths.extend(matches)
+    return paths, None
 
 
 def _load_manifest(path):
@@ -1953,19 +2328,29 @@ def _build_download_spec(args):
         return None, "name_requires_single_url"
     outputs = args.out
     items = []
-    if args.file:
-        m_outputs, m_items, err = _load_manifest(args.file)
+    manifests, err = _expand_manifest_args(args.file)
+    if err:
+        return None, err
+    manifest_outputs = None
+    for path in manifests:
+        m_outputs, m_items, err = _load_manifest(path)
         if err:
-            return None, err
-        outputs = outputs or m_outputs
+            return None, "%s:%s" % (err, path)
+        if m_outputs and not args.out:
+            resolved = str(Path(m_outputs).expanduser().resolve())
+            if manifest_outputs is None:
+                manifest_outputs = resolved
+            elif resolved != manifest_outputs:
+                return None, "manifest_outputs_conflict:%s" % path
         for row in m_items:
             if not isinstance(row, dict) or not row.get("url"):
-                return None, "item_missing_url"
+                return None, "item_missing_url:%s" % path
             item = {"url": str(row["url"]), "save_as": row.get("save_as") or None}
             for key in ("sha256", "size", "headers"):
                 if row.get(key):
                     item[key] = row[key]
             items.append(item)
+    outputs = outputs or manifest_outputs
     for url in args.url or []:
         items.append({"url": url, "save_as": args.name})
     if not items:
@@ -2007,6 +2392,8 @@ def _build_download_spec(args):
         "headers": headers or {},
         "proxy": args.proxy,
     }
+    if manifests:
+        spec["manifests"] = manifests
     return spec, None
 
 
@@ -2026,6 +2413,9 @@ def cmd_download(root, args):
 
     level = str(args.level or DEFAULT_TASK_LEVEL).upper()
     command = "download %d item(s) -> %s" % (len(spec["items"]), spec["outputs"])
+    if spec.get("manifests"):
+        command = "download %d item(s) from %d manifest(s) -> %s" % (
+            len(spec["items"]), len(spec["manifests"]), spec["outputs"])
     now = now_ts()
     task = {
         "id": task_id,
@@ -2068,6 +2458,7 @@ def cmd_download(root, args):
     payload, code = _start_task(root, task_id, args.approval, args.wait, False)
     payload["download"] = {"items": len(spec["items"]), "outputs": spec["outputs"],
                            "deduped": spec.get("deduped", 0),
+                           "manifests": len(spec.get("manifests") or []),
                            "spec": str(spec_path),
                            "log": relative_task_path(task_id, "stdout.log")}
     return print_json(payload, code)
@@ -2369,6 +2760,11 @@ def cmd_delete(root, args):
 
 
 def cmd_approve(root, args):
+    auth = require_passphrase(root)
+    if not auth.get("ok"):
+        return print_json({"error": "passphrase_required", "detail": auth,
+                           "hint": "批准/拒绝审批需要人工口令：用 --passphrase-stdin "
+                                   "从标准输入提供一行"}, EXIT_DENIED)
     pol = policy(root)
     actor = str(pol.get("actor_level") or DEFAULT_ACTOR_LEVEL).upper()
     targets = []
@@ -2582,7 +2978,17 @@ def cmd_logs(root, args):
 
 def cmd_policy(root, args):
     changes = dict(args.set or [])
+    restricted = sorted(k for k in changes if k in RESTRICTED_POLICY_KEYS)
     if changes:
+        # 任何 --set 都要口令：写盘后必须重封签，而重封签需要口令。
+        # 先把「会放宽执行许可」的键点出来，让人知道这次改动的风险面。
+        auth = require_passphrase(root)
+        if not auth.get("ok"):
+            return print_json({"error": "passphrase_required", "restricted": restricted,
+                               "detail": auth,
+                               "hint": "改策略会重建信任基线（重封签），必须持口令："
+                                       "用 --passphrase-stdin 从标准输入提供一行"},
+                              EXIT_DENIED)
         unknown = sorted(k for k in changes if k not in POLICY_DEFAULTS)
         if unknown:
             return print_json({"error": "unknown_keys", "keys": unknown,
@@ -2613,7 +3019,16 @@ def cmd_policy(root, args):
             else:
                 stored[key] = raw
         jwrite(path, stored)
-        log_event(root, "policy_updated", keys=sorted(changes))
+        log_event(root, "policy_updated", keys=sorted(changes),
+                  restricted=restricted or None)
+        # 写完立刻重封签，否则下次启动会因 policy.json 摘要不符被看门狗拦住
+        rc, sealed = _run_guard(["seal", "--confirm"], root, GUARD_PASSPHRASE)
+        if rc != EXIT_OK or not sealed.get("ok"):
+            return print_json({"error": "reseal_failed", "detail": sealed,
+                               "hint": "policy.json 已写入但重封签失败，下次启动会被看门狗"
+                                       "拒绝；请人工执行 ats_guard.py seal --confirm"},
+                              EXIT_DENIED)
+        _freeze_policy(root, force=True)
     pol = policy(root)
     record, state = lease_state(root, pol)
     pol["lease"] = {
@@ -2629,6 +3044,277 @@ def cmd_policy(root, args):
         return print_json(pol)
     print(json.dumps(pol, ensure_ascii=False, indent=2))
     return EXIT_OK
+
+
+# ---------------------------------------------------------------- 看门狗准入
+
+def _sha256_file(path):
+    """流式计算 sha256；文件不存在或读失败返回 None（与 ats_guard.py 同语义）。"""
+    try:
+        p = Path(path)
+        if not p.is_file():
+            return None
+        digest = hashlib.sha256()
+        with p.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _guard_manifest_path(root):
+    """清单位置与 ats_guard.py 保持一致：ATS_GUARD_MANIFEST 优先，否则 <root>/清单名。"""
+    env = os.environ.get(GUARD_MANIFEST_ENV)
+    if env:
+        return Path(env)
+    return Path(root) / GUARD_MANIFEST
+
+
+def _read_guard_manifest(root):
+    try:
+        data = json.loads(_guard_manifest_path(root).read_text(encoding="utf-8"))
+    except Exception:                    # noqa: BLE001
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _extract_guard_flags(argv):
+    """剥离看门狗全局参数，返回 (skip_guard, guard_approval, passphrase, 剩余 argv)。
+
+    必须在 argparse 之前调用：--skip-guard / --guard-approval / --passphrase-stdin
+    是跨子命令的全局开关，交给 argparse 会被子解析器当成未知参数。
+    口令只从 stdin 读，绝不进 argv（argv 会留在进程列表与 shell 历史里）。
+    """
+    skip_guard = False
+    guard_approval = None
+    passphrase_stdin = False
+    rest = []
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token == "--skip-guard":
+            skip_guard = True
+            i += 1
+            continue
+        if token == "--guard-approval":
+            if i + 1 < len(argv):
+                guard_approval = argv[i + 1]
+                i += 2
+                continue
+            i += 1
+            continue
+        if token.startswith("--guard-approval="):
+            guard_approval = token.split("=", 1)[1]
+            i += 1
+            continue
+        if token == "--passphrase-stdin":
+            passphrase_stdin = True
+            i += 1
+            continue
+        rest.append(token)
+        i += 1
+    passphrase = ""
+    if passphrase_stdin:
+        try:
+            passphrase = (sys.stdin.readline() or "").rstrip("\r\n")
+        except Exception:                # noqa: BLE001
+            passphrase = ""
+    return skip_guard, guard_approval, passphrase, rest
+
+
+def _pre_scan_root(argv):
+    """在 argparse 之前裸扫 --root：握手要用 root，而解析失败不能先炸掉准入。"""
+    for i, token in enumerate(argv):
+        if token == "--root" and i + 1 < len(argv):
+            return argv[i + 1]
+        if token.startswith("--root="):
+            return token.split("=", 1)[1]
+    return None
+
+
+def _run_guard(args, root, passphrase=None):
+    """跑一次 ats_guard.py 子命令，返回 (退出码, 解析后的 JSON)。输出不可解析一律算失败。"""
+    script = Path(__file__).resolve().parent / GUARD_FILE
+    cmd = [sys.executable, str(script), "--root", str(root)] + [str(a) for a in args]
+    stdin = None
+    if passphrase is not None:
+        cmd.append("--passphrase-stdin")
+        stdin = passphrase + "\n"
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    try:
+        proc = subprocess.run(cmd, input=stdin, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", env=env, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return EXIT_DENIED, {"ok": False, "error": "guard_spawn_failed",
+                             "detail": "%s: %s" % (type(exc).__name__, exc)}
+    try:
+        payload = json.loads(proc.stdout or "")
+    except json.JSONDecodeError:
+        return EXIT_DENIED, {"ok": False, "error": "guard_output_invalid",
+                             "exit_code": proc.returncode,
+                             "stdout": (proc.stdout or "")[:400],
+                             "stderr": (proc.stderr or "")[:400]}
+    return proc.returncode, payload if isinstance(payload, dict) else {
+        "ok": False, "error": "guard_output_invalid"}
+
+
+def require_passphrase(root):
+    """校验启动时从 stdin 读到的口令；缺失/错误都返回 fail-closed 的载荷。"""
+    if not GUARD_PASSPHRASE:
+        return {"ok": False, "error": "passphrase_missing",
+                "hint": "口令不能为空：用 --passphrase-stdin 从标准输入提供一行，"
+                        "或直接在终端里交互输入"}
+    rc, payload = _run_guard(["auth"], root, GUARD_PASSPHRASE)
+    return payload
+
+
+def _hold_handles():
+    """运行期持有核心脚本的只读句柄。
+
+    Windows 上 Python 的 open() 不带 FILE_SHARE_DELETE，因此持有句柄期间
+    删除与 rename 替换这些文件会失败（实测 PermissionError），读取不受影响。
+    但**原地覆写内容不被阻止** —— 共享写是允许的；这条只能靠「后续新启动的
+    进程都要过 verify」兜住，别把它当成运行期内容不可改。句柄由进程生命周期
+    兜底释放。
+    """
+    if GUARD_HANDLES:
+        return
+    here = Path(__file__).resolve().parent
+    for name in sorted(p.name for p in here.glob("*.py")):
+        try:
+            GUARD_HANDLES.append((here / name).open("rb"))
+        except OSError:
+            continue
+
+
+def _freeze_policy(root, force=False):
+    """握手成功后冻结策略快照：运行中原地改写 policy.json 不影响本次决策。"""
+    global GUARD_POLICY_SNAPSHOT
+    key = _policy_root_key(root)
+    if not force and GUARD_POLICY_SNAPSHOT and GUARD_POLICY_SNAPSHOT.get("root") == key:
+        return
+    saved = GUARD_POLICY_SNAPSHOT
+    GUARD_POLICY_SNAPSHOT = None
+    try:
+        data = policy(root)
+    finally:
+        GUARD_POLICY_SNAPSHOT = saved
+    GUARD_POLICY_SNAPSHOT = {"root": key, "data": data}
+
+
+def _guard_self_check(root):
+    """先自行比对 ats_guard.py 的摘要，再决定要不要把信任交给它。
+
+    清单缺失时不在这里判失败 —— 交给 verify 报 manifest_missing，避免两处口径不一。
+    """
+    manifest = _read_guard_manifest(root)
+    if manifest is None:
+        return None
+    expected = (manifest.get("files") or {}).get(GUARD_FILE)
+    if not expected:
+        return None
+    actual = _sha256_file(Path(__file__).resolve().parent / GUARD_FILE)
+    if actual == expected:
+        return None
+    return {"code": EXIT_DENIED,
+            "payload": {"error": "guard_check_failed",
+                        "detail": {"stage": "guard_self_check",
+                                   "file": GUARD_FILE,
+                                   "expected": expected,
+                                   "actual": actual,
+                                   "manifest": str(_guard_manifest_path(root)),
+                                   "hint": "看门狗自身与清单不符，它输出的「校验通过」"
+                                           "不可信。请用 git 历史逐行比对 "
+                                           "ats_guard.py，确认改动来源后由人执行 "
+                                           "seal --confirm 重封签"}}}
+
+
+def _guard_skip_gate(root, approval_id):
+    """--skip-guard 的审批闸门：只认绑定 __ats_guard_skip__ 的已批准 L3 记录。"""
+    level = normalize_floor_level(policy(root).get("guard_skip_level"), GUARD_SKIP_LEVEL)
+    check = approval_check(root, approval_id, GUARD_SKIP_COMMAND)
+    record = check["record"]
+    if check["ok"] and level_rank(record.get("required_level")) >= level_rank(level):
+        log_event(root, "guard_skip_approved", approval_id=record["id"],
+                  required_level=record.get("required_level"), level=level)
+        return None
+    if check["ok"]:
+        # 审批等级不足：低等级审批不能用来跳过看门狗
+        check = {"ok": False, "error": "insufficient_level", "record": record}
+    new_record = create_approval(
+        root, GUARD_SKIP_COMMAND, level,
+        context={"source": "guard_skip", "guard_skip": True},
+        resume="python %s <command> --skip-guard --guard-approval <approval_id>"
+               % Path(__file__).name)
+    announce_approval(root, new_record)
+    log_event(root, "guard_skip_blocked", approval_id=new_record["id"],
+              approval_error=check["error"], required_level=level)
+    return {"code": EXIT_DENIED,
+            "payload": {"error": "guard_skip_approval_required",
+                        "required_level": level,
+                        "approval_id": new_record["id"],
+                        "approval": new_record,
+                        "approval_error": check["error"],
+                        "resume": new_record.get("resume"),
+                        "hint": "--skip-guard 只供人类紧急调试，必须持 L3 审批："
+                                "先 approve 该 approval_id，再带 --guard-approval 重跑；"
+                                "跳过看门狗不会降低任何命令的执行等级"}}
+
+
+def guard_handshake(root, skip_guard=False, guard_approval=None):
+    """启动准入。返回 None 表示放行；否则返回 {"code", "payload"}。
+
+    顺序：--skip-guard 先过 L3 审批闸门 → 自检看门狗摘要 → 跑 verify →
+    持只读句柄 → 冻结策略快照。任一步失败都 fail-closed。
+    """
+    global GUARD_SKIP_ACTIVE
+    root = Path(root)
+    if skip_guard:
+        denied = _guard_skip_gate(root, guard_approval)
+        if denied is not None:
+            return denied
+        GUARD_SKIP_ACTIVE = True
+        log_event(root, "guard_skipped", level=GUARD_SKIP_LEVEL,
+                  approval_id=guard_approval)
+    else:
+        denied = _guard_self_check(root)
+        if denied is not None:
+            log_event(root, "guard_self_check_failed", file=GUARD_FILE)
+            return denied
+        rc, payload = _run_guard(["verify"], root)
+        if rc != EXIT_OK or not payload.get("ok"):
+            log_event(root, "guard_verify_failed", exit_code=rc,
+                      error=payload.get("error"))
+            error = payload.get("error")
+            if error == "manifest_missing" and payload.get("next_action") == "init":
+                hint = ("本 root 尚未建立信任根，本次命令不执行。由人先执行 "
+                        "ats_guard.py init --confirm 创建密钥，再执行 seal --confirm "
+                        "建立基线；两步都要口令")
+            elif error == "manifest_missing":
+                hint = ("清单缺失但密钥仍在，本次命令不执行。由人执行 seal --confirm "
+                        "重新封签，口令须与 init 时一致")
+            elif payload.get("next_action") == "restore_key":
+                hint = ("密钥文件丢失，本次命令不执行，seal 也修不好（seal 要口令校验，"
+                        "口令校验要读密钥）。请从 git 恢复 ats_guard_key.json 与 "
+                        "ats_guard_manifest.json；确认要全新开始，须由人先手动删除这两个"
+                        "文件，再重跑 init --confirm 与 seal --confirm")
+            else:
+                hint = ("核心脚本未通过看门狗校验，本次命令不执行。确认改动可信后由人执行 "
+                        "seal --confirm 重封签")
+            return {"code": EXIT_DENIED,
+                    "payload": {"error": "guard_check_failed",
+                                "detail": {"stage": "guard_verify",
+                                           "detail": payload,
+                                           "manifest": str(_guard_manifest_path(root)),
+                                           "next_action": payload.get("next_action"),
+                                           "hint": hint}}}
+    _hold_handles()
+    _freeze_policy(root)
+    return None
 
 
 # ---------------------------------------------------------------- 输出与 CLI
@@ -2675,7 +3361,8 @@ def build_parser():
 
     p = sub.add_parser("download", help="创建并启动下载任务")
     p.add_argument("--url", action="append", default=[], help="下载地址，可重复")
-    p.add_argument("--file", default=None, help="清单文件（.json / .txt / .csv）")
+    p.add_argument("--file", action="append", default=[],
+                   help="清单文件（.json / .txt / .csv），可重复；支持通配（如 manifests/*.txt）")
     p.add_argument("--out", default=None, help="输出目录，默认当前目录")
     p.add_argument("--name", default=None, help="文件名（仅单 URL 可用）")
     p.add_argument("--sha256", default=None, help="期望的 SHA-256（仅单 URL 可用）")
@@ -2795,6 +3482,11 @@ HANDLERS = {
 
 
 def main(argv=None):
+    global GUARD_PASSPHRASE
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # 看门狗参数必须在 argparse 之前剥离：它们是跨子命令的全局开关
+    skip_guard, guard_approval, passphrase, argv = _extract_guard_flags(argv)
+    GUARD_PASSPHRASE = passphrase or None
     parser = build_parser()
     args = parser.parse_args(argv)
     if not args.command_name:
@@ -2804,9 +3496,17 @@ def main(argv=None):
         print(json.dumps({"error": "missing_approval_id",
                           "hint": "使用 approve <id>... 或 --all"}, ensure_ascii=False))
         return EXIT_USAGE
-    root = ats_root(args.root)
+    root = ats_root(_pre_scan_root(argv) or args.root)
+    denied = guard_handshake(root, skip_guard=skip_guard, guard_approval=guard_approval)
+    if denied is not None:
+        # 准入失败时只放行 approve：否则「跳过看门狗」这类审批单永远批不了，自己锁死自己
+        if args.command_name != "approve":
+            return print_json(denied["payload"], denied["code"])
+        log_event(root, "guard_bypassed_for_approve",
+                  stage=(denied["payload"].get("detail") or {}).get("stage"))
     handler = HANDLERS[args.command_name]
     return handler(root, args) or EXIT_OK
+
 
 
 if __name__ == "__main__":

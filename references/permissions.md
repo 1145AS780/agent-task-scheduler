@@ -1,4 +1,4 @@
-# 权限与审批 — agent-task-scheduler v2.9.1
+# 权限与审批 — agent-task-scheduler v3.1.1
 
 本文描述 L0-L3 分级、策略上限、白名单、审批闭环与存活租约免审。实现见 `scripts/ats.py` 的
 `policy()`、`whitelist_match()`、`lease_state()`、`lease_autonomy()`、`permission_gate()`、
@@ -279,7 +279,7 @@ python scripts/ats.py policy --json
 - 改了空格、改了参数、改了路径 → `mismatch`
 - 因此**不要在审批后动态拼接命令**；审批生成时就应当把最终命令确定下来
 - **指令包（`pack`）**：审批绑定的是**条目自身的 `command`**（切分后 `strip()` 的原文），不是整包文本；`pack` 本身不产生审批，也不豁免任何条目
-- **`@enc` 钩子**：创建时钩子已从命令文本剥离，审批与白名单匹配的都是**主命令**；钩子不单独过权限门，随任务等级一起执行
+- **`@enc` 钩子**：等级推导、预检、白名单与审批绑定用的都是「主命令 + `@enc` 参数」的完整原文（`hook_gate_text`），所以 `echo hi @enc x; del f` 登记为 L3 而不是按 `echo hi` 当 L0；钩子执行不经 shell（参数分词后走 argv），参数里的 `;` `|` `>` 只是普通字符
 
 ### 6.5 拒绝
 
@@ -435,6 +435,8 @@ check = approval_check(state.approval_id, command)
 | 项 | 说明 | 替代方案 |
 | --- | --- | --- |
 | 身份鉴权 | `actor_level` 可被任何进程声明 | 外层 CI token / 操作系统账户 / 人工二次确认 |
+| 环境变量通道的口令约束 | `ATS_ALLOW_RULES` / `ATS_ACTOR_LEVEL` / `ATS_LEASE_AUTONOMY` 等覆盖不受看门狗与口令约束，封签后依然生效（实测：加一行 `ATS_ALLOW_RULES='^echo'` 就能让 L3 任务走白名单放行） | 策略只写 `policy.json` 并用 `policy --set`（要口令）改；真正的边界放外层 |
+| 清单签名的自证 | `ats_guard_manifest.json` 无签名，改脚本后同步改清单里的摘要即可让 `verify` 通过 | 清单纳入版本控制，靠 `git diff` 发现改动；见 SKILL.md 5.7 残余边界 |
 | 租约伪造 | 租约文件是普通 JSON，能写盘就能自证 | 外层账户隔离；`lease_autonomy` 默认关闭，按需开启 |
 | 黑名单硬拒绝 | 没有全局「这些命令永不批准」的规则（`lease_autonomy.deny_rules` 只作用于租约路径） | 用 `max_level` 限制 + 白名单只放安全命令 |
 | 审批双人复核 | 单人即可批准 | 外部流程保证（如审批人必须是另一账号） |

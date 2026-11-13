@@ -1,10 +1,10 @@
 ---
 name: agent-task-scheduler
-description: A local task scheduler an AI agent starts, polls, and steers between turns. Three entity layers (Task / Plan / Schedule), L0-L3 permission tiers with human approval, intra-stage dependency orchestration with failure propagation, step retry with backoff, stall detection, run snapshots and logs, a built-in HTTP downloader with resume and integrity check, torrent and magnet download via aria2c, and automatic encoding conversion via the @enc hook. Use when a long-running command must leave the chat turn, when commands need staged orchestration, when work repeats on a schedule, when batch-downloading files or torrents, or when a high-risk command needs approval first. 中文触发：面向 AI Agent 的本地任务调度技能，Agent 能在轮次之间启动、轮询并中途转向。三层实体（Task / Plan / Schedule）、L0-L3 分级权限与人工审批闭环（有效期、批量批准、白名单放行、存活租约免审）、Stage 内依赖编排（depends_on + 失败传播）、步骤自动重试与退避、停滞检测（plan_stalled）、运行快照与调度器日志、内置 HTTP 下载器（断点续传、自动重试、完整性校验、并发与限速）、种子/磁力下载（aria2c）、命令成功后自动编码转换（`@enc` 钩子）。当需要让长时间运行的命令脱离对话轮次、分阶段编排多条命令、按周期反复执行、批量下载文件或种子、把多条命令一次性登记为指令包（仅登记不执行）、或需要审批才能执行高风险命令时使用。Licensed MIT. Source: github.com/1145AS780
-version: "2.9.1"
+description: A local task scheduler an AI agent starts, polls, and steers between turns. Three entity layers (Task / Plan / Schedule), L0-L3 permission tiers with human approval, intra-stage dependency orchestration with failure propagation, step retry with backoff, stall detection, run snapshots and logs, a built-in HTTP downloader with resume and integrity check, torrent and magnet download via aria2c, and automatic encoding conversion via the @enc hook. Use when a long-running command must leave the chat turn, when commands need staged orchestration, when work repeats on a schedule, when batch-downloading files or torrents, or when a high-risk command needs approval first. 中文触发：面向 AI Agent 的本地任务调度技能，Agent 能在轮次之间启动、轮询并中途转向。三层实体（Task / Plan / Schedule）、L0-L3 分级权限与人工审批闭环（有效期、批量批准、白名单放行、存活租约免审、启动准入看门狗与口令闸门）、Stage 内依赖编排（depends_on + 失败传播）、步骤自动重试与退避、停滞检测（plan_stalled）、运行快照与调度器日志、内置 HTTP 下载器（断点续传、自动重试、完整性校验、并发与限速）、种子/磁力下载（aria2c）、命令成功后自动编码转换（`@enc` 钩子）。当需要让长时间运行的命令脱离对话轮次、分阶段编排多条命令、按周期反复执行、批量下载文件或种子、把多条命令一次性登记为指令包（仅登记不执行）、或需要审批才能执行高风险命令时使用。Licensed MIT. Source: github.com/1145AS780
+version: "3.1.1"
 ---
 
-# agent-task-scheduler v2.9.1
+# agent-task-scheduler v3.1.1
 
 一个纯本地、无守护进程的调度器。它把「命令」分成三层实体，用文件系统作为唯一状态源，由 Agent 在轮次之间启动、轮询并中途转向。
 
@@ -176,6 +176,8 @@ python scripts/ats_ui.py --stop
 
 控制台提供只读监控、运行/停止/重试、审批与创建编排；数据仍全部读写 `ATS_ROOT`，不引入第二套状态。MCP 接入见 §12。
 
+控制台的审批与策略写入同样受口令闸门约束：口令填在页面顶部输入框，只存在浏览器内存，随请求体到达控制台进程后经 stdin 交给 `ats.py`，**绝不拼进 argv**；未填口令时按钮直接提示而不会发起请求。MCP 的 `approval_resolve` 工具按设计返回 `passphrase_required`——审批只能由持口令的人在控制台或命令行完成。
+
 ---
 
 ## 4. 命令总表
@@ -230,7 +232,7 @@ python scripts/ats_ui.py --stop
 | 参数 | 说明 |
 | --- | --- |
 | `--url URL` | 下载地址，可重复；可与 `--file` 混用 |
-| `--file PATH` | 清单：`.json`（`{"outputs": "...", "items": [...]}` 或纯数组）/ `.txt`（每行 `URL<TAB>文件名`）/ `.csv`（`url,文件名`，首行表头可省） |
+| `--file PATH` | 清单：`.json`（`{"outputs": "...", "items": [...]}` 或纯数组）/ `.txt`（每行 `URL<TAB>文件名`）/ `.csv`（`url,文件名`，首行表头可省）。**可重复**，多份清单合并成一份条目表；值里含 `*` `?` `[` 时按通配展开（如 `--file "manifests/*.txt"`） |
 | `--out DIR` | 输出目录；缺省取清单里的 `outputs`，再缺省为当前目录 |
 | `--name NAME` | 单 URL 时的文件名 |
 | `--sha256 HEX` / `--size N` | 单 URL 时的完整性期望值 |
@@ -259,6 +261,22 @@ python scripts/ats_ui.py --stop
 
 **去重与命名**：`(URL, 目标文件名)` 完全相同的条目会被合并（返回里 `deduped` 计数）；**不同 URL 撞同名文件**直接报错 `name_conflict:<name>`，避免并发覆盖。
 
+**多清单与通配**（`--file` 可重复、可通配）：
+
+```bash
+python scripts/ats.py download --file "manifests/*.txt" --out D:\dl
+```
+
+| 情形 | 结果 |
+| --- | --- |
+| 字面路径 | 原样读取，缺失报 `manifest_not_found:<path>`（与旧版行为一致） |
+| 值含 `*` `?` `[` | 由 `ats.py` 用 `glob` 展开（**不经 shell**），结果按字典序 |
+| 0 匹配 | `manifest_no_match:<pattern>`——绝不把字面量 `*.txt` 当成真实文件名 |
+| 匹配数 > 64 | `manifest_too_many:<pattern>`（`ATS_DOWNLOAD_MANIFEST_MAX` 可调） |
+| 多份清单 `outputs` 不一致且没写 `--out` | `manifest_outputs_conflict:<path>`；写了 `--out` 就以它为准 |
+
+每份清单是**独立输入**，所以多个通配值可以并存（不像 `@enc` 那样只允许一个通配——那里展开结果决定「转换哪个文件」，多值就是歧义）。`--file` 只读清单，因此**不跳过符号链接**（`@enc` 跳过是因为它的展开结果会被就地转码）。展开出的路径清单写进 `tasks/<id>/download.json` 的 `manifests` 字段，事后可核对。
+
 **stdout 协议**（`tasks/<id>/stdout.log`，JSONL）：`item_start` / `item_retry` / `item_done` / `item_error` / `summary`（最后一行，含 `total` / `succeeded` / `failed` / `bytes` / `elapsed` / `items`）。
 
 **退出码**：worker 全成功 `0`、有条目失败 `1`、spec 非法 `2`。`ats.py download --wait` 本身仍按 Task 语义返回 `0/2/4`——**下载是否全部成功看 `task.status` 或 `summary`**。
@@ -267,11 +285,11 @@ python scripts/ats_ui.py --stop
 
 ```json
 {"task_id": "dl-1a2b3c", "status": "starting", "supervisor_pid": 12345, "detached": true,
- "download": {"items": 2, "outputs": "<output-dir>", "deduped": 0,
+ "download": {"items": 2, "outputs": "<output-dir>", "deduped": 0, "manifests": 0,
               "spec": "tasks/dl-1a2b3c/download.json", "log": "tasks/dl-1a2b3c/stdout.log"}}
 ```
 
-spec 报错枚举：`missing_url` / `bad_url` / `bad_header` / `name_requires_single_url` / `digest_requires_single_url` / `too_many_items`（上限 500）/ `name_conflict:<name>` / `manifest_not_found` / `manifest_invalid` / `manifest_empty` / `item_missing_url`。
+spec 报错枚举：`missing_url` / `bad_url` / `bad_header` / `name_requires_single_url` / `digest_requires_single_url` / `too_many_items`（上限 500）/ `name_conflict:<name>` / `manifest_not_found:<path>` / `manifest_invalid:<path>` / `manifest_empty:<path>` / `item_missing_url:<path>` / `manifest_no_match:<pattern>` / `manifest_too_many:<pattern>`（上限 64）/ `manifest_outputs_conflict:<path>`。清单相关错误一律带 `:<路径或模式>`，多份清单时能直接看出是哪一份。
 
 ### 4.4 种子下载器 `ats.py torrent`
 
@@ -361,7 +379,11 @@ python scripts/ats.py create enc-logs --level L1 \
 | 失败语义 | 钩子退出码非 0 → 任务整体 `failed`，任务 `exit_code` 取钩子退出码；Plan 层按既有失败传播规则处理 |
 | 日志与事件 | 钩子输出写 `tasks/<id>/hook-enc.log`；发事件 `task_post_hook`（含 `status` / `exit_code` / `error_type`） |
 | 转换器定位 | 环境变量 `ATS_ENCODER_PATH` > `<task cwd>/tools/encoding_converter.py` > `<当前目录>/tools/encoding_converter.py`；都不存在 → `encoder_not_found` |
-| 参数归属 | `@enc` 之后的参数原样交给转换器（`path` 是**位置参数**，不是 `--path`） |
+| 参数归属 | `@enc` 之后的参数交给转换器（`path` 是**位置参数**，不是 `--path`）；路径含空格时用单/双引号包裹，引号本身不进 argv |
+| 参数执行方式 | 按空白分词（单/双引号包裹的段保持完整）后作为 **argv 列表**交给转换器，**不经 shell**：参数里的 `;` `|` `>` `&` `$` 都只是普通字符，不会变成第二条命令 |
+| 通配路径 | 钩子不经 shell，`*` 不会自动展开，由 `ats.py` 用 `glob` 按任务 `cwd` 展开（`**` 需显式写）。只展开**位置参数**且含 `*` `?` `[` 的 token，flag 及其值不动，且以 `-` 开头的 token 永不当值（`--dry-run --from gbk` 不会把 `--from` 记成值）；两个通配、或通配与手写路径混写 → `hook_glob_ambiguous`；0 匹配 → `hook_glob_no_match`（绝不把字面量当文件名）；超过 256 个 → `hook_glob_too_many`（`ATS_HOOK_GLOB_MAX` 可调）；跳过符号链接（`skipped_symlinks`） |
+| 通配展开后执行 | 每个匹配路径**各调一次转换器**（转换器契约是单个位置路径），按字典序、遇非 0 即停：多目标时 `post_hook.runs` 记逐条 `path`/`exit_code`、`failed_on` 记第一个失败的（单目标不写 `runs`）；`timeout` 是每次调用的超时；`hook-enc.log` 头部写 `glob <模式> -> N path(s)` 与完整清单 |
+| 与权限门的关系 | 等级推导、预检、审批绑定看到的都是「主命令 + `@enc` 参数」的完整原文，所以 `echo hi @enc x; del f` 会被抬到 L3 而不是按 `echo hi` 当 L0 直通 |
 | 坏语法 | `create` 报 `bad_hook`；`pack` 报 `bad_hook_item`（整包不落盘）；退出码均为 2 |
 
 钩子只是把转换器登记到任务上，转换器本身仍是独立 CLI，可单独使用：
@@ -434,6 +456,19 @@ python tools/encoding_converter.py logs --detect --to utf-8 --dry-run
 | `lease_autonomy` | `ATS_LEASE_AUTONOMY` | 租约免审配置，JSON 字符串；坏值一律回落关闭 |
 | `lease_file` | `ATS_LEASE_FILE` | 租约文件路径，默认 `<root>/../temp/py_lease.json`，不存在则回落 `<root>/../.autopilot/temp/py_lease.json` |
 
+**环境变量这条通道不受口令闸门约束**（实测）：`policy.json` 封签后会被 `verify`
+比对摘要，`policy --set` 要口令，但进程环境是调用方自己的东西，看门狗看不到也拦不住。
+在已封签的 root 上，同一条 L3 任务：
+
+```bash
+python scripts/ats.py run e1                       # → approval_required
+$env:ATS_ALLOW_RULES='^echo'; python scripts/ats.py run e1   # → status: starting（白名单放行）
+```
+
+所以「封签」锁住的是 `policy.json` 与核心脚本，**锁不住 `ATS_ACTOR_LEVEL` /
+`ATS_ALLOW_RULES` / `ATS_LEASE_AUTONOMY` 这类覆盖**。要真正的边界，只能靠外层
+（操作系统账户、CI token、人工二次确认），或干脆不把策略写在环境里。
+
 ### 5.4 审批闭环
 
 ```bash
@@ -449,6 +484,10 @@ python scripts/ats.py approve ap-3f2a91c4 --reject --note "窗口期不允许"
 # 3. 用审批重跑
 python scripts/ats.py run deploy1 --approval ap-3f2a91c4
 ```
+
+`approve` 与 `policy --set` 都要口令（见 5.7）：非交互通道必须加
+`--passphrase-stdin`，由标准输入送一行口令；否则返回 `passphrase_required`。
+`--reject` 同样受此约束。
 
 审批记录字段（`approvals/<id>.json`）：
 
@@ -510,6 +549,79 @@ python scripts/ats.py run deploy1 --approval ap-3f2a91c4
 - **租约授予由用户勾选**：`py_consent.py` 第 4 题选「否 / 仅 L2 / 含 L3」，自定义文本**不构成授予**
 - **随租约消亡**：窗口关闭或心跳过期后，下一次权限门立刻回到审批流程，无需清理配置
 - **只读判定**：本调度器只读租约文件，不写、不删、不杀进程；撤销仍由用户关窗完成
+
+### 5.7 看门狗与口令闸门
+
+启动准入与策略/审批写入由独立看门狗 `scripts/ats_guard.py` 把关。它只做两件事：
+比对核心文件 SHA256、校验口令。零依赖、零 ctypes、零临时握手文件，全部通过
+`subprocess` 抓 stdout 与退出码，避免杀软启发式误判。
+
+| 动作 | 命令 | 要口令 | 说明 |
+| --- | --- | --- | --- |
+| 校验基线 | `ats_guard.py verify` | 否 | `ats.py` 每次启动自动跑，不通过即退出，除 `approve` 外的子命令都不执行 |
+| 建密钥 | `ats_guard.py init --confirm` | 是 | 只建一次；清单或密钥任一已存在时拒绝，没有「重置」入口 |
+| 重建基线 | `ats_guard.py seal --confirm` | 是 | 改过核心脚本或策略后由人执行 |
+| 只验口令 | `ats_guard.py auth` | 是 | 不写任何文件 |
+| 审批 | `ats.py approve <id>` | 是 | `--reject` 同样要口令 |
+| 改策略 | `ats.py policy --set <k> <v>` | 是 | 任何 `--set` 都会重封签，而重封签要口令 |
+
+**唯一例外是 `approve`**：准入失败时 `approve` 照常执行，并记一条
+`guard_bypassed_for_approve`（带 `stage`）。理由是不能自己锁死自己 —— 审批是解套的
+唯一手段，如果校验失败连审批都不许批，「跳过看门狗」的审批单就永远批不了。
+放行的是「走到审批逻辑」，不是「免口令」：`approve` 仍要口令，没有密钥文件时只会
+返回 `passphrase_required`（实测：无清单 root 里 `list` 返回 `manifest_missing`，
+`approve ap-x` 返回 `passphrase_required`）。
+
+**首次使用有顺序**：全新 root 里没有清单也没有密钥，此时任何子命令都会被拒绝，
+必须先 `init --confirm`（建密钥）再 `seal --confirm`（建基线）——顺序反了会在
+`seal` 阶段撞 `key_missing`，因为 `seal` 要靠密钥校验口令。两种缺失情形的提示
+分开：密钥还在、只有清单丢了 → 提示去 `seal`；两者都没有 → 提示先 `init`。
+拒绝响应里的 `next_action` 字段就是这个判断结果（`seal` / `init` / `restore_key`）。
+
+第三种情形单独说：**只有密钥丢了、清单还在**，这是唯一「照着 `seal` 走也修不好」的
+失败 —— `seal` 要先校验口令，口令校验要读密钥文件，所以 `seal` 必然返回
+`key_missing`；`init` 又会因为清单已存在而返回 `already_initialized`。此时
+`verify` 的 `next_action` 是 `restore_key`，出路只有两条：从 git 恢复
+`ats_guard_key.json`（与清单一起），或由人手动删掉这两个文件后重跑 `init` + `seal`。
+`ats.py` 的准入失败提示同步改成这条，不再误导人去重封签（实测：删密钥后
+`verify` 报 `missing_file: ats_guard_key.json`，`seal` 报 `key_missing`，
+`init` 报 `already_initialized`）。
+
+口令只经 `--passphrase-stdin` 从标准输入读一行，**绝不进 argv**（argv 会留在
+进程列表与 shell 历史里）。终端里直接交互输入亦可；stdout 被管道抓取时一律
+快速失败，不调 `getpass`，否则会卡住等控制台输入。
+
+密钥文件 `ats_guard_key.json` 只存 PBKDF2-HMAC-SHA256 的盐与摘要（不存明文），
+它自身的 SHA256 也记进清单 —— 换掉密钥等于换口令，`verify` 会发现。
+它和 `ats_guard_manifest.json` 都应纳入版本控制：丢了只能靠 git 恢复。
+
+**`--skip-guard`（仅限人类紧急调试）**：跳过看门狗时不会免审，而是改走另一条
+更严的闸门 —— 必须先拿到 `__ats_guard_skip__` 的 L3 审批，再带
+`--guard-approval <id>` 重试，两个参数缺一不可。等级下限由
+`policy.guard_skip_level` 控制，但代码里强制 `max(L3, 该值)`，写 L0 也会被抬回 L3。
+跳过之后执行等级**不降级**：`--skip-guard` 只跳过完整性校验，不放宽任何命令的等级判定。
+
+残余边界（不隐瞒，四条都实测过）：
+
+1. **清单是信任根，但它本身没有签名。** `verify` 只回答「脚本摘要与清单一致」，不回答
+   「清单是不是人写的」。把 `ats.py` 改一行、再把清单里 `files.ats.py` 的摘要改成新值，
+   `verify` 会返回 `"ok": true, "checked": 9` —— 篡改照样过关。同理
+   `ATS_GUARD_MANIFEST` 环境变量能把清单指到任意路径，调用方自己就能换锚点。
+   清单没签名这件事代码补不上（验证用的密钥必须能读，能读就能伪造），**只能靠 git**：
+   `ats_guard_manifest.json` 的每次改动都该在 `git diff` 里被人看见。
+2. **同权限的进程可以删掉清单与密钥后重跑 `init` + `seal` 重建基线。** 本地文件权限
+   相等时代码拦不住删除，这条只能由人守。运行期句柄只挡住删除与 rename 替换
+   （实测 `PermissionError`），**原地覆写内容不被阻止** —— 共享写是允许的，这条靠
+   「后续新启动的进程都要过 verify」兜住。
+3. **环境变量覆盖不受口令闸门约束**（见 5.3）：`ATS_ALLOW_RULES` 一行就能让 L3 任务
+   走白名单放行，看门狗全程「校验通过」。
+4. **密钥文件丢失不可自愈。** `seal` 要靠密钥校验口令，密钥没了 `seal` 必然
+   `key_missing`，`init` 又因清单存在而拒绝 —— 这不是 bug，是「密钥只建一次」的
+   代价。设计上把它当成需要人介入的运维事件（从 git 恢复或手动删两文件重建），
+   所以 `verify` 用 `next_action: restore_key` 明说，而不是给一条跑不通的命令。
+
+所以本机制实际防的是「**不经口令就自行批准**」与「**改了核心脚本却没改清单**」，
+不是「AI 一定拿不到高等级」—— 后者要外层账户隔离才做得到。
 
 ---
 
@@ -684,7 +796,7 @@ python scripts/ats_plan.py history ci1 --plan ci1-a3 --logs --lines 30
 | 0 | 正常 | 查询成功、执行完成、即使业务命令非 0（业务退出码在 JSON 的 `exit_code`） |
 | 2 | 参数/spec 非法 | spec 缺字段、`every` 非正、缺 `--approval` |
 | 3 | 不存在或状态冲突 | task 不存在、重复 submit、running 时 delete |
-| 4 | 权限不足 | `denied_policy`、`approval_required`、审批身份不足 |
+| 4 | 权限不足 | `denied_policy`、`approval_required`、审批身份不足、`passphrase_required` |
 
 注意：Step/命令失败**不**改变调度器退出码，成功与否看 JSON 的 `status` / `exit_code`。这样 Agent 不会因为业务失败而误判调度器出错。
 
@@ -902,6 +1014,7 @@ HTTP 层额外状态码：`403`（`forbidden_host` / `forbidden_origin`）、`41
 | BT / 磁力 | 支持（`torrent`） | 经 aria2c 下载，需单独安装；单文件 HTTP 多段并发仍不支持 |
 | 指令包自动执行 | 不实现 | `pack` 只登记文本（全部 `pending`），不解析、不运行；必须逐条 `run` |
 | 钩子类型 | 仅 `enc` | 目前只支持 `@enc` 编码转换钩子；不支持任意「成功后追加命令」的通用链 |
+| 钩子作用范围 | 仅 Task 层（`create` / `pack`） | Plan 的 Step 不做 `@enc` 拆分：Step 走 `shell=True` 直接执行，没有钩子后置。为免「以为转换发生了、其实只是把 `@enc ...` 当普通参数传过去」，`submit_plan` / `submit_schedule` 校验阶段直接报 `stage[..].step[..].hook_not_supported` 并整单拒绝；转码要么拆成独立 Task（`create` 带 `@enc`），要么在 Step 命令里显式调 `tools/encoding_converter.py` |
 | 按日志文本自动停止 | 不实现 | 停止只依据退出码（含超时），不扫描 `stdout.log` / `stderr.log` 内容 |
 | MCP 端点鉴权 | 仅本机回环 + Host/Origin 校验 | 无 token / 账户鉴权；开启开关等于授权本机任意进程执行命令，不是安全边界 |
 | MCP 服务端推送 | 不实现 | 只做 Streamable HTTP 的 `POST` / `DELETE`；`GET /mcp` 回 405，不提供 SSE 推送流 |
@@ -912,6 +1025,10 @@ HTTP 层额外状态码：`403`（`forbidden_host` / `forbidden_origin`）、`41
 
 | 版本 | 变更 |
 | --- | --- |
+| 3.1.1 | `download --file` 支持**通配与多份清单**：`--file` 改为可重复，值里含 `*` `?` `[` 时由 `ats.py` 用 `glob` 展开（仍不经 shell），展开结果按字典序并写入 `tasks/<id>/download.json` 的 `manifests` 字段；0 匹配报 `manifest_no_match:<pattern>`（不再把字面量当文件名）、超 64 份报 `manifest_too_many:<pattern>`（`ATS_DOWNLOAD_MANIFEST_MAX` 可调）；多份清单 `outputs` 不一致且未写 `--out` 时报 `manifest_outputs_conflict:<path>`（写了 `--out` 以它为准，不猜）；清单类错误统一追加 `:<路径或模式>` 便于定位；`--file` 只读清单故**不跳过符号链接**（与 `@enc` 的差别已写明），多个通配值可并存（每份清单是独立输入）；新增 3 条用例（`download_manifest_glob_merges` / `download_manifest_glob_no_match` / `download_manifest_outputs_conflict`，全量 52 条） |
+| 3.1.0 | `@enc` 钩子支持**通配路径**（一条任务覆盖多个文件）：钩子不经 shell、`*` 不会自动展开，改由 `ats.py` 用 `glob` 按任务 `cwd` 展开；只展开位置参数里的 `*` `?` `[`，flag 及其值不动（`--include *.log` 原样传给转换器）；两个通配或通配与手写路径混写报 `hook_glob_ambiguous`，0 匹配报 `hook_glob_no_match`（不再把字面量当文件名交给转换器，避免凭空造文件），超 256 个报 `hook_glob_too_many`（`ATS_HOOK_GLOB_MAX` 可调），符号链接跳过并计数；展开后按字典序**逐条调用**转换器、遇非 0 即停，`post_hook` 新增 `glob`/`expanded`/`skipped_symlinks`/`runs`/`failed_on`，`hook-enc.log` 头部写展开清单可事后核对；`timeout` 为每次调用超时；同时修正参数角色判定：以 `-` 开头的 token 永不被当成「值」，否则 `--dry-run --from gbk --to utf-8 logs/*.log` 会把 `--from` 记成值、`gbk` 记成位置参数而误报 `hook_glob_ambiguous`；新增 5 条用例（`hook_glob_expands_multiple_files` / `hook_glob_no_match_fails_loudly` / `hook_glob_rejects_mixed_paths` / `hook_glob_skips_flag_values` / `hook_glob_survives_valueless_flags`，全量 49 条） |
+| 3.0.1 | 修复 `@enc` 钩子绕过权限门（安全）：修复前钩子参数直接拼进 `shell=True` 的命令串执行，`echo hi @enc x; del f` 会按 `echo hi` 登记成 L0 直通，钩子段却执行任意 shell；现在钩子参数按空白分词（引号包裹段保持完整）后以 **argv 列表**交给转换器、不经 shell，且等级推导 / 预检 / 审批绑定统一改用「主命令 + `@enc` 参数」的完整原文（`hook_gate_text`），同一命令实测被抬到 L2/L3 并命中 `denied_injection`；同时修正 `artifact_digests` 把钩子参数里的 `.py` 当执行体绑定、导致转码目标一改就误报 `artifact_changed` 的问题（现在只扫 `@enc` 之前的主命令）；新增 3 条用例（`hook_args_do_not_run_through_shell` / `hook_args_enter_gate_text` / `hook_target_not_bound_as_artifact`）；同时修正看门狗「密钥丢失」的下一步指引：`verify` 新增 `next_action: restore_key`（`seal` 在无密钥时必然 `key_missing`、`init` 又因清单存在而 `already_initialized`，原来只提示「重封签」是条跑不通的路），`ats.py` 准入失败提示同步改写；新增 2 条用例（`guard_key_loss_points_to_restore` / `guard_manifest_loss_guides_to_seal`）；并给 Plan 层补上钩子边界：Step 走 `shell=True` 直接执行、没有钩子后置，原来写 `@enc` 会被静默当普通参数传过去（实测该 Step 还报 `succeeded`，转换根本没发生），现在 `submit_plan` / `submit_schedule` 校验阶段报 `stage[..].step[..].hook_not_supported` 并整单拒绝；新增 1 条用例（`plan_step_rejects_hook`）；另补 1 条用例锁定「钩子段编码载荷也解码」（`hook_args_decoded_payload_raises_level`，实测钩子参数里写 `powershell -EncodedCommand <b64>` 会被解出 `Remove-Item` 并抬到 L3，全量 44 条） |
+| 3.0.0 | 新增独立看门狗 `scripts/ats_guard.py`（零依赖、零 ctypes、零临时握手文件，只用子进程 + stdout JSON 与退出码通信）：`ats.py` 每次启动先做准入握手，比对核心文件 SHA256 与 `ats_guard_manifest.json`，不符即退出、除 `approve` 外的子命令都不执行（`approve` 放行以免自锁，仍要口令）；`ats.py` 同时自验 `ats_guard.py` 摘要，不把信任完全委托给看门狗；子命令 `verify` / `init` / `seal` / `auth` / `self`；PBKDF2-HMAC-SHA256 口令闸门（`ats_guard_key.json` 只存盐与摘要、密钥文件摘要入清单、`init` 在清单或密钥任一已存在时拒绝、无重置入口），`approve` / `policy --set` / `init` / `seal` 一律要口令且只从 `--passphrase-stdin` 读（绝不进 argv）；运行期持核心脚本只读句柄并冻结 `policy.json`（跨进程删除/替换被阻塞，同进程不持句柄以免 `os.replace` 自锁）；`--skip-guard` 仅限人类紧急调试，强制 `__ats_guard_skip__` 的 L3 审批、`guard_skip_level` 只允许调高、跳过不降低执行等级；`ats_plan.py` 同步启动准入；新增 16 条看门狗与口令闸门用例（全量 37 条）；`tests/lint.py` 改用内存 `compile()` 避免 pyc 落盘触发杀软误报 |
 | 2.9.1 | 新增 MCP 适配与本地控制台：`scripts/ats_mcp.py`（stdio，客户端拉起，16 个工具，协议 `2025-06-18` / `2025-03-26` / `2024-11-05`）、`scripts/ats_mcp_http.py`（控制台进程内的 Streamable HTTP 端点，默认关闭，`--mcp-port` 默认控制台端口 + 1，`confirm:true` 才允许开启，只绑 `127.0.0.1` 并校验 Host / Origin）、`scripts/ats_ui.py` 本地 Web 控制台（`--ensure` / `--status` / `--stop`）与 `scripts/ats_ui.cmd` 一键启动（修正为指向 `ats_ui.py`） |
 | 2.8 | 新增「存活租约免审」`lease_autonomy`：`policy.json` / `ATS_LEASE_AUTONOMY` 配置 `enabled` / `max_level` / `rules` / `deny_rules`，`lease_file` / `ATS_LEASE_FILE` 指定租约路径（默认 `<root>/../temp/py_lease.json`，不存在则回落 `<root>/../.autopilot/temp/py_lease.json`）；`permission_gate` 与 `gate_operation` 在身份判定之后、审批之前插入该路径，放行写 `status=approved` 的留痕审批（`auto_approved=true`、`resolved_by=py_lease:<令牌>`）不投待办；判定为五道关（总闸 / 等级上限 / 租约存活 / 命令白名单 / 租约自带约束），任一不满足退回审批，坏配置一律回落关闭；`policy` 命令新增 `lease` 段报告租约状态；`py_consent.py` 第 4 题把授予范围变成用户可勾选项 |
 | 2.7 | 新增 `@enc` 后缀钩子：命令文本末尾追加 `@enc <转换器参数>` 即把编码转换登记为任务的 `post_hook`，主命令退出码为 0 才执行（转换器 `tools/encoding_converter.py`，可用 `ATS_ENCODER_PATH` 覆盖）；钩子失败则任务 `failed` 且 `exit_code` 取钩子码，日志 `hook-enc.log`、事件 `task_post_hook`；`create` / `pack` 均支持，坏语法报 `bad_hook` / `bad_hook_item`；转换器仍可独立 CLI 使用 |
