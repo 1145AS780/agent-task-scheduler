@@ -1759,8 +1759,9 @@ def extend_check_scans_plugin_source():
         expect(pf.get("confidence") in ("low", "medium", "high"),
                "应给出置信度，实际 %r" % pf.get("confidence"))
         sources = pf.get("sources") or []
-        entry = str(Path(sb.root) / "extend" / "danger" / "__init__.py")
-        expect(any(s.get("file") == entry and s.get("ok") for s in sources),
+        entry = (Path(sb.root) / "extend" / "danger" / "__init__.py").resolve()
+        expect(any(s.get("file") and Path(s["file"]).resolve() == entry and s.get("ok")
+                   for s in sources),
                "应真的解析了插件入口 %s，实际 sources=%r" % (entry, sources))
     finally:
         sb.cleanup()
