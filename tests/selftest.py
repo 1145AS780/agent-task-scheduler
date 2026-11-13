@@ -77,7 +77,10 @@ class Sandbox:
     """一次用例的隔离环境：独立的 ATS_ROOT 与临时目录。"""
 
     def __init__(self):
-        self.dir = Path(tempfile.mkdtemp(prefix="ats-selftest-"))
+        # 先规范化临时目录：macOS 的 /var 是 /private/var 的软链，Windows 的 TEMP
+        # 在 CI 上是 8.3 短名（RUNNER~1）。脚本侧对路径做 resolve()，这里若不规范化，
+        # 断言就会拿短名/软链名去比长名，在 macos-latest 和 windows-latest 上假红。
+        self.dir = Path(tempfile.mkdtemp(prefix="ats-selftest-")).resolve()
         self.root = self.dir / "root"
         self.auto_seal = True
         self.manifest = self.root / "ats_guard_manifest.json"
