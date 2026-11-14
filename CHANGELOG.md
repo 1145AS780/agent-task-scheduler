@@ -53,6 +53,30 @@ GitHub Releases 和从 SKILL.md 会读到两套说法。
 - **[references/versioning.md](references/versioning.md)**：版本号规范入库，含进位条件、
   发布纪律与 19 处版本号落点清单。
 - **[CHANGELOG.md](CHANGELOG.md)**：本文件，此前版本历史只写在 `SKILL.md` §15。
+- **签证（Visa）：带配额的完整性豁免**（`ats_guard.py` 新子命令 + `ats.py` 握手新分支，
+  规范见 `SKILL.md` §5.7.1）。改完核心脚本还要跑测试，但重封签要口令——签证就是这条
+  路径：**只跳过 `digest_mismatch` 这一关，其它闸门一律照旧**。
+  - 存储：`<root>/visas/<visa_id>.json`，字段 `visa_id`（`v-` + 8 位 hex）、`number`
+    （剩余次数）、`created_at`、`expires_at`、`note`。`expires_at` 必然存在，
+    没有「永久签证」。
+  - 签发：`ats_guard.py visa issue --number N --time 分钟 [--note TEXT]`，
+    **必须持人类口令**（`--passphrase-stdin`）；`--number` 缺省 1、`--time` 缺省 30 分钟。
+  - 管理：`visa list` 只列未过期且 `number > 0` 的签证（顺带报 `corrupt` 项），
+    `visa revoke <visa_id>` 提前报废，`visa consume --id <visa_id>` 供握手内部扣减。
+  - 拦截：`ats.py` 握手在 `verify` 失败时先判 `_visa_scope`——**仅当全部 problem 都是
+    `.py` 的 `digest_mismatch`** 才算覆盖；清单缺失 / 版本不符 / 空清单 / `policy.json`
+    或密钥被改 / 新增未封签文件，任一命中即不覆盖，仍报 `guard_check_failed`。
+  - 放行：读 `--visa-id`，再读环境变量 `ATS_VISA_ID`（命令行优先）。未带 ID →
+    `guard_check_failed`；ID 不存在 / 非法 / 过期 → `visa_invalid`（`reason` 为
+    `not_found` / `bad_id` / `expired`）；未过期且 `number > 0` → 放行并**原子扣减**
+    （独立锁文件互斥，读-改-写一次落盘）。扣到 0 当场删文件并向 stderr 打印
+    `[Visa] 配额已耗尽，签证已销毁，后续执行请重新封签或申请新签证。`
+  - 边界：签证期间再改代码，哈希继续不一致，签证依然有效（这正是它的用途）；
+    **绝不绕过审批门**（L3 / `deny_rules` / `guard_skip_level` 全部原样生效）；
+    不在覆盖范围内时不扣配额，免得白烧次数。
+  - `--visa-id` 与 `--guard-approval` / `--skip-guard` / `--passphrase-stdin` 一样由
+    `_extract_guard_flags` 在 argparse 之前剥离，子命令位置随意；`ats_plan.py` 复用同一套
+    握手函数，签证自动生效。
 
 ### 变更
 
@@ -83,9 +107,13 @@ GitHub Releases 和从 SKILL.md 会读到两套说法。
 ### 发版验证
 
 - `tests/lint.py`：13 个文件通过静态检查，退出码 0
-- `tests/selftest.py`：**68/68** 通过，退出码 0（全部在独立临时 `ATS_ROOT` 沙箱运行，
+- `tests/selftest.py`：**75/75** 通过，退出码 0（全部在独立临时 `ATS_ROOT` 沙箱运行，
   不污染仓库运行态）
-- 信任基线：`ats_guard.py verify` → `"ok": true`、`checked: 10`、`problems: []`
+- 信任基线：本次改动了 `scripts/` 下三个 `.py`，**发版后、重封签前** `ats_guard.py verify`
+  如实返回 `"ok": false`、`checked: 10`、`problems` 为 `ats.py` / `ats_guard.py` /
+  `ats_plan.py` 三条 `digest_mismatch`。这是预期的失配（不是缺陷），按本节开头的
+  升级必读重封签后才会回到 `"ok": true`、`problems: []`。要临时跑测试又不想重封签，
+  用签证（`visa issue`，见 `SKILL.md` §5.7.1），它只豁免这一关。
 
 ---
 

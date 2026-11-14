@@ -41,7 +41,21 @@
     python ats_guard.py init   [--root DIR] --confirm [--passphrase-stdin]
     python ats_guard.py auth   [--root DIR] [--passphrase-stdin]
     python ats_guard.py self
+    python ats_guard.py visa issue --number N --time MINUTES --passphrase-stdin [--note TEXT]
+    python ats_guard.py visa list
+    python ats_guard.py visa revoke <visa_id>
+    python ats_guard.py visa consume --id <visa_id>
 
+========================= 签证（Visa）=========================
+签证是「改了核心脚本、还没重封签，但要先跑一轮测试」的临时通行证，存于
+<root>/visas/<visa_id>.json，字段只有 visa_id / number / created_at /
+expires_at / note 五个。它**只跳过完整性校验**，不跳过任何审批门：
+  * 签发必须持人类口令（visa issue --passphrase-stdin），否则 AI 能自己给自己
+    发免死金牌；
+  * 每次握手消耗 1 次配额，扣减后立刻落盘，扣到 0 时文件当场删除；
+  * 签证只在 ats.py 握手判定为 digest_mismatch（已有基线但摘要不符）时生效，
+    清单缺失 / 看门狗自检失败 / 策略篡改都不在签证覆盖范围内；
+  * 过期即失效，过期时间由 --time 分钟数决定，不接受「永不过期」。
 退出码：0 通过 / 2 用法错误 / 3 清单缺失 / 4 校验失败
 """
 
@@ -69,6 +83,14 @@ EXIT_OK = 0
 EXIT_USAGE = 2
 EXIT_NO_MANIFEST = 3
 EXIT_MISMATCH = 4
+
+VISA_DIR_NAME = "visas"
+VISA_DEFAULT_NUMBER = 1              # 不传 --number 时默认只放行一次
+VISA_DEFAULT_MINUTES = 30            # 不传 --time 时默认 30 分钟，绝不「永不过期」
+VISA_ID_PREFIX = "v-"
+VISA_ID_HEX_LEN = 8
+VISA_LOCK_NAME = ".visa.lock"
+VISA_LOCK_TIMEOUT = 2.0
 
 
 def sha256_file(path):
@@ -384,60 +406,324 @@ def cmd_verify(root):
     return emit(payload, EXIT_OK if not problems else EXIT_MISMATCH)
 
 
+# ---------------------------------------------------------------- 签证（Visa）
+
+def visa_dir(root):
+    return Path(root) / VISA_DIR_NAME
+
+
+def valid_visa_id(visa_id):
+    """签证 ID 只允许 v- 加 8 位小写 hex，防止用 ../ 之类拼出任意路径。"""
+    if not isinstance(visa_id, str) or not visa_id.startswith(VISA_ID_PREFIX):
+        return False
+    body = visa_id[len(VISA_ID_PREFIX):]
+    return len(body) == VISA_ID_HEX_LEN and all(c in "0123456789abcdef" for c in body)
+
+
+def visa_path(root, visa_id):
+    return visa_dir(root) / (visa_id + ".json")
+
+
+def read_visa(root, visa_id):
+    path = visa_path(root, visa_id)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:                    # noqa: BLE001
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def visa_state(record, now=None):
+    """返回 (状态, 剩余次数)。状态：valid / expired / exhausted / corrupt。"""
+    if not isinstance(record, dict):
+        return "corrupt", 0
+    try:
+        number = int(record.get("number"))
+        expires_at = int(record.get("expires_at"))
+    except (TypeError, ValueError):
+        return "corrupt", 0
+    now = int(time.time()) if now is None else int(now)
+    if expires_at <= now:
+        return "expired", number
+    if number <= 0:
+        return "exhausted", number
+    return "valid", number
+
+
+def acquire_visa_lock(root):
+    """扣减配额用独立锁文件做互斥：tmp+replace 只保证「写」原子，不保证「读改写」原子。"""
+    lock = visa_dir(root) / VISA_LOCK_NAME
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.time() + VISA_LOCK_TIMEOUT
+    while True:
+        try:
+            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            return lock
+        except FileExistsError:
+            if time.time() >= deadline:
+                return None
+            time.sleep(0.05)
+        except OSError:
+            return None
+
+
+def release_visa_lock(lock):
+    if lock is None:
+        return
+    try:
+        Path(lock).unlink()
+    except OSError:
+        pass
+
+
+def cmd_visa_issue(root, number, minutes, note, passphrase):
+    """签发签证：必须持人类口令，否则 AI 就能自己给自己发免死金牌。"""
+    auth = check_passphrase(root, passphrase)
+    if not auth.get("ok"):
+        return emit({"ok": False, "error": "passphrase_required", "detail": auth,
+                     "hint": "签发签证要人类口令（密钥文件：%s）。用 --passphrase-stdin "
+                             "从标准输入提供一行，或直接在终端交互输入" % key_path(root)},
+                    EXIT_MISMATCH)
+    if number is None:
+        number = VISA_DEFAULT_NUMBER
+    if minutes is None:
+        minutes = VISA_DEFAULT_MINUTES
+    try:
+        number = int(number)
+        minutes = int(minutes)
+    except (TypeError, ValueError):
+        return emit({"ok": False, "error": "bad_number",
+                     "hint": "--number 与 --time 必须是正整数，--time 单位是分钟"},
+                    EXIT_USAGE)
+    if number < 1 or minutes < 1:
+        return emit({"ok": False, "error": "bad_number",
+                     "hint": "--number 与 --time 必须 >= 1，--time 单位是分钟"},
+                    EXIT_USAGE)
+    created_at = int(time.time())
+    record = {"visa_id": "", "number": number, "created_at": created_at,
+              "expires_at": created_at + minutes * 60, "note": note or ""}
+    for _ in range(8):
+        candidate = VISA_ID_PREFIX + os.urandom(4).hex()
+        if not visa_path(root, candidate).exists():
+            record["visa_id"] = candidate
+            break
+    if not record["visa_id"]:
+        return emit({"ok": False, "error": "visa_id_collision",
+                     "hint": "生成签证 ID 连续冲突，稍后重试"}, EXIT_MISMATCH)
+    write_manifest(visa_path(root, record["visa_id"]), record)
+    return emit({"ok": True, "visa_id": record["visa_id"], "number": number,
+                 "created_at": created_at, "expires_at": record["expires_at"],
+                 "expires_iso": time.strftime("%Y-%m-%dT%H:%M:%S",
+                                              time.localtime(record["expires_at"]))
+                 if record["expires_at"] > 0 else "",
+                 "note": record["note"],
+                 "path": str(visa_path(root, record["visa_id"]))}, EXIT_OK)
+
+
+def cmd_visa_list(root):
+    """列出有效签证与剩余配额；过期/损坏的单独放在 invalid 里，便于排查。"""
+    base = visa_dir(root)
+    visas = []
+    invalid = []
+    if base.is_dir():
+        for path in sorted(base.glob("*.json")):
+            record = read_visa(root, path.stem)
+            if record is None:
+                invalid.append({"visa_id": path.stem, "status": "corrupt"})
+                continue
+            state, number = visa_state(record)
+            entry = {"visa_id": record.get("visa_id") or path.stem,
+                     "number": number,
+                     "created_at": record.get("created_at"),
+                     "expires_at": record.get("expires_at"),
+                     "note": record.get("note") or "",
+                     "status": state}
+            try:
+                entry["expires_iso"] = time.strftime(
+                    "%Y-%m-%dT%H:%M:%S", time.localtime(int(entry["expires_at"])))
+            except (TypeError, ValueError, OSError):
+                pass
+            (visas if state == "valid" else invalid).append(entry)
+    return emit({"ok": True, "count": len(visas), "visas": visas,
+                 "invalid": invalid, "dir": str(base)}, EXIT_OK)
+
+
+def cmd_visa_revoke(root, visa_id):
+    if not valid_visa_id(visa_id):
+        return emit({"ok": False, "error": "bad_visa_id",
+                     "hint": "签证 ID 形如 v-0123abcd，即 v- 加 8 位小写十六进制"},
+                    EXIT_USAGE)
+    path = visa_path(root, visa_id)
+    if not path.is_file():
+        return emit({"ok": False, "error": "visa_not_found", "visa_id": visa_id,
+                     "hint": "该签证不存在，用 visa list 查看现有签证"}, EXIT_MISMATCH)
+    try:
+        path.unlink()
+    except OSError as exc:
+        return emit({"ok": False, "error": "visa_revoke_failed", "visa_id": visa_id,
+                     "detail": "%s: %s" % (type(exc).__name__, exc),
+                     "hint": "删除签证文件失败，检查文件权限后重试"}, EXIT_MISMATCH)
+    return emit({"ok": True, "visa_id": visa_id, "revoked": True,
+                 "path": str(path)}, EXIT_OK)
+
+
+def cmd_visa_consume(root, visa_id):
+    """握手期消耗一次配额：扣减立刻落盘，扣到 0 时文件当场删除（用完即焚）。"""
+    if not valid_visa_id(visa_id):
+        return emit({"ok": False, "error": "visa_invalid", "reason": "bad_id",
+                     "visa_id": visa_id,
+                     "hint": "签证 ID 形如 v-0123abcd；不带签证时只能走重封签"},
+                    EXIT_MISMATCH)
+    lock = acquire_visa_lock(root)
+    if lock is None:
+        return emit({"ok": False, "error": "visa_invalid", "reason": "locked",
+                     "visa_id": visa_id,
+                     "hint": "签证扣减被其他进程占用，稍后重试"}, EXIT_MISMATCH)
+    try:
+        record = read_visa(root, visa_id)
+        if record is None:
+            return emit({"ok": False, "error": "visa_invalid", "reason": "not_found",
+                         "visa_id": visa_id,
+                         "hint": "签证不存在或已被销毁，由人重新执行 visa issue"},
+                        EXIT_MISMATCH)
+        state, number = visa_state(record)
+        if state != "valid":
+            return emit({"ok": False, "error": "visa_invalid", "reason": state,
+                         "visa_id": visa_id,
+                         "hint": "签证已过期或配额耗尽，由人重新执行 visa issue"},
+                        EXIT_MISMATCH)
+        remaining = number - 1
+        if remaining <= 0:
+            try:
+                visa_path(root, visa_id).unlink()
+            except OSError as exc:
+                return emit({"ok": False, "error": "visa_invalid",
+                             "reason": "unlink_failed", "visa_id": visa_id,
+                             "detail": "%s: %s" % (type(exc).__name__, exc),
+                             "hint": "签证文件无法删除，为免配额被重复使用，本次不放行"},
+                            EXIT_MISMATCH)
+            # 只写 stderr：stdout 必须是纯 JSON，否则 ats.py 的 _run_guard 解析不到结果。
+            sys.stderr.write("[Visa] 配额已耗尽，签证已销毁，"
+                             "后续执行请重新封签或申请新签证。\n")
+            return emit({"ok": True, "visa_id": visa_id, "remaining": 0,
+                         "destroyed": True}, EXIT_OK)
+        record["number"] = remaining
+        write_manifest(visa_path(root, visa_id), record)
+        return emit({"ok": True, "visa_id": visa_id, "remaining": remaining,
+                     "destroyed": False, "expires_at": record.get("expires_at")}, EXIT_OK)
+    finally:
+        release_visa_lock(lock)
+
+
+def cmd_visa(root, sub, opts, passphrase):
+    if sub == "issue":
+        return cmd_visa_issue(root, opts.get("number"), opts.get("minutes"),
+                              opts.get("note"), passphrase)
+    if sub == "list":
+        return cmd_visa_list(root)
+    if sub == "revoke":
+        return cmd_visa_revoke(root, opts.get("visa_id") or "")
+    return cmd_visa_consume(root, opts.get("visa_id") or "")
+
+
+VALUE_FLAGS = {
+    "--root": "root",
+    "--number": "number",
+    "--time": "minutes",
+    "--note": "note",
+    "--id": "visa_id",
+}
+
+
 def parse_args(argv):
-    root = None
-    confirm = False
-    passphrase_stdin = False
-    action = None
+    """解析参数，返回 (action, opts)；用法错误返回 (None, None)。
+
+    --number / --time / --note / --id 只在 visa 子命令里有意义，其余子命令带上
+    也不会被消费（保持旧调用方按位置解析的兼容性）。
+    """
+    opts = {"root": None, "confirm": False, "passphrase_stdin": False,
+            "number": None, "minutes": None, "note": None,
+            "visa_id": None, "sub": None}
+    words = []
     i = 0
     while i < len(argv):
         token = argv[i]
-        if token in ("--root",):
-            if i + 1 < len(argv):
-                root = argv[i + 1]
-                i += 2
-                continue
-            return None, None, False, False
-        if token.startswith("--root="):
-            root = token.split("=", 1)[1]
-            i += 1
-            continue
         if token == "--confirm":
-            confirm = True
+            opts["confirm"] = True
             i += 1
             continue
         if token == "--passphrase-stdin":
-            passphrase_stdin = True
+            opts["passphrase_stdin"] = True
             i += 1
             continue
         if token == "--json":
             i += 1
             continue
-        if action is None and not token.startswith("-"):
-            action = token
+        name, sep, inline = token.partition("=")
+        if sep and name in VALUE_FLAGS:
+            opts[VALUE_FLAGS[name]] = inline
             i += 1
             continue
-        return None, None, False, False
-    return action, root, confirm, passphrase_stdin
+        if token in VALUE_FLAGS:
+            if i + 1 >= len(argv):
+                return None, None
+            opts[VALUE_FLAGS[token]] = argv[i + 1]
+            i += 2
+            continue
+        if token.startswith("-"):
+            return None, None
+        words.append(token)
+        i += 1
+    if not words:
+        return None, None
+    action = words[0]
+    if action == "visa":
+        if len(words) < 2 or words[1] not in ("issue", "list", "revoke", "consume"):
+            return None, None
+        if len(words) > 3:
+            return None, None
+        opts["sub"] = words[1]
+        if len(words) == 3:
+            opts["visa_id"] = words[2]
+        return action, opts
+    if len(words) > 1:
+        return None, None
+    return action, opts
+
+
+USAGE = ("python ats_guard.py verify|seal|init|auth|self "
+         "[--root DIR] [--confirm] [--passphrase-stdin] [--json]；"
+         "visa: issue --number N --time MINUTES [--note TEXT] | list | "
+         "revoke <visa_id> | consume --id <visa_id>")
 
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    action, root, confirm, passphrase_stdin = parse_args(argv)
-    if action not in ("verify", "seal", "init", "auth", "self"):
-        return emit({"ok": False, "error": "usage",
-                     "usage": "python ats_guard.py verify|seal|init|auth|self "
-                              "[--root DIR] [--confirm] [--passphrase-stdin] [--json]"},
-                    EXIT_USAGE)
-    root = resolve_root(root)
+    action, opts = parse_args(argv)
+    if action not in ("verify", "seal", "init", "auth", "self", "visa"):
+        return emit({"ok": False, "error": "usage", "usage": USAGE}, EXIT_USAGE)
+    root = resolve_root(opts.get("root"))
+    if action == "visa":
+        sub = opts.get("sub")
+        if sub not in ("issue", "list", "revoke", "consume"):
+            return emit({"ok": False, "error": "usage", "usage": USAGE}, EXIT_USAGE)
+        passphrase = ""
+        if sub == "issue":
+            passphrase = read_passphrase(opts.get("passphrase_stdin"))
+        return cmd_visa(root, sub, opts, passphrase)
     if action == "verify":
         return cmd_verify(root)
     if action == "auth":
-        return cmd_auth(root, read_passphrase(passphrase_stdin))
+        return cmd_auth(root, read_passphrase(opts.get("passphrase_stdin")))
     if action == "init":
-        return cmd_init(root, confirm, read_passphrase(passphrase_stdin))
+        return cmd_init(root, opts.get("confirm"),
+                        read_passphrase(opts.get("passphrase_stdin")))
     if action == "seal":
-        return cmd_seal(root, confirm, read_passphrase(passphrase_stdin))
+        return cmd_seal(root, opts.get("confirm"),
+                        read_passphrase(opts.get("passphrase_stdin")))
     return cmd_self()
 
 

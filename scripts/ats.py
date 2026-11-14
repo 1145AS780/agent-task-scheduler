@@ -90,6 +90,7 @@ GUARD_PASSPHRASE = None                # 启动时从 stdin 读入，绝不进 a
 GUARD_HANDLES = []                     # 运行期持有的核心脚本只读句柄
 GUARD_SKIP_ACTIVE = False              # 本次进程是否以 --skip-guard 放行
 GUARD_POLICY_SNAPSHOT = None           # 握手时冻结的策略快照
+GUARD_VISA_ENV = "ATS_VISA_ID"         # 签证 ID 的环境变量形式，与 --visa-id 等价
 
 DEFAULT_LEASE_AUTONOMY = {
     "enabled": False,
@@ -3396,14 +3397,15 @@ def _read_guard_manifest(root):
 
 
 def _extract_guard_flags(argv):
-    """剥离看门狗全局参数，返回 (skip_guard, guard_approval, passphrase, 剩余 argv)。
+    """剥离看门狗全局参数，返回 (skip_guard, guard_approval, visa_id, passphrase, 剩余 argv)。
 
-    必须在 argparse 之前调用：--skip-guard / --guard-approval / --passphrase-stdin
-    是跨子命令的全局开关，交给 argparse 会被子解析器当成未知参数。
+    必须在 argparse 之前调用：--skip-guard / --guard-approval / --visa-id /
+    --passphrase-stdin 是跨子命令的全局开关，交给 argparse 会被子解析器当成未知参数。
     口令只从 stdin 读，绝不进 argv（argv 会留在进程列表与 shell 历史里）。
     """
     skip_guard = False
     guard_approval = None
+    visa_id = None
     passphrase_stdin = False
     rest = []
     i = 0
@@ -3424,19 +3426,32 @@ def _extract_guard_flags(argv):
             guard_approval = token.split("=", 1)[1]
             i += 1
             continue
+        if token == "--visa-id":
+            if i + 1 < len(argv):
+                visa_id = argv[i + 1]
+                i += 2
+                continue
+            i += 1
+            continue
+        if token.startswith("--visa-id="):
+            visa_id = token.split("=", 1)[1]
+            i += 1
+            continue
         if token == "--passphrase-stdin":
             passphrase_stdin = True
             i += 1
             continue
         rest.append(token)
         i += 1
+    if visa_id is None:
+        visa_id = (os.environ.get(GUARD_VISA_ENV) or "").strip() or None
     passphrase = ""
     if passphrase_stdin:
         try:
             passphrase = (sys.stdin.readline() or "").rstrip("\r\n")
         except Exception:                # noqa: BLE001
             passphrase = ""
-    return skip_guard, guard_approval, passphrase, rest
+    return skip_guard, guard_approval, visa_id, passphrase, rest
 
 
 def _pre_scan_root(argv):
@@ -3581,10 +3596,69 @@ def _guard_skip_gate(root, approval_id):
                                 "跳过看门狗不会降低任何命令的执行等级"}}
 
 
-def guard_handshake(root, skip_guard=False, guard_approval=None):
+def _visa_scope(payload):
+    """判定这次 verify 失败是否落在签证覆盖范围内，返回 (是否覆盖, 说明)。
+
+    只认核心 .py 的 digest_mismatch：清单缺失、清单版本不符、空清单、
+    policy.json / 密钥文件被动过、新增未封签文件，全都超出签证语义
+    —— 签证买的是「代码改了还没重封签」，不是「整条信任链都可以不一致」。
+    """
+    if payload.get("error"):
+        return False, "verify_error:%s" % payload.get("error")
+    problems = payload.get("problems")
+    if not isinstance(problems, list) or not problems:
+        return False, "no_problems"
+    files = []
+    for item in problems:
+        if not isinstance(item, dict):
+            return False, "malformed_problem"
+        if item.get("error") != "digest_mismatch":
+            return False, "problem:%s" % item.get("error")
+        name = item.get("file")
+        if not isinstance(name, str) or not name.endswith(".py"):
+            return False, "problem_file:%s" % name
+        files.append(name)
+    return True, files
+
+
+def _guard_visa_gate(root, visa_id, verify_payload, files):
+    """签证闸门：核心 .py 摘要不符时凭有效签证放行一次。
+
+    放行不放权：签证只跳过完整性校验，审批门、命令等级、策略上限全都不受影响。
+    扣减配额交给 ats_guard.py visa consume，那边带锁做读改写，扣到 0 当场删文件。
+    调用方保证 visa_id 非空、且失败范围已由 _visa_scope 确认可覆盖。
+    """
+    rc, result = _run_guard(["visa", "consume", "--id", visa_id], root)
+    if rc != EXIT_OK or not result.get("ok"):
+        log_event(root, "guard_visa_rejected", visa_id=visa_id, exit_code=rc,
+                  error=result.get("error"), reason=result.get("reason"))
+        return {"code": EXIT_DENIED,
+                "payload": {"error": "visa_invalid",
+                            "detail": {"stage": "guard_visa",
+                                       "visa_id": visa_id,
+                                       "reason": result.get("reason"),
+                                       "guard": result,
+                                       "files": files,
+                                       "verify": verify_payload,
+                                       "hint": "签证不存在 / 已过期 / 配额耗尽，"
+                                               "本次命令不执行。由人重新执行 "
+                                               "ats_guard.py visa issue 签发新签证，"
+                                               "或 seal --confirm 重封签"}}}
+    if result.get("destroyed"):
+        # 子进程的 stderr 被 _run_guard 捕获了，这里补一条到父进程控制台
+        sys.stderr.write("[Visa] 配额已耗尽，签证已销毁，"
+                         "后续执行请重新封签或申请新签证。\n")
+    log_event(root, "guard_visa_used", visa_id=visa_id,
+              remaining=result.get("remaining"), destroyed=result.get("destroyed"),
+              files=files)
+    return None
+
+
+def guard_handshake(root, skip_guard=False, guard_approval=None, visa_id=None):
     """启动准入。返回 None 表示放行；否则返回 {"code", "payload"}。
 
     顺序：--skip-guard 先过 L3 审批闸门 → 自检看门狗摘要 → 跑 verify →
+    （verify 仅因核心 .py 摘要不符失败时，凭签证放行一次并扣配额）→
     持只读句柄 → 冻结策略快照。任一步失败都 fail-closed。
     """
     global GUARD_SKIP_ACTIVE
@@ -3605,6 +3679,18 @@ def guard_handshake(root, skip_guard=False, guard_approval=None):
         if rc != EXIT_OK or not payload.get("ok"):
             log_event(root, "guard_verify_failed", exit_code=rc,
                       error=payload.get("error"))
+            covered, scope = _visa_scope(payload)
+            if covered and visa_id:
+                denied = _guard_visa_gate(root, visa_id, payload, scope)
+                if denied is None:
+                    _hold_handles()
+                    _freeze_policy(root)
+                    return None
+                return denied
+            if covered:
+                log_event(root, "guard_visa_absent", files=scope)
+            else:
+                log_event(root, "guard_visa_skipped", visa_id=visa_id, scope=scope)
             error = payload.get("error")
             if error == "manifest_missing" and payload.get("next_action") == "init":
                 hint = ("本 root 尚未建立信任根，本次命令不执行。由人先执行 "
@@ -3622,6 +3708,10 @@ def guard_handshake(root, skip_guard=False, guard_approval=None):
             else:
                 hint = ("核心脚本未通过看门狗校验，本次命令不执行。确认改动可信后由人执行 "
                         "seal --confirm 重封签")
+            if covered:
+                hint = (hint + "；若只是改了核心脚本、想先跑一轮测试，可带 --visa-id <id> "
+                                "或设环境变量 ATS_VISA_ID 使用人类签发的签证，"
+                                "每次握手消耗 1 次配额")
             return {"code": EXIT_DENIED,
                     "payload": {"error": "guard_check_failed",
                                 "detail": {"stage": "guard_verify",
@@ -3836,7 +3926,7 @@ def main(argv=None):
     global GUARD_PASSPHRASE
     argv = list(sys.argv[1:] if argv is None else argv)
     # 看门狗参数必须在 argparse 之前剥离：它们是跨子命令的全局开关
-    skip_guard, guard_approval, passphrase, argv = _extract_guard_flags(argv)
+    skip_guard, guard_approval, visa_id, passphrase, argv = _extract_guard_flags(argv)
     GUARD_PASSPHRASE = passphrase or None
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -3848,7 +3938,8 @@ def main(argv=None):
                           "hint": "使用 approve <id>... 或 --all"}, ensure_ascii=False))
         return EXIT_USAGE
     root = ats_root(_pre_scan_root(argv) or args.root)
-    denied = guard_handshake(root, skip_guard=skip_guard, guard_approval=guard_approval)
+    denied = guard_handshake(root, skip_guard=skip_guard, guard_approval=guard_approval,
+                             visa_id=visa_id)
     if denied is not None:
         # 准入失败时只放行 approve：否则「跳过看门狗」这类审批单永远批不了，自己锁死自己
         if args.command_name != "approve":

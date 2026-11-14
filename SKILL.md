@@ -721,6 +721,70 @@ python scripts/ats.py run deploy1 --approval ap-3f2a91c4
 所以本机制实际防的是「**不经口令就自行批准**」与「**改了核心脚本却没改清单**」，
 不是「AI 一定拿不到高等级」—— 后者要外层账户隔离才做得到。
 
+#### 5.7.1 签证（Visa）：带配额的完整性豁免
+
+封签要口令，而改完核心脚本又必须能跑测试 —— 于是有了签证：**只豁免「摘要不一致」
+这一关，其它闸门一律照旧**。签证由人签发（要口令），带次数与有效期，用完即焚。
+
+| 动作 | 命令 | 要口令 | 说明 |
+| --- | --- | --- | --- |
+| 签发 | `ats_guard.py visa issue --number <N> --time <分钟>` | 是 | `--number` 缺省 1；`--time` 缺省 30 分钟；`--note` 可选备注 |
+| 查看 | `ats_guard.py visa list` | 否 | 只列**未过期且 number > 0** 的签证 |
+| 销毁 | `ats_guard.py visa revoke <visa_id>` | 否 | 提前报废，删文件即失效 |
+| 扣减 | （内部）`visa consume --id <visa_id>` | 否 | `ats.py` 握手放行时调用，扣 1 |
+
+签证文件存 `<root>/visas/<visa_id>.json`（`<root>` 默认 `OCSKIS/.ats`）：
+
+```json
+{
+  "visa_id": "v-3f9a1c07",
+  "number": 3,
+  "created_at": 1793512103,
+  "expires_at": 1793515703,
+  "note": "AI 用于测试 ats_plan.py 的修改"
+}
+```
+
+`visa_id` 是签发时生成的 `v-` + 8 位 hex；`number` 是剩余可用次数（**签发默认必须为 1**，
+要更多次必须显式 `--number`）；`expires_at` 必然存在，不存在「永久签证」。
+
+**握手拦截逻辑**（`ats.py` 启动时 `guard_handshake`）：
+
+1. `verify` 通过 → 正常执行，签证完全不参与（也不会被消耗）。
+2. `verify` 失败 → 判 `_visa_scope`：**只有全部 problem 都是 `.py` 的 `digest_mismatch`**
+   才算签证覆盖范围；清单缺失、清单版本不符、空清单、`policy.json`/密钥文件被改、
+   新增未封签文件，任何一条命中即**不覆盖**，仍报 `guard_check_failed`。
+3. 覆盖范围内 → 读签证 ID：先看 `--visa-id`，再看环境变量 `ATS_VISA_ID`（命令行优先）。
+   - 没带 ID → `guard_check_failed`（`stage=guard_verify`），签证文件原样不动。
+   - 带了 ID 但文件不存在 / ID 格式非法 → `visa_invalid`（`reason=not_found` / `bad_id`）。
+   - 已过期 → `visa_invalid`（`reason=expired`）。
+   - 未过期且 `number > 0` → 放行本次，**原子扣减**：独立锁文件互斥，读-改-写一次落盘。
+     - 扣完 `number == 0` → 当场删掉签证文件，并在 stderr 打印
+       `[Visa] 配额已耗尽，签证已销毁，后续执行请重新封签或申请新签证。`
+
+签证**只管哈希**：签证期间再改代码，哈希继续不一致，签证依然有效（这正是它的用途）；
+配额耗尽则立刻停，不能无限次借签证跑。
+
+**安全底线（三条不许碰）**：
+
+- 签证**绝不绕过审批门**：L3 命令、`deny_rules`、`guard_skip_level` 全部原样生效，
+  签证只把「代码完整性」这一关放过去，命令等级与审批判定一行都不放宽
+- 签证**不是封签的替代品**：它只覆盖 `.py` 摘要漂移；策略文件、密钥、清单本身被改
+  时签证无效，改完策略仍须 `seal`
+- 签证**只在放行时消耗**：verify 失败但不在覆盖范围内（如 policy 被改）不扣配额，
+  免得白烧次数
+
+`--visa-id` 与 `--guard-approval` / `--skip-guard` / `--passphrase-stdin` 一样是
+**全局开关**，在 argparse 之前被 `_extract_guard_flags` 剥离，子命令位置随意
+（`ats.py list --visa-id v-xxx` 与 `ats.py --visa-id v-xxx list` 等价）。
+`ats_plan.py` 复用同一套握手函数，因此签证对它自动生效。
+
+实测（`tests/selftest.py -k visa`，7/7 通过）：无口令签发 → `passphrase_required`；
+错口令 → `passphrase_mismatch`；`number=2` 跑两次，第二次扣到 0 并打印 `[Visa]`、
+文件消失，第三次 → `visa_invalid`；`expires_at` 改到过去 → `reason=expired`；
+`policy.json` 被改 → 仍 `guard_check_failed` 且配额未被消耗；L3 任务持签证仍
+`approval_required`；`ATS_VISA_ID` 与 `--visa-id` 等价。
+
 ---
 
 ## 6. 编排规范
@@ -1128,7 +1192,7 @@ HTTP 层额外状态码：`403`（`forbidden_host` / `forbidden_origin`）、`41
 
 | 版本 | 变更 |
 | --- | --- |
-| 3.2.0-R0 | `extend` **扩展插件层**：插件是 `<ATS_ROOT>/extend/<extend_id>/` 下自包含目录，用 `instruction.json` 声明入口与指令；`scripts/ats_extend.py` 的发现层**只扫描、不导入、不执行**，执行时复用普通 Task 全链路（权限门、预检、审批、日志、`stop`）；子命令 `list` / `help` / `check`（纯预演，不写审批、不碰租约、不执行）/ `run`；目录名须等于 `extend_id`、id 匹配 `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`、入口禁目录穿越，任一不符即 `inactive`；等级声明不被信任（`EXTEND_LEVEL_FLOOR = "L2"`，低于 L2 抬到 L2、缺失或非法按 L3）；`run` 的 `command` 与 `check` 的 `gate_text` 逐字相同、`shell=false`、`--arg` 进 argv 不进 shell；非 active 直接 `inactive_extend`（退出码 4）不建 Task。同时新增 `scripts/ats_preflight.py` 静态预检，入口绝对路径进 `gate_text`，因此插件源码会被扫到。**一键安装** `setup.ps1`：口令经 stdin 传入（不进 argv / 进程列表 / 命令历史），密钥不存在时先 `init` 再 `seal`，失败按 `passphrase_too_short` / `passphrase_mismatch` 给出可复制下一步。`torrent` **自动注入公共 Tracker**：`scripts/ats_torrent.py` 常量区新增 `DEFAULT_TRACKERS`（138 条 udp / http / https 公共节点），`start_aria2` 构建 argv 时动态追加 `--bt-tracker=<列表>`，磁力链与 `.torrent` 共用同一参数（前者靠它取元数据、后者靠它找 peer）；可用环境变量 `ATS_TRACKERS` 覆盖，优先级高于内置表，设成空串表示显式关闭注入；新增 `sanitize_trackers` 统一清洗换行 / 制表 / 反引号 / 引号 / 多余空格 / 空项 / 重复项，只保留 `udp://` `http://` `https://`（`wss://` 等 aria2c 不支持的 scheme 静默丢弃），缺路径的地址自动补 `/announce`；`aria2_start` 事件新增 `trackers`（生效条数）与 `tracker_source`（`default` / `env:ATS_TRACKERS` / `env:ATS_TRACKERS(disabled)`），变量里一条合法地址都没有时输出 `tracker_warning` 而非崩溃；错误返回体批量补齐可复制 `hint`，并由 `tests/lint.py` 第 5 项 `check_actionable_error` 强制——字面量 `print_json({"error": ...})` 缺 `hint` / `message` 直接判失败；文档与 `--help` 文本统一 `--root` 默认值口径为 `<ats 本体目录>/.ats`（`ats_ui.py` 例外为 `<cwd>/.ats`）；版本号格式改用 `vA.B.C-Rx`（规范见 [versioning.md](references/versioning.md)），全仓 19 处版本号落点统一到 `3.2.0-R0`，顺带修正 `ats.py` 残留的 `v2.7`（docstring 与 `--help` 两处） |
+| 3.2.0-R0 | `extend` **扩展插件层**：插件是 `<ATS_ROOT>/extend/<extend_id>/` 下自包含目录，用 `instruction.json` 声明入口与指令；`scripts/ats_extend.py` 的发现层**只扫描、不导入、不执行**，执行时复用普通 Task 全链路（权限门、预检、审批、日志、`stop`）；子命令 `list` / `help` / `check`（纯预演，不写审批、不碰租约、不执行）/ `run`；目录名须等于 `extend_id`、id 匹配 `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`、入口禁目录穿越，任一不符即 `inactive`；等级声明不被信任（`EXTEND_LEVEL_FLOOR = "L2"`，低于 L2 抬到 L2、缺失或非法按 L3）；`run` 的 `command` 与 `check` 的 `gate_text` 逐字相同、`shell=false`、`--arg` 进 argv 不进 shell；非 active 直接 `inactive_extend`（退出码 4）不建 Task。同时新增 `scripts/ats_preflight.py` 静态预检，入口绝对路径进 `gate_text`，因此插件源码会被扫到。**一键安装** `setup.ps1`：口令经 stdin 传入（不进 argv / 进程列表 / 命令历史），密钥不存在时先 `init` 再 `seal`，失败按 `passphrase_too_short` / `passphrase_mismatch` 给出可复制下一步。`torrent` **自动注入公共 Tracker**：`scripts/ats_torrent.py` 常量区新增 `DEFAULT_TRACKERS`（138 条 udp / http / https 公共节点），`start_aria2` 构建 argv 时动态追加 `--bt-tracker=<列表>`，磁力链与 `.torrent` 共用同一参数（前者靠它取元数据、后者靠它找 peer）；可用环境变量 `ATS_TRACKERS` 覆盖，优先级高于内置表，设成空串表示显式关闭注入；新增 `sanitize_trackers` 统一清洗换行 / 制表 / 反引号 / 引号 / 多余空格 / 空项 / 重复项，只保留 `udp://` `http://` `https://`（`wss://` 等 aria2c 不支持的 scheme 静默丢弃），缺路径的地址自动补 `/announce`；`aria2_start` 事件新增 `trackers`（生效条数）与 `tracker_source`（`default` / `env:ATS_TRACKERS` / `env:ATS_TRACKERS(disabled)`），变量里一条合法地址都没有时输出 `tracker_warning` 而非崩溃；错误返回体批量补齐可复制 `hint`，并由 `tests/lint.py` 第 5 项 `check_actionable_error` 强制——字面量 `print_json({"error": ...})` 缺 `hint` / `message` 直接判失败；文档与 `--help` 文本统一 `--root` 默认值口径为 `<ats 本体目录>/.ats`（`ats_ui.py` 例外为 `<cwd>/.ats`）；版本号格式改用 `vA.B.C-Rx`（规范见 [versioning.md](references/versioning.md)），全仓 19 处版本号落点统一到 `3.2.0-R0`，顺带修正 `ats.py` 残留的 `v2.7`（docstring 与 `--help` 两处）；新增**签证（Visa）**：带配额与过期时间的完整性豁免，用于「改完核心脚本还要跑测试」的场景，只跳过 `digest_mismatch` 这一关，绝不绕过审批门（见 §5.7.1）：签证存 `<root>/visas/<visa_id>.json`（`visa_id` 为 `v-`+8 位 hex，字段 `number` / `created_at` / `expires_at` / `note`），`visa issue --number N --time 分钟` 必须持人类口令（`--number` 缺省 1、`--time` 缺省 30 分钟、`--note` 可选），`visa list` 只列未过期且 `number > 0` 的签证，`visa revoke <id>` 提前报废；`ats.py` 握手在 `verify` 失败时先判 `_visa_scope`（**仅当全部 problem 都是 `.py` 的 `digest_mismatch`** 才覆盖，清单缺失 / 版本不符 / 空清单 / `policy.json` / 密钥 / 新增未封签文件一律不覆盖），再读 `--visa-id` 或 `ATS_VISA_ID`（命令行优先，与 `--guard-approval` / `--skip-guard` / `--passphrase-stdin` 同为 `_extract_guard_flags` 剥离的全局开关），校验未过期且 `number > 0` 后放行并**原子扣减**（独立锁文件互斥，读-改-写一次落盘），扣到 0 当场删签证文件并向 stderr 打印 `[Visa] 配额已耗尽，签证已销毁，后续执行请重新封签或申请新签证。`；未带 ID 报 `guard_check_failed`、ID 不存在 / 非法 / 过期报 `visa_invalid`（`reason` 为 `not_found` / `bad_id` / `expired`）；签证不在覆盖范围内时不扣配额；`ats_plan.py` 复用同一套握手函数自动生效；新增 7 条用例（`visa_issue_requires_passphrase` / `visa_allows_runs_then_destroys_itself` / `visa_expired_is_rejected` / `visa_does_not_cover_policy_tamper` / `visa_does_not_bypass_approval` / `visa_id_from_env_is_equivalent` / `visa_list_and_revoke`，全量 75 条） |
 | 3.1.1 | `download --file` 支持**通配与多份清单**：`--file` 改为可重复，值里含 `*` `?` `[` 时由 `ats.py` 用 `glob` 展开（仍不经 shell），展开结果按字典序并写入 `tasks/<id>/download.json` 的 `manifests` 字段；0 匹配报 `manifest_no_match:<pattern>`（不再把字面量当文件名）、超 64 份报 `manifest_too_many:<pattern>`（`ATS_DOWNLOAD_MANIFEST_MAX` 可调）；多份清单 `outputs` 不一致且未写 `--out` 时报 `manifest_outputs_conflict:<path>`（写了 `--out` 以它为准，不猜）；清单类错误统一追加 `:<路径或模式>` 便于定位；`--file` 只读清单故**不跳过符号链接**（与 `@enc` 的差别已写明），多个通配值可并存（每份清单是独立输入）；新增 3 条用例（`download_manifest_glob_merges` / `download_manifest_glob_no_match` / `download_manifest_outputs_conflict`，全量 52 条） |
 | 3.1.0 | `@enc` 钩子支持**通配路径**（一条任务覆盖多个文件）：钩子不经 shell、`*` 不会自动展开，改由 `ats.py` 用 `glob` 按任务 `cwd` 展开；只展开位置参数里的 `*` `?` `[`，flag 及其值不动（`--include *.log` 原样传给转换器）；两个通配或通配与手写路径混写报 `hook_glob_ambiguous`，0 匹配报 `hook_glob_no_match`（不再把字面量当文件名交给转换器，避免凭空造文件），超 256 个报 `hook_glob_too_many`（`ATS_HOOK_GLOB_MAX` 可调），符号链接跳过并计数；展开后按字典序**逐条调用**转换器、遇非 0 即停，`post_hook` 新增 `glob`/`expanded`/`skipped_symlinks`/`runs`/`failed_on`，`hook-enc.log` 头部写展开清单可事后核对；`timeout` 为每次调用超时；同时修正参数角色判定：以 `-` 开头的 token 永不被当成「值」，否则 `--dry-run --from gbk --to utf-8 logs/*.log` 会把 `--from` 记成值、`gbk` 记成位置参数而误报 `hook_glob_ambiguous`；新增 5 条用例（`hook_glob_expands_multiple_files` / `hook_glob_no_match_fails_loudly` / `hook_glob_rejects_mixed_paths` / `hook_glob_skips_flag_values` / `hook_glob_survives_valueless_flags`，全量 49 条） |
 | 3.0.1 | 修复 `@enc` 钩子绕过权限门（安全）：修复前钩子参数直接拼进 `shell=True` 的命令串执行，`echo hi @enc x; del f` 会按 `echo hi` 登记成 L0 直通，钩子段却执行任意 shell；现在钩子参数按空白分词（引号包裹段保持完整）后以 **argv 列表**交给转换器、不经 shell，且等级推导 / 预检 / 审批绑定统一改用「主命令 + `@enc` 参数」的完整原文（`hook_gate_text`），同一命令实测被抬到 L2/L3 并命中 `denied_injection`；同时修正 `artifact_digests` 把钩子参数里的 `.py` 当执行体绑定、导致转码目标一改就误报 `artifact_changed` 的问题（现在只扫 `@enc` 之前的主命令）；新增 3 条用例（`hook_args_do_not_run_through_shell` / `hook_args_enter_gate_text` / `hook_target_not_bound_as_artifact`）；同时修正看门狗「密钥丢失」的下一步指引：`verify` 新增 `next_action: restore_key`（`seal` 在无密钥时必然 `key_missing`、`init` 又因清单存在而 `already_initialized`，原来只提示「重封签」是条跑不通的路），`ats.py` 准入失败提示同步改写；新增 2 条用例（`guard_key_loss_points_to_restore` / `guard_manifest_loss_guides_to_seal`）；并给 Plan 层补上钩子边界：Step 走 `shell=True` 直接执行、没有钩子后置，原来写 `@enc` 会被静默当普通参数传过去（实测该 Step 还报 `succeeded`，转换根本没发生），现在 `submit_plan` / `submit_schedule` 校验阶段报 `stage[..].step[..].hook_not_supported` 并整单拒绝；新增 1 条用例（`plan_step_rejects_hook`）；另补 1 条用例锁定「钩子段编码载荷也解码」（`hook_args_decoded_payload_raises_level`，实测钩子参数里写 `powershell -EncodedCommand <b64>` 会被解出 `Remove-Item` 并抬到 L3，全量 44 条） |

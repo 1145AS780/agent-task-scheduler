@@ -92,8 +92,8 @@ class Sandbox:
         """给本沙箱重新封签：临时 root 的清单只对当前代码快照有效。"""
         init_and_seal(self.root)
 
-    def guard(self, *args, timeout=60):
-        return self._run(GUARD, *args, timeout=timeout)
+    def guard(self, *args, timeout=60, passphrase=TEST_PASSPHRASE):
+        return self._run(GUARD, *args, timeout=timeout, passphrase=passphrase)
 
     def ats(self, *args, timeout=90, passphrase=TEST_PASSPHRASE):
         return self._run(ATS, *args, timeout=timeout, passphrase=passphrase)
@@ -1178,6 +1178,224 @@ def guard_blocks_tampered_core_file():
         stage = (payload.get("detail") or {}).get("stage")
         expect(stage == "guard_verify",
                "应停在 guard_verify 阶段，实际 %r" % stage)
+    finally:
+        sb.cleanup()
+
+
+def tamper_core_digest(sb, name="ats.py"):
+    """把清单里某个核心脚本的摘要改掉，制造 digest_mismatch。
+
+    改清单而不是改真实脚本：沙箱与仓库共用 scripts/，动真文件会污染工作区。
+    从 verify 的视角看两者等价——都是「代码与基线不一致」。
+    """
+    sb.auto_seal = False
+    data = json.loads(sb.manifest.read_text(encoding="utf-8"))
+    data["files"][name] = "0" * 64
+    sb.manifest.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+@case
+def visa_issue_requires_passphrase():
+    """签证签发必须持人类口令：缺失/错误都拒绝，正确才落盘，默认 1 次。"""
+    sb = Sandbox()
+    try:
+        rc, out, err = sb.guard("visa", "issue", "--number", "3", "--time", "5",
+                                passphrase=None)
+        expect(rc == 4, "无口令签发应被拒，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        expect(payload.get("error") == "passphrase_required",
+               "应报 passphrase_required，实际 %r" % payload.get("error"))
+        expect(not (sb.root / "visas").exists(), "被拒时不应落盘签证")
+
+        rc, out, err = sb.guard("visa", "issue", "--number", "3", "--time", "5",
+                                passphrase="wrong-passphrase")
+        expect(rc == 4, "错口令签发应被拒，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        expect((payload.get("detail") or {}).get("error") == "passphrase_mismatch",
+               "应报 passphrase_mismatch，实际 %r" % payload.get("detail"))
+
+        rc, out, err = sb.guard("visa", "issue", "--time", "5")
+        expect(rc == 0, "正确口令应签发成功，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        expect(payload.get("number") == 1,
+               "不传 --number 应默认 1，实际 %r" % payload.get("number"))
+        visa_id = payload.get("visa_id")
+        expect(isinstance(visa_id, str) and visa_id.startswith("v-")
+               and len(visa_id) == 10,
+               "签证 ID 应为 v- 加 8 位 hex，实际 %r" % (visa_id,))
+        visa_file = sb.root / "visas" / (visa_id + ".json")
+        expect(visa_file.is_file(), "签证文件应落盘")
+        record = json.loads(visa_file.read_text(encoding="utf-8"))
+        expect(int(record.get("expires_at") or 0) > int(record.get("created_at") or 0),
+               "必须有晚于 created_at 的 expires_at，实际 %r" % (record,))
+    finally:
+        sb.cleanup()
+
+
+@case
+def visa_allows_runs_then_destroys_itself():
+    """摘要不符时凭签证放行，每次扣 1；扣到 0 当场销毁，再跑就报 visa_invalid。"""
+    sb = Sandbox()
+    try:
+        sb.seal()
+        tamper_core_digest(sb)
+        rc, out, err = sb.guard("visa", "issue", "--number", "2", "--time", "10")
+        expect(rc == 0, "签发应成功，实际 %s\n%s" % (rc, out))
+        visa_id = json.loads(out)["visa_id"]
+        visa_file = sb.root / "visas" / (visa_id + ".json")
+
+        rc, out, err = sb.ats("list", "--visa-id", visa_id)
+        expect(rc == 0, "持签证首次执行应放行，实际 %s\n%s\n%s" % (rc, out, err))
+        expect(visa_file.is_file(), "首跑后还剩 1 次，签证文件应仍在")
+        expect(json.loads(visa_file.read_text(encoding="utf-8")).get("number") == 1,
+               "首跑后剩余次数应为 1")
+
+        rc, out, err = sb.ats("list", "--visa-id", visa_id)
+        expect(rc == 0, "第二次执行应放行，实际 %s\n%s\n%s" % (rc, out, err))
+        expect("[Visa]" in err, "配额耗尽应在控制台提示，实际 stderr=%r" % err)
+        expect(not visa_file.exists(), "配额扣到 0 应销毁签证文件")
+
+        rc, out, err = sb.ats("list", "--visa-id", visa_id)
+        expect(rc == 4, "签证已销毁后再跑应被拒，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        expect(payload.get("error") == "visa_invalid",
+               "应报 visa_invalid，实际 %r" % payload.get("error"))
+    finally:
+        sb.cleanup()
+
+
+@case
+def visa_expired_is_rejected():
+    """过期签证一律拒绝：把 expires_at 改到过去，等价于等到过期。"""
+    sb = Sandbox()
+    try:
+        sb.seal()
+        tamper_core_digest(sb)
+        rc, out, err = sb.guard("visa", "issue", "--number", "1", "--time", "10")
+        expect(rc == 0, "签发应成功，实际 %s\n%s" % (rc, out))
+        visa_id = json.loads(out)["visa_id"]
+        visa_file = sb.root / "visas" / (visa_id + ".json")
+        record = json.loads(visa_file.read_text(encoding="utf-8"))
+        record["expires_at"] = int(time.time()) - 1
+        visa_file.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+
+        rc, out, err = sb.ats("list", "--visa-id", visa_id)
+        expect(rc == 4, "过期签证应被拒，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        expect(payload.get("error") == "visa_invalid",
+               "应报 visa_invalid，实际 %r" % payload.get("error"))
+        expect((payload.get("detail") or {}).get("reason") == "expired",
+               "应报 reason=expired，实际 %r" % ((payload.get("detail") or {}).get("reason"),))
+    finally:
+        sb.cleanup()
+
+
+@case
+def visa_does_not_cover_policy_tamper():
+    """签证只管代码摘要：policy.json 被动过照样拒绝，且不消耗配额。"""
+    sb = Sandbox()
+    try:
+        rc, out, err = sb.ats("policy", "--set", "max_level", "L2")
+        expect(rc == 0, "policy --set 应成功，实际 %s\n%s" % (rc, out))
+        sb.auto_seal = False
+        policy_path = sb.root / "policy.json"
+        expect(policy_path.is_file(), "policy --set 应落盘 policy.json")
+        stored = json.loads(policy_path.read_text(encoding="utf-8"))
+        stored["max_level"] = "L0"
+        policy_path.write_text(json.dumps(stored, ensure_ascii=False), encoding="utf-8")
+
+        rc, out, err = sb.guard("visa", "issue", "--number", "1", "--time", "10")
+        expect(rc == 0, "签发应成功，实际 %s\n%s" % (rc, out))
+        visa_id = json.loads(out)["visa_id"]
+
+        rc, out, err = sb.ats("list", "--visa-id", visa_id)
+        expect(rc == 4, "policy 被改时签证不应放行，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        expect(payload.get("error") == "guard_check_failed",
+               "应报 guard_check_failed，实际 %r" % payload.get("error"))
+        expect((payload.get("detail") or {}).get("stage") == "guard_verify",
+               "应停在 guard_verify，实际 %r" % (payload.get("detail"),))
+        expect((sb.root / "visas" / (visa_id + ".json")).is_file(),
+               "签证未参与放行时不应被消耗")
+    finally:
+        sb.cleanup()
+
+
+@case
+def visa_does_not_bypass_approval():
+    """签证只跳过完整性校验：L3 命令照样要审批。"""
+    sb = Sandbox()
+    try:
+        sb.ats("create", "risky", "--command", "echo hi", "--level", "L3")
+        tamper_core_digest(sb)
+        rc, out, err = sb.guard("visa", "issue", "--number", "1", "--time", "10")
+        expect(rc == 0, "签发应成功，实际 %s\n%s" % (rc, out))
+        visa_id = json.loads(out)["visa_id"]
+
+        rc, out, err = sb.ats("run", "risky", "--visa-id", visa_id)
+        expect(rc == 4, "签证不应免掉审批，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        expect(payload.get("error") == "approval_required",
+               "应报 approval_required，实际 %r" % payload.get("error"))
+    finally:
+        sb.cleanup()
+
+
+@case
+def visa_id_from_env_is_equivalent():
+    """环境变量 ATS_VISA_ID 与 --visa-id 等价。"""
+    sb = Sandbox()
+    try:
+        sb.seal()
+        tamper_core_digest(sb)
+        rc, out, err = sb.guard("visa", "issue", "--number", "1", "--time", "10")
+        expect(rc == 0, "签发应成功，实际 %s\n%s" % (rc, out))
+        visa_id = json.loads(out)["visa_id"]
+
+        env = dict(os.environ)
+        env["ATS_VISA_ID"] = visa_id
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        proc = subprocess.run([sys.executable, str(ATS), "--root", str(sb.root), "list"],
+                              capture_output=True, text=True, env=env,
+                              encoding="utf-8", errors="replace", timeout=90)
+        expect(proc.returncode == 0, "环境变量签证应放行，实际 %s\n%s\n%s"
+               % (proc.returncode, proc.stdout, proc.stderr))
+    finally:
+        sb.cleanup()
+
+
+@case
+def visa_list_and_revoke():
+    """visa list 看剩余配额，visa revoke 提前销毁。"""
+    sb = Sandbox()
+    try:
+        rc, out, err = sb.guard("visa", "issue", "--number", "4", "--time", "10")
+        expect(rc == 0, "签发应成功，实际 %s\n%s" % (rc, out))
+        first = json.loads(out)["visa_id"]
+        rc, out, err = sb.guard("visa", "issue", "--number", "2", "--time", "10")
+        expect(rc == 0, "第二张签发应成功，实际 %s\n%s" % (rc, out))
+        second = json.loads(out)["visa_id"]
+
+        rc, out, err = sb.guard("visa", "list")
+        expect(rc == 0, "list 应成功，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        expect(payload.get("count") == 2,
+               "应看到 2 张有效签证，实际 %r" % payload.get("count"))
+        numbers = {v["visa_id"]: v["number"] for v in payload.get("visas") or []}
+        expect(numbers.get(first) == 4 and numbers.get(second) == 2,
+               "剩余配额应与签发一致，实际 %r" % (numbers,))
+
+        rc, out, err = sb.guard("visa", "revoke", first)
+        expect(rc == 0, "revoke 应成功，实际 %s\n%s" % (rc, out))
+        rc, out, err = sb.guard("visa", "list")
+        payload = json.loads(out)
+        expect(payload.get("count") == 1,
+               "销毁后应只剩 1 张，实际 %r" % payload.get("count"))
+
+        rc, out, err = sb.guard("visa", "revoke", "v-zzzzzzzz")
+        expect(rc == 2, "非法 ID 应报用法错误，实际 %s\n%s" % (rc, out))
     finally:
         sb.cleanup()
 

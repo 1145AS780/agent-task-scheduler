@@ -2014,10 +2014,11 @@ HANDLERS = {
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     # 与 ats.py 同一套启动准入：ats_plan 也会真正执行命令，不能绕过看门狗。
-    skip_guard, guard_approval, passphrase, argv = ats._extract_guard_flags(argv)
+    skip_guard, guard_approval, visa_id, passphrase, argv = ats._extract_guard_flags(argv)
     ats.GUARD_PASSPHRASE = passphrase or None
     root = ats.ats_root(ats._pre_scan_root(argv))
-    denied = ats.guard_handshake(root, skip_guard=skip_guard, guard_approval=guard_approval)
+    denied = ats.guard_handshake(root, skip_guard=skip_guard, guard_approval=guard_approval,
+                                 visa_id=visa_id)
     if denied is not None:
         ats.print_json(denied["payload"], denied["code"])
         return denied["code"]
