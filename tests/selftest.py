@@ -1401,6 +1401,237 @@ def visa_list_and_revoke():
 
 
 @case
+def visa_task_scope_auto_approves_bound_task():
+    """Task Visa：绑 task_id + 命令哈希，命中即自动放行，并留可追溯的 auto_approved。"""
+    sb = Sandbox()
+    try:
+        rc, out, err = sb.ats("create", "risky", "--command", "echo hi", "--level", "L3")
+        expect(rc == 0, "create 应成功，实际 %s\n%s" % (rc, out))
+
+        rc, out, err = sb.ats("visa", "issue", "--task", "risky", "--time", "10")
+        expect(rc == 0, "Task Visa 签发应成功，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        expect(payload.get("scope_type") == "command",
+               "Task Visa 的 scope_type 应为 command，实际 %r" % payload.get("scope_type"))
+        expect(payload.get("task_id") == "risky",
+               "应把 task_id 写死进签证，实际 %r" % payload.get("task_id"))
+        expect(payload.get("plan_id") == "",
+               "Task Visa 不应带 plan_id，实际 %r" % payload.get("plan_id"))
+        expect(payload.get("command") == "echo hi",
+               "签发应回显被绑定的命令原文，实际 %r" % payload.get("command"))
+        expect(len(payload.get("scope_hash") or "") == 64,
+               "应绑定 64 位命令哈希，实际 %r" % payload.get("scope_hash"))
+        visa_id = payload["visa_id"]
+        visa_file = sb.root / "visas" / (visa_id + ".json")
+
+        rc, out, err = sb.ats("run", "risky", "--visa-id", visa_id, "--wait")
+        expect(rc == 0, "Task Visa 应自动放行 L3 任务，实际 %s\n%s\n%s" % (rc, out, err))
+        task = json.loads((sb.root / "tasks" / "risky" / "task.json")
+                          .read_text(encoding="utf-8"))
+        expect(task["status"] == "succeeded", "任务应执行成功，实际 %r" % task["status"])
+        approval_id = task.get("approval_id")
+        expect(str(approval_id or "").startswith("ap-"),
+               "task 应记录自动审批单号，实际 %r" % (approval_id,))
+
+        record = json.loads((sb.root / "approvals" / (approval_id + ".json"))
+                            .read_text(encoding="utf-8"))
+        expect(record.get("auto_approved") is True,
+               "审批记录必须标 auto_approved，实际 %r" % record.get("auto_approved"))
+        expect(record.get("resolved_by") == "visa:" + visa_id,
+               "resolved_by 应为 visa:<visa_id>，实际 %r" % record.get("resolved_by"))
+        expect(record.get("visa_scope_type") == "command",
+               "审批记录应带作用域类型，实际 %r" % record.get("visa_scope_type"))
+        expect(int(record.get("expires_at") or 0) == int(record.get("created_at") or 0),
+               "自动审批单必须落地即过期（不可当凭证重放），实际 %r" % record)
+        expect(not visa_file.exists(), "配额 1 用完后签证应自毁")
+    finally:
+        sb.cleanup()
+
+
+@case
+def visa_task_scope_rejects_other_task():
+    """跨任务使用一律拒绝：不扣配额、不回落到审批，且不弄坏原绑定。"""
+    sb = Sandbox()
+    try:
+        sb.ats("create", "alpha", "--command", "echo alpha", "--level", "L3")
+        sb.ats("create", "beta", "--command", "echo beta", "--level", "L3")
+        rc, out, err = sb.ats("visa", "issue", "--task", "alpha", "--time", "10")
+        expect(rc == 0, "签发应成功，实际 %s\n%s" % (rc, out))
+        visa_id = json.loads(out)["visa_id"]
+        visa_file = sb.root / "visas" / (visa_id + ".json")
+
+        rc, out, err = sb.ats("run", "beta", "--visa-id", visa_id)
+        expect(rc == 4, "拿 alpha 的签证跑 beta 应被拒，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        expect(payload.get("error") == "visa_mismatch",
+               "应报 visa_mismatch，实际 %r" % payload.get("error"))
+        expect(payload.get("approval_id") is None,
+               "越权不应顺手生成审批单（不回落审批），实际 %r" % payload.get("approval_id"))
+        expect(visa_file.is_file(), "作用域不匹配不应扣配额")
+        expect(json.loads(visa_file.read_text(encoding="utf-8")).get("number") == 1,
+               "配额应仍为 1")
+
+        rc, out, err = sb.ats("run", "alpha", "--visa-id", visa_id, "--wait")
+        expect(rc == 0, "越权一次后原绑定仍应可用，实际 %s\n%s\n%s" % (rc, out, err))
+    finally:
+        sb.cleanup()
+
+
+@case
+def visa_task_scope_binds_command_text():
+    """签发后改 task.json 的命令原文 → 哈希对不上，签证自动失效且不扣配额。"""
+    sb = Sandbox()
+    try:
+        sb.ats("create", "risky", "--command", "echo hi", "--level", "L3")
+        rc, out, err = sb.ats("visa", "issue", "--task", "risky", "--time", "10")
+        expect(rc == 0, "签发应成功，实际 %s\n%s" % (rc, out))
+        visa_id = json.loads(out)["visa_id"]
+
+        tpath = sb.root / "tasks" / "risky" / "task.json"
+        task = json.loads(tpath.read_text(encoding="utf-8"))
+        task["command"] = "echo tampered"
+        tpath.write_text(json.dumps(task, ensure_ascii=False), encoding="utf-8")
+
+        rc, out, err = sb.ats("run", "risky", "--visa-id", visa_id)
+        expect(rc == 4, "命令被改后签证应失效，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        expect(payload.get("error") == "visa_mismatch",
+               "应报 visa_mismatch，实际 %r" % payload.get("error"))
+        expect((sb.root / "visas" / (visa_id + ".json")).is_file(),
+               "哈希不匹配不应扣配额")
+    finally:
+        sb.cleanup()
+
+
+@case
+def visa_plan_scope_covers_whole_dag():
+    """Plan Visa：unlimited 配额，plan_id 相等即逐 step 放行，全程不扣配额。"""
+    sb = Sandbox()
+    try:
+        spec = sb.dir / "plan-visa.json"
+        spec.write_text(json.dumps({
+            "id": "pv", "title": "plan visa",
+            "stages": [{"id": "s1", "mode": "serial", "steps": [
+                {"id": "a", "command": "echo a", "level": "L3", "timeout": 60},
+                {"id": "b", "command": "echo b", "level": "L3", "timeout": 60,
+                 "depends_on": ["a"]}]}],
+        }, ensure_ascii=False), encoding="utf-8")
+        rc, sub = sb.json_out_plan("submit_plan", "--spec", spec)
+        expect(rc == 0, "submit_plan 应成功，实际 %s\n%s" % (rc, sub))
+        plan_id = sub["plan_id"]
+
+        rc, out, err = sb.ats("visa", "issue", "--plan", plan_id,
+                              "--number", "unlimited", "--time", "10")
+        expect(rc == 0, "Plan Visa 签发应成功，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        expect(payload.get("scope_type") == "plan",
+               "scope_type 应为 plan，实际 %r" % payload.get("scope_type"))
+        expect(payload.get("plan_id") == plan_id,
+               "应把 plan_id 写死进签证，实际 %r" % payload.get("plan_id"))
+        expect(payload.get("number") == "unlimited",
+               "plan 场景应允许 unlimited，实际 %r" % payload.get("number"))
+        expect(len(payload.get("scope_hash") or "") == 64,
+               "应绑定 64 位 DAG 指纹，实际 %r" % payload.get("scope_hash"))
+        visa_id = payload["visa_id"]
+        visa_file = sb.root / "visas" / (visa_id + ".json")
+
+        rc, run = sb.json_out_plan("run_plan", plan_id, "--visa-id", visa_id)
+        expect(rc == 0, "run_plan 应正常返回，实际 %s\n%s" % (rc, run))
+        counts = run.get("counts") or {}
+        expect(counts.get("succeeded") == 2,
+               "两个 L3 step 都应被自动放行并成功，实际 %r" % (counts,))
+        expect(visa_file.is_file(), "unlimited 不扣配额，签证应仍在")
+        expect(json.loads(visa_file.read_text(encoding="utf-8")).get("number") == "unlimited",
+               "unlimited 配额不应被改写成数字")
+    finally:
+        sb.cleanup()
+
+
+@case
+def visa_plan_scope_rejects_other_plan():
+    """拿 A 计划的签证跑 B 计划：step 直接判 failed，不扣配额、不建审批单。"""
+    sb = Sandbox()
+    try:
+        def write_plan(pid, tag):
+            path = sb.dir / ("plan-%s.json" % pid)
+            path.write_text(json.dumps({
+                "id": pid, "title": tag,
+                "stages": [{"id": "s1", "mode": "serial", "steps": [
+                    {"id": "a", "command": "echo %s" % tag, "level": "L3",
+                     "timeout": 60}]}],
+            }, ensure_ascii=False), encoding="utf-8")
+            return path
+
+        rc, sub_a = sb.json_out_plan("submit_plan", "--spec", write_plan("pa", "aaa"))
+        expect(rc == 0, "提交 plan A 应成功，实际 %s\n%s" % (rc, sub_a))
+        rc, sub_b = sb.json_out_plan("submit_plan", "--spec", write_plan("pb", "bbb"))
+        expect(rc == 0, "提交 plan B 应成功，实际 %s\n%s" % (rc, sub_b))
+
+        rc, out, err = sb.ats("visa", "issue", "--plan", sub_a["plan_id"],
+                              "--number", "unlimited", "--time", "10")
+        expect(rc == 0, "签发 plan A 的签证应成功，实际 %s\n%s" % (rc, out))
+        visa_id = json.loads(out)["visa_id"]
+        visa_file = sb.root / "visas" / (visa_id + ".json")
+
+        rc, run = sb.json_out_plan("run_plan", sub_b["plan_id"], "--visa-id", visa_id)
+        step_path = (sb.root / "schedules" / sub_b["schedule_id"] / "plans"
+                     / sub_b["plan_id"] / "stages" / "s1" / "steps" / "a" / "step.json")
+        step = json.loads(step_path.read_text(encoding="utf-8"))
+        expect(step.get("status") == "failed",
+               "跨计划使用应判该 step 失败，实际 %r\n%s" % (step.get("status"), run))
+        expect(step.get("error_type") == "visa_mismatch",
+               "error_type 应为 visa_mismatch，实际 %r" % step.get("error_type"))
+        expect(visa_file.is_file(), "跨计划使用不应扣配额")
+    finally:
+        sb.cleanup()
+
+
+@case
+def visa_unlimited_requires_plan_scope():
+    """unlimited 只对 plan 开放：command / digest 场景必须给正整数配额。"""
+    sb = Sandbox()
+    try:
+        sb.ats("create", "risky", "--command", "echo hi", "--level", "L3")
+        rc, out, err = sb.ats("visa", "issue", "--task", "risky",
+                              "--number", "unlimited", "--time", "10")
+        expect(rc == 2, "command 作用域写 unlimited 应报用法错误，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        expect(payload.get("error") == "bad_number",
+               "应报 bad_number，实际 %r" % payload.get("error"))
+        visas = sb.root / "visas"
+        expect(not visas.exists() or not list(visas.glob("*.json")),
+               "被拒时不应落盘任何签证")
+    finally:
+        sb.cleanup()
+
+
+@case
+def visa_command_scope_does_not_cover_core_tamper():
+    """Task/Plan Visa 只免审批，不覆盖核心脚本摘要不符：硬拿它过握手一律拒绝。"""
+    sb = Sandbox()
+    try:
+        sb.ats("create", "risky", "--command", "echo hi", "--level", "L3")
+        sb.seal()
+        tamper_core_digest(sb)
+        rc, out, err = sb.ats("visa", "issue", "--task", "risky", "--time", "10")
+        expect(rc == 0, "准入失败时 visa issue 仍应可用（否则改核心脚本就签不了证），"
+                       "实际 %s\n%s" % (rc, out))
+        visa_id = json.loads(out)["visa_id"]
+
+        rc, out, err = sb.ats("run", "risky", "--visa-id", visa_id)
+        expect(rc == 4, "摘要不符时 command 签证不应放行握手，实际 %s\n%s" % (rc, out))
+        payload = json.loads(out)
+        expect(payload.get("error") == "visa_scope_not_applicable",
+               "应报 visa_scope_not_applicable，实际 %r" % payload.get("error"))
+        expect((payload.get("detail") or {}).get("scope_type") == "command",
+               "detail 应带 scope_type=command，实际 %r" % payload.get("detail"))
+        expect((sb.root / "visas" / (visa_id + ".json")).is_file(),
+               "越权过握手不应扣配额")
+    finally:
+        sb.cleanup()
+
+
+@case
 def guard_blocks_without_manifest():
     """没有清单（未封签）时同样拒绝，不允许「默认放行」。"""
     sb = Sandbox()

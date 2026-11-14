@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""agent-task-scheduler — Plan / Schedule 层执行器 (v3.2.0-R0)
+"""agent-task-scheduler — Plan / Schedule 层执行器 (v3.3.0-R0)
 
 命令：
   submit_plan --spec plan.json [--id ID]
@@ -45,6 +45,7 @@ Schedule spec：
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -296,6 +297,45 @@ def validate_spec(spec):
         if len(order_steps(steps)) < len([s for s in steps if isinstance(s, dict) and s.get("id")]):
             errors.append("stage[%s].depends_on_cycle" % stage_id)
     return errors
+
+
+def plan_fingerprint(plan):
+    """DAG 指纹：Plan Visa 绑定的对象。
+
+    只投影「跑起来会变行为」的字段（stage 顺序与模式、step 的 id/命令/等级/依赖/
+    重试/超时/cwd/env），刻意不纳入 plan.json 里的 attempt、status、时间戳等
+    运行期元数据 —— 否则计划重跑一次 attempt+1 就会让签证失效，而 DAG 根本没变。
+
+    归一化只做两件不改变语义的事：depends_on 统一成字符串列表并排序、env 键排序。
+    其余字段逐字进入哈希，所以改命令、改等级、改依赖都会让指纹变，签证自动失效。
+    """
+    stages = []
+    for stage in (plan.get("stages") or []):
+        if not isinstance(stage, dict):
+            continue
+        steps = []
+        for step in (stage.get("steps") or []):
+            if not isinstance(step, dict):
+                continue
+            env = step.get("env") or {}
+            steps.append({
+                "id": step.get("id"),
+                "command": step.get("command"),
+                "level": str(step.get("level") or ats.DEFAULT_TASK_LEVEL).upper(),
+                "depends_on": sorted(step_deps(step)),
+                "retry": step.get("retry", 0),
+                "retry_backoff": step.get("retry_backoff", 0),
+                "timeout": step.get("timeout", 0),
+                "cwd": step.get("cwd") or None,
+                "env": {str(k): str(v) for k, v in sorted(env.items())}
+                       if isinstance(env, dict) else {},
+            })
+        stages.append({"id": stage.get("id"),
+                       "mode": stage.get("mode", "serial"),
+                       "steps": steps})
+    canonical = json.dumps(stages, ensure_ascii=False, sort_keys=True,
+                           separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------- 状态读写
@@ -658,6 +698,7 @@ def ensure_step_permission(root, plan, sdir, stage, step, approval):
         "plan_id": plan.get("id"),
         "stage_id": stage.get("id"),
         "step_id": step.get("id"),
+        "visa_id": ats.GUARD_VISA_ID,
     }
     approval_id = state.get("approval_id") or approval
     gate = ats.permission_gate(root, command, approval_id, context)
@@ -725,6 +766,26 @@ def ensure_step_permission(root, plan, sdir, stage, step, approval):
                     "approval_mode": gate.get("approval_mode")})
         plan_log(root, plan, "task_failed", stage_id=stage.get("id"),
                  step_id=step.get("id"), status="failed", error_type=err)
+        return "denied", gate
+
+    if gate["reason"] == "visa_mismatch":
+        # 签证作用域对不上 = 跨任务使用。设计上明令「直接拒绝、不扣配额、不回落审批」，
+        # 所以这里既不建审批单也不暂停重试，直接判本步失败，把原因摆到事件流里。
+        state["status"] = "failed"
+        state["error_type"] = "visa_mismatch"
+        state["ended_at"] = now_ts()
+        save_step(pdir, stage.get("id"), step.get("id"), state)
+        emit(sdir, {"type": "task_failed", "schedule_id": Path(sdir).name,
+                    "plan_id": plan.get("id"), "stage_id": stage.get("id"),
+                    "step_id": step.get("id"), "status": "failed",
+                    "error_type": "visa_mismatch",
+                    "visa_id": gate.get("visa_id"),
+                    "visa_scope_type": gate.get("visa_scope_type"),
+                    "visa_reason": (gate.get("visa") or {}).get("reason")})
+        plan_log(root, plan, "task_failed", stage_id=stage.get("id"),
+                 step_id=step.get("id"), status="failed",
+                 error_type="visa_mismatch", visa_id=gate.get("visa_id"),
+                 visa_reason=(gate.get("visa") or {}).get("reason"))
         return "denied", gate
 
     # approval_required：缺失/过期时创建审批；pending 不重发（避免刷屏）
@@ -1918,7 +1979,7 @@ def cmd_prune(root, args):
 def build_parser():
     ap = argparse.ArgumentParser(
         prog="ats_plan.py",
-        description="agent-task-scheduler — Plan / Schedule 层执行器 (v3.2.0-R0)",
+        description="agent-task-scheduler — Plan / Schedule 层执行器 (v3.3.0-R0)",
     )
     ap.add_argument("--root", default=None, help="ATS_ROOT，默认 <ats 本体目录>/.ats")
     sub = ap.add_subparsers(dest="command_name")
@@ -2016,6 +2077,7 @@ def main(argv=None):
     # 与 ats.py 同一套启动准入：ats_plan 也会真正执行命令，不能绕过看门狗。
     skip_guard, guard_approval, visa_id, passphrase, argv = ats._extract_guard_flags(argv)
     ats.GUARD_PASSPHRASE = passphrase or None
+    ats.GUARD_VISA_ID = visa_id or None
     root = ats.ats_root(ats._pre_scan_root(argv))
     denied = ats.guard_handshake(root, skip_guard=skip_guard, guard_approval=guard_approval,
                                  visa_id=visa_id)

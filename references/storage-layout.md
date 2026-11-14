@@ -1,4 +1,4 @@
-# 存储布局 — agent-task-scheduler v3.2.0-R0
+# 存储布局 — agent-task-scheduler v3.3.0-R0
 
 所有状态都在 `ATS_ROOT` 下（默认 `<ats 本体目录>/.ats`；`ats_ui.py` 例外，默认 `<cwd>/.ats`）。本文描述目录结构、文件语义、生命周期与清理策略。
 

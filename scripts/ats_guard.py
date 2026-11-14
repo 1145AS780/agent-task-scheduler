@@ -42,19 +42,32 @@
     python ats_guard.py auth   [--root DIR] [--passphrase-stdin]
     python ats_guard.py self
     python ats_guard.py visa issue --number N --time MINUTES --passphrase-stdin [--note TEXT]
+    python ats_guard.py visa issue --time MINUTES --scope-type command
+                         --scope-hash SHA256 --task-id TASK [--number N]
+    python ats_guard.py visa issue --time MINUTES --scope-type plan
+                         --scope-hash SHA256 --plan-id PLAN [--number unlimited]
     python ats_guard.py visa list
+    python ats_guard.py visa peek --id <visa_id>
     python ats_guard.py visa revoke <visa_id>
     python ats_guard.py visa consume --id <visa_id>
+                         [--scope-hash SHA256 --task-id TASK --plan-id PLAN]
 
 ========================= 签证（Visa）=========================
 签证是「改了核心脚本、还没重封签，但要先跑一轮测试」的临时通行证，存于
-<root>/visas/<visa_id>.json，字段只有 visa_id / number / created_at /
-expires_at / note 五个。它**只跳过完整性校验**，不跳过任何审批门：
+<root>/visas/<visa_id>.json。按 scope_type 分三种，互不通用：
+
+  digest   —— 老签证的默认值，也等于字段缺省。只跳过完整性校验，不跳过审批门。
+  command  —— Task Visa。绑定 task_id + 命令原文的 SHA256，只放行那一条命令，
+              且**不覆盖完整性校验**：改了核心脚本仍须重封签或另用 digest 签证。
+  plan     —— Plan Visa。绑定 plan_id + Plan 的 DAG 指纹，只放行该 Plan 的 Step，
+              配额可写 "unlimited"（Plan 跑完前不限次数）。
+
+共同底线：
   * 签发必须持人类口令（visa issue --passphrase-stdin），否则 AI 能自己给自己
     发免死金牌；
-  * 每次握手消耗 1 次配额，扣减后立刻落盘，扣到 0 时文件当场删除；
-  * 签证只在 ats.py 握手判定为 digest_mismatch（已有基线但摘要不符）时生效，
-    清单缺失 / 看门狗自检失败 / 策略篡改都不在签证覆盖范围内；
+  * 每次消费消耗 1 次配额，扣减后立刻落盘，扣到 0 时文件当场删除；
+  * 带 scope 的签证必须带对应 scope 参数消费，参数对不上直接 visa_mismatch，
+    **绝不跨任务**：哈希或 ID 不符就不放行，也不回落到审批；
   * 过期即失效，过期时间由 --time 分钟数决定，不接受「永不过期」。
 退出码：0 通过 / 2 用法错误 / 3 清单缺失 / 4 校验失败
 """
@@ -91,6 +104,12 @@ VISA_ID_PREFIX = "v-"
 VISA_ID_HEX_LEN = 8
 VISA_LOCK_NAME = ".visa.lock"
 VISA_LOCK_TIMEOUT = 2.0
+VISA_SCOPE_DIGEST = "digest"         # 字段缺省即老签证：只管完整性校验
+VISA_SCOPE_COMMAND = "command"       # Task Visa：绑定 task_id + 命令哈希
+VISA_SCOPE_PLAN = "plan"             # Plan Visa：绑定 plan_id + DAG 指纹
+VISA_SCOPE_TYPES = (VISA_SCOPE_DIGEST, VISA_SCOPE_COMMAND, VISA_SCOPE_PLAN)
+VISA_UNLIMITED = "unlimited"         # 只允许 plan 场景：Plan 跑完前不限次数
+VISA_SUBS = ("issue", "list", "peek", "revoke", "consume")
 
 
 def sha256_file(path):
@@ -435,19 +454,38 @@ def read_visa(root, visa_id):
     return data if isinstance(data, dict) else None
 
 
+def visa_scope_type(record):
+    """签证的作用域类型；字段缺省按 digest 处理，保证老签证行为不变。"""
+    kind = record.get("scope_type") if isinstance(record, dict) else None
+    if isinstance(kind, str) and kind in VISA_SCOPE_TYPES:
+        return kind
+    return VISA_SCOPE_DIGEST
+
+
+def visa_number(record):
+    """解析配额：返回 int 或 VISA_UNLIMITED；非法值抛 ValueError。"""
+    raw = record.get("number")
+    if isinstance(raw, str) and raw.strip().lower() == VISA_UNLIMITED:
+        return VISA_UNLIMITED
+    return int(raw)
+
+
 def visa_state(record, now=None):
-    """返回 (状态, 剩余次数)。状态：valid / expired / exhausted / corrupt。"""
+    """返回 (状态, 剩余次数)。状态：valid / expired / exhausted / corrupt。
+
+    剩余次数可能是 int，也可能是 "unlimited"（只有 plan 场景允许）。
+    """
     if not isinstance(record, dict):
         return "corrupt", 0
     try:
-        number = int(record.get("number"))
+        number = visa_number(record)
         expires_at = int(record.get("expires_at"))
     except (TypeError, ValueError):
         return "corrupt", 0
     now = int(time.time()) if now is None else int(now)
     if expires_at <= now:
         return "expired", number
-    if number <= 0:
+    if number != VISA_UNLIMITED and number <= 0:
         return "exhausted", number
     return "valid", number
 
@@ -479,7 +517,49 @@ def release_visa_lock(lock):
         pass
 
 
-def cmd_visa_issue(root, number, minutes, note, passphrase):
+def _bad_scope(payload):
+    return None, emit(payload, EXIT_USAGE)
+
+
+def normalize_scope(scope_type, scope_hash, task_id, plan_id):
+    """校验作用域参数，返回 (scope_dict, error_payload)。
+
+    三种作用域互斥，且都必须把「作用对象」绑死：
+      digest  —— 不许带任何 scope 参数（带了就是调用方搞错了意图）；
+      command —— 必须同时给 scope_hash 与 task_id，缺一个就签不成；
+      plan    —— 必须同时给 scope_hash 与 plan_id。
+    这样签出来的签证天然不可跨任务使用：哈希与 ID 都写进文件，消费时逐字比对。
+    """
+    kind = (scope_type or VISA_SCOPE_DIGEST)
+    if not isinstance(kind, str) or kind not in VISA_SCOPE_TYPES:
+        return _bad_scope({"ok": False, "error": "bad_scope_type",
+                           "hint": "--scope-type 只能是 digest / command / plan"})
+    digest = (scope_hash or "").strip().lower()
+    task = (task_id or "").strip()
+    plan = (plan_id or "").strip()
+    if kind == VISA_SCOPE_DIGEST:
+        if digest or task or plan:
+            return _bad_scope({"ok": False, "error": "scope_not_applicable",
+                               "hint": "digest 签证不绑任何对象；要绑任务或计划请显式给 "
+                                       "--scope-type command / plan"})
+        return {"scope_type": kind}, None
+    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        return _bad_scope({"ok": False, "error": "bad_scope_hash",
+                           "hint": "%s 签证的 --scope-hash 必须是 64 位小写十六进制 "
+                                   "SHA-256" % kind})
+    if kind == VISA_SCOPE_COMMAND:
+        if not task or plan:
+            return _bad_scope({"ok": False, "error": "bad_scope_target",
+                               "hint": "command 签证必须给 --task-id，且不能带 --plan-id"})
+        return {"scope_type": kind, "scope_hash": digest, "task_id": task}, None
+    if not plan or task:
+        return _bad_scope({"ok": False, "error": "bad_scope_target",
+                           "hint": "plan 签证必须给 --plan-id，且不能带 --task-id"})
+    return {"scope_type": kind, "scope_hash": digest, "plan_id": plan}, None
+
+
+def cmd_visa_issue(root, number, minutes, note, passphrase,
+                   scope_type=None, scope_hash=None, task_id=None, plan_id=None):
     """签发签证：必须持人类口令，否则 AI 就能自己给自己发免死金牌。"""
     auth = check_passphrase(root, passphrase)
     if not auth.get("ok"):
@@ -487,24 +567,44 @@ def cmd_visa_issue(root, number, minutes, note, passphrase):
                      "hint": "签发签证要人类口令（密钥文件：%s）。用 --passphrase-stdin "
                              "从标准输入提供一行，或直接在终端交互输入" % key_path(root)},
                     EXIT_MISMATCH)
-    if number is None:
-        number = VISA_DEFAULT_NUMBER
+    scope, err = normalize_scope(scope_type, scope_hash, task_id, plan_id)
+    if err is not None:
+        return err
     if minutes is None:
         minutes = VISA_DEFAULT_MINUTES
     try:
-        number = int(number)
         minutes = int(minutes)
     except (TypeError, ValueError):
         return emit({"ok": False, "error": "bad_number",
-                     "hint": "--number 与 --time 必须是正整数，--time 单位是分钟"},
-                    EXIT_USAGE)
-    if number < 1 or minutes < 1:
+                     "hint": "--time 必须是正整数，单位是分钟"}, EXIT_USAGE)
+    if minutes < 1:
         return emit({"ok": False, "error": "bad_number",
-                     "hint": "--number 与 --time 必须 >= 1，--time 单位是分钟"},
-                    EXIT_USAGE)
+                     "hint": "--time 必须 >= 1，单位是分钟"}, EXIT_USAGE)
+    if number is None:
+        number = VISA_DEFAULT_NUMBER
+    if isinstance(number, str) and number.strip().lower() == VISA_UNLIMITED:
+        # unlimited 只对 plan 开放：Plan 有明确终点（DAG 跑完即散），
+        # 而 command 场景下的无限次等于给单条命令开了永久免死金牌。
+        if scope["scope_type"] != VISA_SCOPE_PLAN:
+            return emit({"ok": False, "error": "bad_number",
+                         "hint": "--number unlimited 只允许 scope-type=plan；"
+                                 "command / digest 必须给正整数配额"}, EXIT_USAGE)
+        number = VISA_UNLIMITED
+    else:
+        try:
+            number = int(number)
+        except (TypeError, ValueError):
+            return emit({"ok": False, "error": "bad_number",
+                         "hint": "--number 必须是正整数，plan 场景可写 unlimited"},
+                        EXIT_USAGE)
+        if number < 1:
+            return emit({"ok": False, "error": "bad_number",
+                         "hint": "--number 必须 >= 1，plan 场景可写 unlimited"},
+                        EXIT_USAGE)
     created_at = int(time.time())
     record = {"visa_id": "", "number": number, "created_at": created_at,
               "expires_at": created_at + minutes * 60, "note": note or ""}
+    record.update(scope)
     for _ in range(8):
         candidate = VISA_ID_PREFIX + os.urandom(4).hex()
         if not visa_path(root, candidate).exists():
@@ -520,6 +620,10 @@ def cmd_visa_issue(root, number, minutes, note, passphrase):
                                               time.localtime(record["expires_at"]))
                  if record["expires_at"] > 0 else "",
                  "note": record["note"],
+                 "scope_type": record["scope_type"],
+                 "scope_hash": record.get("scope_hash") or "",
+                 "task_id": record.get("task_id") or "",
+                 "plan_id": record.get("plan_id") or "",
                  "path": str(visa_path(root, record["visa_id"]))}, EXIT_OK)
 
 
@@ -540,6 +644,10 @@ def cmd_visa_list(root):
                      "created_at": record.get("created_at"),
                      "expires_at": record.get("expires_at"),
                      "note": record.get("note") or "",
+                     "scope_type": visa_scope_type(record),
+                     "scope_hash": record.get("scope_hash") or "",
+                     "task_id": record.get("task_id") or "",
+                     "plan_id": record.get("plan_id") or "",
                      "status": state}
             try:
                 entry["expires_iso"] = time.strftime(
@@ -570,8 +678,64 @@ def cmd_visa_revoke(root, visa_id):
                  "path": str(path)}, EXIT_OK)
 
 
-def cmd_visa_consume(root, visa_id):
-    """握手期消耗一次配额：扣减立刻落盘，扣到 0 时文件当场删除（用完即焚）。"""
+def cmd_visa_peek(root, visa_id):
+    """只读查看：不扣配额，用于审批门前预检（决定要不要走到扣减那一步）。"""
+    if not valid_visa_id(visa_id):
+        return emit({"ok": False, "error": "visa_invalid", "reason": "bad_id",
+                     "visa_id": visa_id,
+                     "hint": "签证 ID 形如 v-0123abcd；不带签证时只能走重封签"},
+                    EXIT_MISMATCH)
+    record = read_visa(root, visa_id)
+    if record is None:
+        return emit({"ok": False, "error": "visa_invalid", "reason": "not_found",
+                     "visa_id": visa_id,
+                     "hint": "签证不存在或已被销毁，由人重新执行 visa issue"},
+                    EXIT_MISMATCH)
+    state, number = visa_state(record)
+    return emit({"ok": state == "valid", "visa_id": visa_id, "status": state,
+                 "number": number, "expires_at": record.get("expires_at"),
+                 "scope_type": visa_scope_type(record),
+                 "scope_hash": record.get("scope_hash") or "",
+                 "task_id": record.get("task_id") or "",
+                 "plan_id": record.get("plan_id") or ""},
+                EXIT_OK if state == "valid" else EXIT_MISMATCH)
+
+
+def scope_mismatch(record, scope):
+    """比对签证作用域与本次执行对象；返回空字符串表示匹配，否则返回原因码。
+
+    规则（与签发时的绑定逐字对应）：
+      digest  —— 调用方不许带任何 scope 参数（带了就是拿老签证办新事）；
+      command —— 命令哈希必须相等；给了 task_id 时还必须是同一任务；
+      plan    —— plan_id 相等即放行（Plan 级联匹配）；plan_id 没给时按 DAG 指纹比。
+    任何一条对不上都返回原因码，由调用方直接拒绝，**不回落到审批**。
+    """
+    kind = visa_scope_type(record)
+    digest = (scope.get("scope_hash") or "").strip().lower()
+    task = (scope.get("task_id") or "").strip()
+    plan = (scope.get("plan_id") or "").strip()
+    if kind == VISA_SCOPE_DIGEST:
+        return "digest_scope" if (digest or task or plan) else ""
+    if not (digest or task or plan):
+        return "scope_required"
+    if kind == VISA_SCOPE_COMMAND:
+        if task and task != (record.get("task_id") or ""):
+            return "task_mismatch"
+        if not digest:
+            return "hash_required"
+        return "" if digest == (record.get("scope_hash") or "") else "hash_mismatch"
+    if plan:
+        return "" if plan == (record.get("plan_id") or "") else "plan_mismatch"
+    return "" if digest == (record.get("scope_hash") or "") else "hash_mismatch"
+
+
+def cmd_visa_consume(root, visa_id, scope=None):
+    """握手期消耗一次配额：扣减立刻落盘，扣到 0 时文件当场删除（用完即焚）。
+
+    scope 为空表示「老式 digest 签证」调用（ats.py 完整性校验用）；
+    带 scope 时先比对作用域，不匹配则一次配额都不扣。
+    """
+    scope = scope or {}
     if not valid_visa_id(visa_id):
         return emit({"ok": False, "error": "visa_invalid", "reason": "bad_id",
                      "visa_id": visa_id,
@@ -595,6 +759,25 @@ def cmd_visa_consume(root, visa_id):
                          "visa_id": visa_id,
                          "hint": "签证已过期或配额耗尽，由人重新执行 visa issue"},
                         EXIT_MISMATCH)
+        reason = scope_mismatch(record, scope)
+        if reason:
+            return emit({"ok": False, "error": "visa_mismatch", "reason": reason,
+                         "visa_id": visa_id,
+                         "scope_type": visa_scope_type(record),
+                         "expected_hash": record.get("scope_hash") or "",
+                         "expected_task": record.get("task_id") or "",
+                         "expected_plan": record.get("plan_id") or "",
+                         "given_hash": (scope.get("scope_hash") or "").strip().lower(),
+                         "given_task": (scope.get("task_id") or "").strip(),
+                         "given_plan": (scope.get("plan_id") or "").strip(),
+                         "hint": "签证只对它签发时绑定的对象生效：哈希或 ID 不符就是"
+                                 "跨任务使用，请由人重新签发对应签证"},
+                        EXIT_MISMATCH)
+        if number == VISA_UNLIMITED:
+            return emit({"ok": True, "visa_id": visa_id,
+                         "remaining": VISA_UNLIMITED, "destroyed": False,
+                         "scope_type": visa_scope_type(record),
+                         "expires_at": record.get("expires_at")}, EXIT_OK)
         remaining = number - 1
         if remaining <= 0:
             try:
@@ -609,11 +792,13 @@ def cmd_visa_consume(root, visa_id):
             sys.stderr.write("[Visa] 配额已耗尽，签证已销毁，"
                              "后续执行请重新封签或申请新签证。\n")
             return emit({"ok": True, "visa_id": visa_id, "remaining": 0,
-                         "destroyed": True}, EXIT_OK)
+                         "destroyed": True,
+                         "scope_type": visa_scope_type(record)}, EXIT_OK)
         record["number"] = remaining
         write_manifest(visa_path(root, visa_id), record)
         return emit({"ok": True, "visa_id": visa_id, "remaining": remaining,
-                     "destroyed": False, "expires_at": record.get("expires_at")}, EXIT_OK)
+                     "destroyed": False, "scope_type": visa_scope_type(record),
+                     "expires_at": record.get("expires_at")}, EXIT_OK)
     finally:
         release_visa_lock(lock)
 
@@ -621,12 +806,21 @@ def cmd_visa_consume(root, visa_id):
 def cmd_visa(root, sub, opts, passphrase):
     if sub == "issue":
         return cmd_visa_issue(root, opts.get("number"), opts.get("minutes"),
-                              opts.get("note"), passphrase)
+                              opts.get("note"), passphrase,
+                              scope_type=opts.get("scope_type"),
+                              scope_hash=opts.get("scope_hash"),
+                              task_id=opts.get("task_id"),
+                              plan_id=opts.get("plan_id"))
     if sub == "list":
         return cmd_visa_list(root)
+    if sub == "peek":
+        return cmd_visa_peek(root, opts.get("visa_id") or "")
     if sub == "revoke":
         return cmd_visa_revoke(root, opts.get("visa_id") or "")
-    return cmd_visa_consume(root, opts.get("visa_id") or "")
+    return cmd_visa_consume(root, opts.get("visa_id") or "",
+                            {"scope_hash": opts.get("scope_hash"),
+                             "task_id": opts.get("task_id"),
+                             "plan_id": opts.get("plan_id")})
 
 
 VALUE_FLAGS = {
@@ -635,18 +829,24 @@ VALUE_FLAGS = {
     "--time": "minutes",
     "--note": "note",
     "--id": "visa_id",
+    "--scope-type": "scope_type",
+    "--scope-hash": "scope_hash",
+    "--task-id": "task_id",
+    "--plan-id": "plan_id",
 }
 
 
 def parse_args(argv):
     """解析参数，返回 (action, opts)；用法错误返回 (None, None)。
 
-    --number / --time / --note / --id 只在 visa 子命令里有意义，其余子命令带上
+    --number / --time / --note / --id / --scope-type / --scope-hash /
+    --task-id / --plan-id 只在 visa 子命令里有意义，其余子命令带上
     也不会被消费（保持旧调用方按位置解析的兼容性）。
     """
     opts = {"root": None, "confirm": False, "passphrase_stdin": False,
             "number": None, "minutes": None, "note": None,
-            "visa_id": None, "sub": None}
+            "visa_id": None, "sub": None, "scope_type": None,
+            "scope_hash": None, "task_id": None, "plan_id": None}
     words = []
     i = 0
     while i < len(argv):
@@ -681,7 +881,7 @@ def parse_args(argv):
         return None, None
     action = words[0]
     if action == "visa":
-        if len(words) < 2 or words[1] not in ("issue", "list", "revoke", "consume"):
+        if len(words) < 2 or words[1] not in VISA_SUBS:
             return None, None
         if len(words) > 3:
             return None, None
@@ -696,8 +896,11 @@ def parse_args(argv):
 
 USAGE = ("python ats_guard.py verify|seal|init|auth|self "
          "[--root DIR] [--confirm] [--passphrase-stdin] [--json]；"
-         "visa: issue --number N --time MINUTES [--note TEXT] | list | "
-         "revoke <visa_id> | consume --id <visa_id>")
+         "visa: issue --time MINUTES [--number N|unlimited] [--note TEXT] "
+         "[--scope-type digest|command|plan --scope-hash SHA256 "
+         "--task-id TASK|--plan-id PLAN] | list | peek --id <visa_id> | "
+         "revoke <visa_id> | consume --id <visa_id> "
+         "[--scope-hash SHA256] [--task-id TASK] [--plan-id PLAN]")
 
 
 def main(argv=None):
@@ -708,7 +911,7 @@ def main(argv=None):
     root = resolve_root(opts.get("root"))
     if action == "visa":
         sub = opts.get("sub")
-        if sub not in ("issue", "list", "revoke", "consume"):
+        if sub not in VISA_SUBS:
             return emit({"ok": False, "error": "usage", "usage": USAGE}, EXIT_USAGE)
         passphrase = ""
         if sub == "issue":

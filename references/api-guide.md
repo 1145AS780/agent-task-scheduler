@@ -1,4 +1,4 @@
-# API 指南 — agent-task-scheduler v3.2.0-R0
+# API 指南 — agent-task-scheduler v3.3.0-R0
 
 本文分两半：**前半是对外协议**（外部人类 / Agent 怎么调、怎么读 JSON、怎么处理退出码与审批），
 **后半是内部扩展点**（新增策略键、审批模式、子命令、UI 动作时要同步改哪些地方）。

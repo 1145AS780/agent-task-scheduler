@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ats_torrent.py — agent-task-scheduler 的 BitTorrent worker (v3.2.0-R0)。
+"""ats_torrent.py — agent-task-scheduler 的 BitTorrent worker (v3.3.0-R0)。
 
 由 `ats.py torrent` 自动派生，**不面向人直接使用**。它读取一份 torrent spec
 （JSON），拉起一个只监听 127.0.0.1 的 aria2c RPC 实例，把种子下到目标目录，

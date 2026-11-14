@@ -1,4 +1,4 @@
-# 版本号规范 — agent-task-scheduler v3.2.0-R0
+# 版本号规范 — agent-task-scheduler v3.3.0-R0
 
 本文规定版本号怎么写、什么时候进位、发版前必须做什么。实现落点是文末的「版本号落点清单」，
 改版本号时按那份清单逐个核对，别只改 SKILL.md 头部。
@@ -67,25 +67,42 @@
 6. **两处同步**：`CHANGELOG.md` 与 `SKILL.md` §15「版本历史」是同一份内容的两处落点，
    改版本时两边都要改；`CHANGELOG.md` 是给使用者看的发版文档，`SKILL.md` 是给 Agent 读的技能说明
 
-## 5. 版本号落点清单（19 处）
+## 5. 版本号落点清单（20 处）
 
 改版本号时逐个核对，漏掉一处就会出现 `(v2.7)` 这种陈旧字样混在发版里（本项目 3.2.0-R0 之前
 `ats.py` 就漏了 docstring 与 `--help` 两处，仍写着 v2.7）。
 
+> 计数口径：`SKILL.md` 3 处 + `references/*.md` 10 份各 1 处 + `scripts/` 4 个文件共 7 处 = 20 处。
+> 3.2.0-R0 时本表写的是「19 处」，漏数了本文件自己的标题行——`references/` 下实际有 10 份 `.md`
+> （9 份主题文档 + 本文件）。这不是版本变更造成的增减，是原来的计数口径就少了一份。
+
 | 文件 | 位置 | 形态 |
 | --- | --- | --- |
-| `SKILL.md` | 第 4 行 | `version: "3.2.0-R0"` |
-| `SKILL.md` | 第 7 行 | `# agent-task-scheduler v3.2.0-R0` |
-| `SKILL.md` | 版本历史表首行 | `\| 3.2.0-R0 \|` |
-| `references/*.md`（9 份） | 第 1 行 | `# … — agent-task-scheduler v3.2.0-R0` |
-| `scripts/ats.py` | docstring + `build_parser` 的 `description` | `(v3.2.0-R0)` |
-| `scripts/ats_plan.py` | docstring + `description` | `(v3.2.0-R0)` |
-| `scripts/ats_ui.py` | docstring + `VERSION` 常量 | `(v3.2.0-R0)` / `VERSION = "3.2.0-R0"` |
-| `scripts/ats_torrent.py` | docstring | `(v3.2.0-R0)` |
+| `SKILL.md` | 第 4 行 | `version: "3.3.0-R0"` |
+| `SKILL.md` | 第 7 行 | `# agent-task-scheduler v3.3.0-R0` |
+| `SKILL.md` | 版本历史表首行 | `\| 3.3.0-R0 \|` |
+| `references/*.md`（10 份，含本文件） | 第 1 行 | `# … — agent-task-scheduler v3.3.0-R0` |
+| `scripts/ats.py` | docstring + `build_parser` 的 `description`（2 处） | `(v3.3.0-R0)` |
+| `scripts/ats_plan.py` | docstring + `description`（2 处） | `(v3.3.0-R0)` |
+| `scripts/ats_ui.py` | docstring + `VERSION` 常量（2 处） | `(v3.3.0-R0)` / `VERSION = "3.3.0-R0"` |
+| `scripts/ats_torrent.py` | docstring（1 处） | `(v3.3.0-R0)` |
 
-`scripts/ats_mcp_http.py` 的 `(v1.0)` 是**模块自身**的版本号，不是项目版本，不随本项目进位。
+`scripts/ats_mcp_http.py` 的 `(v1.0)` 与 `scripts/ats_mcp.py` 的 `SERVER_VERSION = "0.1.0"`
+都是**模块自身**的版本号，不是项目版本，不随本项目进位（MCP 服务器有独立的协议与客户端兼容问题，
+跟着项目版本一起跳只会让客户端误判）。
 
-## 6. 当前判定（v3.2.0-R0 为什么是 B 而不是 C）
+## 6. 当前判定（v3.3.0-R0 为什么是 B 而不是 C）
+
+`v3.2.0-R0` 的 tag 已经在 2026-11-14 13:55:05 打到 `49d7476` 并推到 origin（tag 对象
+`0899650`），发出去的内容是 extend 插件层 + torrent 公共 Tracker + 基础签证（75 条用例）。
+本次待发版的是**此前完全没有的能力**：Task Visa / Plan Visa（作用域三选一、`approval_required`
+自动放行、Plan 级联匹配、`unlimited` 只对 plan 开放）。按第 2 节，新增能力属 B、`C` 强制清零，
+因此是 `v3.3.0-R0`，不是 `v3.2.1-R0`。
+
+为什么不塞回已发布的 3.2.0-R0：tag 一旦推出去就是对外承诺。同一个版本号下改内容，会让
+「拉 tag 的人」和「读 CHANGELOG 的人」拿到两套事实，且无法事后分辨。要改已发布内容只能新版本。
+
+### 6.1 历史判定：v3.2.0-R0 为什么是 B 而不是 C
 
 本次待发版内容包含一项**此前完全没有的能力**：`torrent` 自动注入 138 条公共 Tracker
 （`DEFAULT_TRACKERS` + `ATS_TRACKERS` 覆盖开关 + `sanitize_trackers` 清洗 + 新事件字段

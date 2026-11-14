@@ -1,4 +1,4 @@
-# 权限与审批 — agent-task-scheduler v3.2.0-R0
+# 权限与审批 — agent-task-scheduler v3.3.0-R0
 
 本文描述 L0-L3 分级、策略上限、白名单、审批闭环与存活租约免审。实现见 `scripts/ats.py` 的
 `policy()`、`whitelist_match()`、`lease_state()`、`lease_autonomy()`、`permission_gate()`、

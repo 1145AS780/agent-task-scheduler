@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""agent-task-scheduler — Task 层执行器 (v3.2.0-R0)
+"""agent-task-scheduler — Task 层执行器 (v3.3.0-R0)
 
 命令：
   create <id> --command "..." [--cwd DIR] [--level L0..L3] [--timeout SEC]
@@ -91,6 +91,7 @@ GUARD_HANDLES = []                     # 运行期持有的核心脚本只读句
 GUARD_SKIP_ACTIVE = False              # 本次进程是否以 --skip-guard 放行
 GUARD_POLICY_SNAPSHOT = None           # 握手时冻结的策略快照
 GUARD_VISA_ENV = "ATS_VISA_ID"         # 签证 ID 的环境变量形式，与 --visa-id 等价
+GUARD_VISA_ID = None                   # 本次进程携带的签证 ID，权限门凭它匹配 Task/Plan 作用域
 
 DEFAULT_LEASE_AUTONOMY = {
     "enabled": False,
@@ -697,6 +698,16 @@ def _normalize_command(text) -> str:
     return " ".join(str(text or "").split())
 
 
+def command_scope_hash(text) -> str:
+    """Task Visa 绑定的命令指纹：SHA-256(归一化原文)。
+
+    归一化只折叠空白，与 `_normalize_command` 同一口径 —— 签发时按 task.json
+    里的原文算，消费时按权限门实际看到的 gate_text 算，两边必须逐字一致，
+    否则就是「拿这张签证去跑别的命令」，直接判 visa_mismatch。
+    """
+    return hashlib.sha256(_normalize_command(text).encode("utf-8")).hexdigest()
+
+
 SCRIPT_SUFFIXES = (".py", ".ps1", ".sh", ".bat", ".cmd", ".js", ".mjs")
 
 
@@ -994,6 +1005,61 @@ def create_lease_approval(root, command, required_level, lease, rule, context=No
     return record
 
 
+def create_visa_approval(root, command, required_level, visa, scope, context=None):
+    """把「签证自动放行」落成一条只供追溯的审批记录。
+
+    与租约免审的关键区别：`expires_at` 直接写成创建时刻，即「落地即过期」。
+    签证的每一次放行都必须现场消费配额，这条记录**不是可复用凭证** ——
+    否则事后拿 `--approval <id>` 重放，就能绕开签证配额一直跑。
+    status 仍是 approved（与租约一致，便于 approval prune 统一清理），
+    真正的身份写在 resolved_by = visa:<visa_id> 与 auto_approved 两个字段上。
+    """
+    context = dict(context or {})
+    created = now_ts()
+    record = {
+        "id": new_approval_id(),
+        "command": command,
+        "required_level": str(required_level).upper(),
+        "status": "approved",
+        "created_at": created,
+        "created_iso": iso(created),
+        "expires_at": created,
+        "resolved_at": created,
+        "resolved_iso": iso(created),
+        "resolved_by": "visa:%s" % visa.get("visa_id"),
+        "note": "visa_auto_approved: scope=%s" % (scope.get("scope_type") or ""),
+        "source": context.get("source", "operation"),
+        "schedule_id": context.get("schedule_id"),
+        "plan_id": context.get("plan_id"),
+        "stage_id": context.get("stage_id"),
+        "step_id": context.get("step_id"),
+        "task_id": context.get("task_id"),
+        "task_instance": context.get("task_instance"),
+        "task_created_at": context.get("task_created_at"),
+        "resume": None,
+        "auto_approved": True,
+        "visa_id": visa.get("visa_id"),
+        "visa_scope_type": scope.get("scope_type"),
+        "visa_scope_hash": scope.get("scope_hash"),
+        "visa_remaining": visa.get("remaining"),
+    }
+    save_approval(root, record)
+    log_event(root, "visa_auto_approved", approval_id=record["id"],
+              visa_id=record["visa_id"], scope_type=record["visa_scope_type"],
+              scope_hash=record["visa_scope_hash"], remaining=record["visa_remaining"],
+              required_level=record["required_level"], source=record["source"],
+              task_id=record["task_id"], plan_id=record["plan_id"],
+              schedule_id=record["schedule_id"], step_id=record["step_id"])
+    emit_event(root, {"type": "visa_auto_approved", "visa_id": record["visa_id"],
+                      "approval_id": record["id"],
+                      "scope_type": record["visa_scope_type"],
+                      "remaining": record["visa_remaining"],
+                      "level": record["required_level"],
+                      "task_id": record["task_id"], "plan_id": record["plan_id"],
+                      "stage_id": record["stage_id"], "step_id": record["step_id"]})
+    return record
+
+
 def lease_autonomy(root, required_level, text, context=None):
     """存活租约 + 命中白名单 → 免审放行；不适用时返回 None，交回原有审批流程。
 
@@ -1108,6 +1174,9 @@ def permission_gate(root, command, approval_id=None, context=None):
     if check["ok"]:
         result.update(allowed=True, reason="approval")
         return result
+    visa = _visa_task_gate(root, command, context, result)
+    if visa is not None:
+        return visa
     result.update(allowed=False, reason="approval_required")
     return result
 
@@ -2105,7 +2174,9 @@ def _start_task(root, task_id, approval=None, wait=False, force=False):
             except OSError:
                 pass
 
-        effective_approval = approval or (gate.get("lease") or {}).get("approval_id")
+        effective_approval = (approval
+                              or (gate.get("lease") or {}).get("approval_id")
+                              or (gate.get("approval_id") if gate.get("auto_approved") else None))
         task.update({
             "status": "starting",
             "started_at": now_ts(),
@@ -3628,6 +3699,20 @@ def _guard_visa_gate(root, visa_id, verify_payload, files):
     扣减配额交给 ats_guard.py visa consume，那边带锁做读改写，扣到 0 当场删文件。
     调用方保证 visa_id 非空、且失败范围已由 _visa_scope 确认可覆盖。
     """
+    rc, peek = _run_guard(["visa", "peek", "--id", visa_id], root)
+    scope_type = peek.get("scope_type") if peek.get("ok") else None
+    if scope_type in ("command", "plan"):
+        # Task/Plan Visa 绑的是「某条命令 / 某个计划」，不覆盖核心脚本摘要不符。
+        # 硬拿它过握手就是越权使用，一次配额都不扣，直接拒绝。
+        log_event(root, "guard_visa_scope_refused", visa_id=visa_id,
+                  scope_type=scope_type, files=files)
+        return {"code": EXIT_DENIED,
+                "payload": {"error": "visa_scope_not_applicable",
+                            "detail": {"stage": "guard_visa", "visa_id": visa_id,
+                                       "scope_type": scope_type, "files": files,
+                                       "hint": "这张签证绑定的是具体任务/计划，不覆盖核心"
+                                               "脚本摘要不符。要么 seal --confirm 重封签，"
+                                               "要么由人签发一张 digest 签证"}}}
     rc, result = _run_guard(["visa", "consume", "--id", visa_id], root)
     if rc != EXIT_OK or not result.get("ok"):
         log_event(root, "guard_visa_rejected", visa_id=visa_id, exit_code=rc,
@@ -3652,6 +3737,58 @@ def _guard_visa_gate(root, visa_id, verify_payload, files):
               remaining=result.get("remaining"), destroyed=result.get("destroyed"),
               files=files)
     return None
+
+
+def _visa_task_gate(root, command, context, result):
+    """approval_required 时的 Task / Plan Visa 闸门；不涉及签证一律返回 None。
+
+    只接管 scope_type=command / plan 的签证。digest 签证是完整性校验专用，
+    到这里原样交回人工审批 —— 老语义「签证不放宽审批门」不变。
+
+    三道关：
+      1) peek 只读预检：签证不存在/过期/是 digest → 交回原流程，不报错、不扣配额；
+      2) consume 带作用域消费：命令哈希或 task/plan ID 对不上 → 直接 visa_mismatch
+         拒绝，**不回落到审批**（跨任务使用一律不许）；
+      3) 放行留痕：写 auto_approved 审批记录 + visa_auto_approved 事件。
+    """
+    visa_id = (context.get("visa_id") or GUARD_VISA_ID or "").strip()
+    if not visa_id:
+        return None
+    rc, peek = _run_guard(["visa", "peek", "--id", visa_id], root)
+    if rc != EXIT_OK or not peek.get("ok"):
+        log_event(root, "visa_task_skipped", visa_id=visa_id,
+                  reason=peek.get("reason") or peek.get("error"))
+        return None
+    if peek.get("scope_type") not in ("command", "plan"):
+        return None
+    scope = {"scope_hash": command_scope_hash(command),
+             "task_id": str(context.get("task_id") or "").strip(),
+             "plan_id": str(context.get("plan_id") or "").strip()}
+    args = ["visa", "consume", "--id", visa_id, "--scope-hash", scope["scope_hash"]]
+    if scope["task_id"]:
+        args += ["--task-id", scope["task_id"]]
+    if scope["plan_id"]:
+        args += ["--plan-id", scope["plan_id"]]
+    rc, consumed = _run_guard(args, root)
+    if rc != EXIT_OK or not consumed.get("ok"):
+        log_event(root, "visa_task_rejected", visa_id=visa_id, exit_code=rc,
+                  error=consumed.get("error"), reason=consumed.get("reason"),
+                  task_id=scope["task_id"], plan_id=scope["plan_id"],
+                  scope_hash=scope["scope_hash"])
+        denied = dict(result)
+        denied.update(allowed=False, reason="visa_mismatch", visa=consumed,
+                      visa_id=visa_id,
+                      visa_scope_type=consumed.get("scope_type") or peek.get("scope_type"))
+        return denied
+    record = create_visa_approval(
+        root, command, result.get("required_level"),
+        {"visa_id": visa_id, "remaining": consumed.get("remaining")},
+        {"scope_type": consumed.get("scope_type") or peek.get("scope_type"),
+         "scope_hash": scope["scope_hash"]},
+        context)
+    result.update(allowed=True, reason="visa_auto", approval_id=record["id"],
+                  approval=record, visa=consumed, auto_approved=True)
+    return result
 
 
 def guard_handshake(root, skip_guard=False, guard_approval=None, visa_id=None):
@@ -3734,7 +3871,7 @@ def print_json(data, code=EXIT_OK):
 def build_parser():
     ap = argparse.ArgumentParser(
         prog="ats.py",
-        description="agent-task-scheduler — Task 层执行器 (v3.2.0-R0)",
+        description="agent-task-scheduler — Task 层执行器 (v3.3.0-R0)",
     )
     ap.add_argument("--root", default=None,
                     help="状态根目录，默认 <ats 本体目录>/.ats（即 OCSKIS/.ats）；"
@@ -3897,7 +4034,133 @@ def build_parser():
     e.add_argument("--force", action="store_true", help="task id 已存在时覆盖")
     e.add_argument("--json", action="store_true")
 
+    p = sub.add_parser("visa",
+                       help="签证管理（issue / list / peek / revoke / consume）")
+    p.add_argument("visa_action",
+                   choices=["issue", "list", "peek", "revoke", "consume"])
+    p.add_argument("visa_id", nargs="?", default=None, help="peek/revoke/consume 用")
+    p.add_argument("--id", dest="visa_id_flag", default=None, help="等价于位置参数 visa_id")
+    p.add_argument("--number", default=None,
+                   help="配额次数；plan 场景可写 unlimited")
+    p.add_argument("--time", type=int, default=None, help="有效期（分钟），默认 30")
+    p.add_argument("--note", default=None)
+    p.add_argument("--task", default=None,
+                   help="签发 Task Visa：读 tasks/<id>/task.json 的命令原文并绑定哈希")
+    p.add_argument("--plan", default=None,
+                   help="签发 Plan Visa：读该 Plan 的 DAG 并绑定指纹")
+    p.add_argument("--scope-type", dest="scope_type", default=None,
+                   choices=["digest", "command", "plan"])
+    p.add_argument("--scope-hash", dest="scope_hash", default=None)
+    p.add_argument("--task-id", dest="task_id", default=None)
+    p.add_argument("--plan-id", dest="plan_id", default=None)
+
     return ap
+
+
+def _plan_module():
+    """按需导入同目录 ats_plan.py。
+
+    ats_plan 反向 import ats（core 调 extension），模块级 import 会成环，
+    所以只在真正需要读 plan.json / 校验 DAG 时才延迟导入。
+    """
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import ats_plan
+    return ats_plan
+
+
+def _visa_target_task(root, task_id):
+    """Task Visa 的作用域：按 task.json 里的命令原文算哈希。
+
+    防篡改靠哈希本身：签发这一刻的内容被写进签证，之后谁再改 task.json，
+    消费时算出来的哈希就对不上，签证自动失效，不需要额外时间戳比对。
+    """
+    task = load_task(root, task_id)
+    if not task:
+        return None, {"error": "task_not_found", "task_id": task_id,
+                      "hint": "先 create 建 Task，或 list 确认 task_id 拼写"}
+    text = hook_gate_text(task.get("command") or "", task.get("post_hook"))
+    if not text.strip():
+        return None, {"error": "task_command_empty", "task_id": task_id,
+                      "hint": "task.json 里没有命令原文，没有可绑定的对象"}
+    return {"scope_type": "command", "scope_hash": command_scope_hash(text),
+            "task_id": str(task.get("id") or task_id), "command": text}, None
+
+
+def _visa_target_plan(root, plan_id):
+    """Plan Visa 的作用域：先校验整条 DAG，合法才允许签发。"""
+    planmod = _plan_module()
+    sdir, pdir = planmod.resolve_plan(root, plan_id)
+    if pdir is None:
+        return None, {"error": "plan_not_found", "plan_id": plan_id,
+                      "hint": "先 ats_plan.py list 确认 plan_id 拼写"}
+    plan = planmod.load_plan(pdir) or {}
+    errors = planmod.validate_spec(plan)
+    if errors:
+        return None, {"error": "plan_spec_invalid", "plan_id": plan_id,
+                      "errors": errors,
+                      "hint": "DAG 不合法不给签：Plan Visa 只对能跑完的计划有意义"}
+    return {"scope_type": "plan", "scope_hash": planmod.plan_fingerprint(plan),
+            "plan_id": str(plan.get("id") or plan_id),
+            "schedule_id": Path(sdir).name}, None
+
+
+def cmd_visa(root, args):
+    """签证管理入口：issue 在这里补齐作用域，其余动作原样转交 ats_guard。"""
+    action = args.visa_action
+    visa_id = (args.visa_id_flag or args.visa_id or "").strip()
+    if action != "issue":
+        argv = ["visa", action]
+        if visa_id:
+            argv += ["--id", visa_id]
+        if action == "consume":
+            for flag, value in (("--scope-hash", args.scope_hash),
+                                ("--task-id", args.task_id),
+                                ("--plan-id", args.plan_id)):
+                if value:
+                    argv += [flag, value]
+        rc, payload = _run_guard(argv, root, GUARD_PASSPHRASE)
+        return print_json(payload, rc)
+
+    if args.task and args.plan:
+        return print_json({"error": "visa_scope_conflict",
+                           "hint": "--task 与 --plan 只能二选一"}, EXIT_USAGE)
+    scope_type, scope_hash = args.scope_type, args.scope_hash
+    task_id, plan_id, resolved = args.task_id, args.plan_id, None
+    if args.task:
+        resolved, err = _visa_target_task(root, args.task)
+        if err is not None:
+            return print_json(err, EXIT_CONFLICT)
+        scope_type, scope_hash = resolved["scope_type"], resolved["scope_hash"]
+        task_id, plan_id = resolved["task_id"], None
+    elif args.plan:
+        resolved, err = _visa_target_plan(root, args.plan)
+        if err is not None:
+            return print_json(err, EXIT_CONFLICT)
+        scope_type, scope_hash = resolved["scope_type"], resolved["scope_hash"]
+        plan_id, task_id = resolved["plan_id"], None
+    argv = ["visa", "issue"]
+    if args.number is not None:
+        argv += ["--number", str(args.number)]
+    if args.time is not None:
+        argv += ["--time", str(args.time)]
+    if args.note:
+        argv += ["--note", args.note]
+    if scope_type:
+        argv += ["--scope-type", scope_type]
+    if scope_hash:
+        argv += ["--scope-hash", scope_hash]
+    if task_id:
+        argv += ["--task-id", task_id]
+    if plan_id:
+        argv += ["--plan-id", plan_id]
+    rc, payload = _run_guard(argv, root, GUARD_PASSPHRASE)
+    if isinstance(payload, dict) and payload.get("ok") and resolved:
+        payload["scope_target"] = {k: v for k, v in resolved.items() if k != "command"}
+        if resolved.get("command"):
+            payload["command"] = resolved["command"]
+    return print_json(payload, rc)
 
 
 HANDLERS = {
@@ -3919,15 +4182,17 @@ HANDLERS = {
     "logs": cmd_logs,
     "policy": cmd_policy,
     "extend": cmd_extend,
+    "visa": cmd_visa,
 }
 
 
 def main(argv=None):
-    global GUARD_PASSPHRASE
+    global GUARD_PASSPHRASE, GUARD_VISA_ID
     argv = list(sys.argv[1:] if argv is None else argv)
     # 看门狗参数必须在 argparse 之前剥离：它们是跨子命令的全局开关
     skip_guard, guard_approval, visa_id, passphrase, argv = _extract_guard_flags(argv)
     GUARD_PASSPHRASE = passphrase or None
+    GUARD_VISA_ID = visa_id or None
     parser = build_parser()
     args = parser.parse_args(argv)
     if not args.command_name:
@@ -3941,10 +4206,17 @@ def main(argv=None):
     denied = guard_handshake(root, skip_guard=skip_guard, guard_approval=guard_approval,
                              visa_id=visa_id)
     if denied is not None:
-        # 准入失败时只放行 approve：否则「跳过看门狗」这类审批单永远批不了，自己锁死自己
-        if args.command_name != "approve":
+        # 准入失败时只放行 approve 与 visa 的只读/签发动作：
+        #   approve —— 否则「跳过看门狗」这类审批单永远批不了，自己锁死自己；
+        #   visa issue/list/peek —— 核心脚本正被改动时，人要签发 Task/Plan 签证
+        #     才能继续测试，签发本身仍受人类口令约束。
+        # revoke / consume 不放行：它们不需要口令，没必要在准入失败时开口子。
+        exempt = args.command_name == "approve" or (
+            args.command_name == "visa" and args.visa_action in ("issue", "list", "peek"))
+        if not exempt:
             return print_json(denied["payload"], denied["code"])
-        log_event(root, "guard_bypassed_for_approve",
+        log_event(root, "guard_bypassed_for_%s" % args.command_name,
+                  action=getattr(args, "visa_action", None),
                   stage=(denied["payload"].get("detail") or {}).get("stage"))
     handler = HANDLERS[args.command_name]
     return handler(root, args) or EXIT_OK

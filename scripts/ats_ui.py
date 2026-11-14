@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ats_ui.py — agent-task-scheduler 人类用本地 Web 面板 (v3.2.0-R0)
+"""ats_ui.py — agent-task-scheduler 人类用本地 Web 面板 (v3.3.0-R0)
 
 只读监控 + 运行控制 + 审批 + 创建编排。纯标准库，无第三方依赖。
 
@@ -24,7 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "3.2.0-R0"
+VERSION = "3.3.0-R0"
 SERVER_START = int(time.time())
 
 SCRIPT_DIR = Path(__file__).resolve().parent

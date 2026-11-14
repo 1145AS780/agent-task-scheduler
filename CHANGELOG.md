@@ -1,10 +1,98 @@
 # 变更日志 — agent-task-scheduler
 
 版本号遵循 `vA.B.C-Rx` 规范：`A` 安全与架构级、`B` 核心功能新增、`C` 修补、`Rx` 架构重置计数。
-进位条件、发版纪律与 19 处版本号落点见 [references/versioning.md](references/versioning.md)。
+进位条件、发版纪律与 20 处版本号落点见 [references/versioning.md](references/versioning.md)。
 
 本文件与 `SKILL.md` §15「版本历史」同源，**改版本时两处必须同步**，否则使用者从
 GitHub Releases 和从 SKILL.md 会读到两套说法。
+
+---
+
+## 3.3.0-R0 — 2026-11-14
+
+> ⚠️ **升级必读：拉取本版本后必须重新封签，否则看门狗会拒绝执行。**
+>
+> 本次改动了 `scripts/` 下**五个** `.py`——功能改动落在 `ats.py`、`ats_guard.py`、
+> `ats_plan.py`，版本号进位又顺带改了 `ats_torrent.py`、`ats_ui.py` 的 docstring 与 `VERSION`；
+> 而 `ats_guard.py` 的 `core_files()` 取的是 `scripts/` 下**全部** `.py`，任何一个变动
+> 都会让 `ats_guard_manifest.json` 失配，`ats.py` 启动时的准入握手随即失败。
+>
+> 重建基线：在 `OCSKIS/` 目录下运行 `setup.bat`，输入与上次相同的口令。口令只经 stdin
+> 传递，不进 argv、不进进程列表、不进命令历史。密钥丢失时的处置见 3.2.0-R0 的升级必读。
+>
+> 完成后的自检：`python scripts/ats_guard.py verify`，应返回 `"ok": true`、`"problems": []`。
+
+### 为什么是 3.3.0 而不是 3.2.1
+
+`v3.2.0-R0` 的 tag 在 2026-11-14 13:55 已指向 `49d7476` 并推送到 origin，发出去的内容是
+extend 插件层 + torrent 公共 Tracker + 基础签证（75 条用例）。本次新增的是**此前完全没有
+的能力**（Task / Plan 签证、`approval_required` 自动放行、Plan 级联匹配），按
+[versioning.md](references/versioning.md) §2 属 B 进位，`C` 强制清零，因此是 `3.3.0-R0`。
+把新能力塞回已发布的 3.2.0-R0 会让「拉 tag 的人」和「读 CHANGELOG 的人」拿到两套事实。
+
+### 新增
+
+- **Task Visa / Plan Visa：带作用域绑定的自动审批豁免**（规范见 `SKILL.md` §5.7.2）。
+  基础签证解决的是「改完核心脚本还要跑测试」，只覆盖 `digest_mismatch`；本次解决的是
+  「高并发复杂任务里反复点批准」的审批疲劳：签证绑定到**具体对象**，命中就自动放行
+  `approval_required` 这一环。
+  - 作用域三选一，互斥（老签证文件不需要迁移，缺省即 `digest`）：
+    - `digest`：老签证语义，仅覆盖核心 `.py` 的 `digest_mismatch`
+    - `command`（Task Visa）：绑 `scope_hash` + `task_id`
+    - `plan`（Plan Visa）：绑 `scope_hash`（DAG 指纹）+ `plan_id`
+  - 签发：
+    - `ats.py visa issue --task <task_id>`：读该任务 `task.json` 的命令原文，
+      算 `SHA-256(归一化原文)` 作为 `scope_hash`，把 `task_id` 一并写死
+    - `ats.py visa issue --plan <plan_id>`：先 `validate_spec`，DAG 不合法直接
+      `plan_spec_invalid` 拒签，再绑 `plan_fingerprint`
+    - 底层仍可 `ats_guard.py visa issue --scope-type/--scope-hash/--task-id/--plan-id`
+    - 三条路径一律要人类口令（`--passphrase-stdin`）
+  - `plan_fingerprint`：只投影 stage 的 `id` / `mode` 与 step 的 `id` / `command` /
+    `level` / `depends_on`（排序）/ `retry` / `retry_backoff` / `timeout` / `cwd` /
+    `env`（键排序），排除 `attempt` / `status` / 时间戳等运行期元数据，所以「跑完再跑」
+    与 `resume` 都不改指纹
+  - `--number unlimited` **只对 `scope_type=plan` 开放**：command / digest 写 unlimited
+    直接 `bad_number`。Plan 有明确终点，单条命令的无限次等于永久免死金牌。扣减遇到
+    unlimited 不写文件，`number` 保持字符串
+  - 消费：`permission_gate` 判 `approval_required` 后，`_visa_task_gate` 先 `visa peek`
+    只读预检（不存在 / 过期 / 耗尽 / ID 非法 / 是 digest → 记 `visa_task_skipped`
+    并**交回人工审批**，不报错不扣配额），再 `visa consume` 带作用域比对。不匹配 →
+    `visa_mismatch`（`reason` ∈ `task_mismatch` / `plan_mismatch` / `hash_mismatch` /
+    `scope_required`），**一次配额都不扣、不回落审批**；匹配 → 扣配额并写
+    `auto_approved` 审批记录 + `visa_auto_approved` 事件
+  - 自动审批记录**落地即过期**（`expires_at == created_at`）：身份写在
+    `resolved_by = visa:<visa_id>` 与 `auto_approved: true` 上，只供追溯，
+    不是可复用凭证——否则事后拿 `--approval <id>` 重放就能绕开配额一直跑
+  - Plan 场景：`ats_plan.py` 的 `ensure_step_permission` 把 `visa_id` 放进 step 的
+    context；收到 `visa_mismatch` 时该 step 直接 `failed`
+    （`error_type=visa_mismatch`），不建审批单、不重试、不继续往下跑
+  - 安全底线：**防篡改**（Task Visa 的哈希签发时写死，改 `task.json` 命令即
+    `hash_mismatch`；Plan Visa 签发时校验 DAG 合法并绑指纹，但消费端按 `plan_id`
+    级联匹配，改 `plan.json` 的 DAG 不会在消费端被拦——指纹用于签发门槛与留痕，
+    Plan Visa 拿去跑普通 Task 会退回按哈希比对而必然 `hash_mismatch`）、
+    **绝不跨任务**（`task_id` / `plan_id` 逐字比对，拿 A 跑 B 直接拒
+    且不弄坏原绑定）、**放行不放权**（`deny_rules` / `policy` 上限 / hard floor /
+    preflight 全部原样生效）、**不覆盖完整性**（command / plan 签证绑的是具体对象，
+    硬拿它过握手一律 `visa_scope_not_applicable` 且不扣配额）
+  - 准入失败时的豁免扩到 `approve` 与 `visa issue / list / peek`（否则「核心脚本正在改」
+    这个最需要签证的时刻恰恰签不了证）；`revoke` / `consume` 不放行（它们不要口令，
+    没必要在准入失败时开口子）
+
+### 变更
+
+- `tests/lint.py`：13 个文件通过静态检查，退出码 0
+- `tests/selftest.py`：**82/82** 通过，退出码 0（全部在独立临时 `ATS_ROOT` 沙箱运行，
+  不污染仓库运行态）。其中签证相关 14 条（`-k visa` 14/14）：7 条 digest 签证
+  （`SKILL.md` §5.7.1）+ 7 条 Task/Plan Visa（§5.7.2，含跨任务越权拦截、`unlimited`
+  只对 plan 开放、哈希绑死命令原文、command 签证不覆盖核心脚本摘要不符）
+- `tests/readme_parity.py`：双语文档结构对齐（44 个结构块），退出码 0
+- 信任基线：本次改动了 `scripts/` 下五个 `.py`，**发版后、重封签前**
+  `ats_guard.py verify` 如实返回 `"ok": false`、`checked: 10`、`problems` 为 `ats.py` /
+  `ats_guard.py` / `ats_plan.py` / `ats_torrent.py` / `ats_ui.py` 五条 `digest_mismatch`
+  （实测输出，退出码 1）。这是预期的失配（不是缺陷），
+  按本节开头的升级必读重封签后才会回到 `"ok": true`、`problems: []`。要临时跑测试又不想
+  重封签，用签证（`visa issue`，见 `SKILL.md` §5.7.1）；要连着跑多条 L3 命令不想反复点批准，
+  用 Task / Plan Visa（§5.7.2）。
 
 ---
 
@@ -51,7 +139,8 @@ GitHub Releases 和从 SKILL.md 会读到两套说法。
   （`default` / `env:ATS_TRACKERS` / `env:ATS_TRACKERS(disabled)`）。变量里一条合法地址
   都没有时输出 `tracker_warning`，而不是崩溃。
 - **[references/versioning.md](references/versioning.md)**：版本号规范入库，含进位条件、
-  发布纪律与 19 处版本号落点清单。
+  发布纪律与 19 处版本号落点清单（该计数少算了 `references/` 下本文件自己的标题行，
+  实际 20 处；3.3.0-R0 已更正，见 versioning.md §5 的计数口径说明）。
 - **[CHANGELOG.md](CHANGELOG.md)**：本文件，此前版本历史只写在 `SKILL.md` §15。
 - **签证（Visa）：带配额的完整性豁免**（`ats_guard.py` 新子命令 + `ats.py` 握手新分支，
   规范见 `SKILL.md` §5.7.1）。改完核心脚本还要跑测试，但重封签要口令——签证就是这条
@@ -86,7 +175,8 @@ GitHub Releases 和从 SKILL.md 会读到两套说法。
   不再出现「文档写一个、代码跑另一个」。
 - **版本号格式改用 `vA.B.C-Rx`**：全仓 19 处落点（`SKILL.md` 3 处、`references/*.md` 9 份首行、
   `ats.py` / `ats_plan.py` / `ats_ui.py` / `ats_torrent.py` 共 6 处）统一到 `3.2.0-R0`。
-  旧 tag（`v3.1.1` 及更早）保持原样，不回改历史。
+  旧 tag（`v3.1.1` 及更早）保持原样，不回改历史。该计数漏了 `references/versioning.md`
+  自己的标题行（它当时也是 `3.2.0-R0`），实际 20 处，3.3.0-R0 已更正。
 - **错误返回体批量补齐可复制 `hint`**，并由 `tests/lint.py` 第 5 项
   `check_actionable_error` 强制——字面量 `print_json({"error": ...})` 缺 `hint` / `message`
   直接判失败。这条规则是为了避免「只报错不给出路」：使用者看到 `guard_check_failed`
