@@ -1,4 +1,4 @@
-# 命令书写与调用规范 — agent-task-scheduler v3.3.0-R0
+# 命令书写与调用规范 — agent-task-scheduler v4.0.0-R0
 
 本文面向「由 Agent 调用调度器脚本」这一使用场景，规定**怎么把命令传进去、怎么把结果读出来、怎么避免被 shell 吃掉引号**。几乎所有「调度器行为诡异」的事故都源于本文某一条被违反。
 
@@ -249,6 +249,24 @@ python scripts/ats.py create enc-all --level L1 --cwd D:\proj --command 'build.b
 
 - 提交 Plan 前，手工确认 `plan["cwd"]` 与每个 step 的 `cwd` 存在
 - 建议每个 step 显式写 `cwd`（绝对路径），不依赖当前目录，因为调度器可能被不同工作目录的调用驱动
+
+### 4.1 允许范围（Task）
+
+`cwd` 不只看存不存在，还要看**在不在允许范围内**——它是执行权限面：命令在哪个目录跑，就决定了它能读写什么。
+
+- 允许范围 = ATS root 内部（含全部子孙）∪ `policy.allow_dirs` 每一项及其全部子孙
+- 越界在 `create` 阶段就拒（`bad_cwd`，`reason=cwd_outside_allowlist`），不会出现「任务建好、批完、跑起来才报错」
+- 相对 `cwd` 一律以 **ATS root** 为基准，不跟调用方的进程目录（否则会「校验一处、执行另一处」）
+- `run` 前二次校验：白名单可能被改、目录可能被删，失效判 `cwd_gone`，**不静默回退到 root**
+- `supervise`（内部子命令）自己也重算一次边界，越界直接把任务标 `failed`，不拉起进程
+
+`policy --json` 里看 `allow_dirs_detail` 逐项核对（`exists` / `broader_than_root`），有 `boundary_warnings` 说明某项把 root 也覆盖进去了（等于放开整层上层目录）。
+
+```bash
+python scripts/ats.py policy --set allow_dirs '["D:/proj/web","E:/build"]'
+```
+
+`allow_dirs` 不支持逗号分隔（Windows 下 `D:\a,b` 是合法目录名），改用 JSON 数组或 `||`/换行。
 
 ```json
 {"id": "build", "command": "npm run build", "cwd": "D:/proj/web", "level": "L1"}

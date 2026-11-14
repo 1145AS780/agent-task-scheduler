@@ -14,11 +14,14 @@ import base64
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 import types
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 sys.dont_write_bytecode = True
@@ -28,6 +31,7 @@ REPO = Path(__file__).resolve().parents[1]
 ATS = REPO / "scripts" / "ats.py"
 ATS_PLAN = REPO / "scripts" / "ats_plan.py"
 GUARD = REPO / "scripts" / "ats_guard.py"
+ATS_UI = REPO / "scripts" / "ats_ui.py"
 EXAMPLES = REPO / "references" / "examples"
 
 DEAD_PID = 2147483647
@@ -449,6 +453,7 @@ def hook_args_do_not_run_through_shell():
             "import sys\nprint('ARGV', sys.argv[1:])\n", encoding="utf-8")
         os.environ["ATS_ENCODER_PATH"] = str(tools / "encoding_converter.py")
 
+        sb.write_policy({"allow_dirs": [str(sb.dir)]})   # 钩子材料在 root 外，须显式授权
         sb.json_out("create", "hook", "--cwd", str(sb.dir), "--level", "L0",
                     "--command", "echo hi @enc x; copy nul PWN.txt")
         rc, run = sb.json_out("run", "hook", "--wait")
@@ -531,6 +536,7 @@ def hook_glob_expands_multiple_files():
         for name in ("a.log", "b.log", "c.log"):
             (logs / name).write_text("x", encoding="utf-8")
 
+        sb.write_policy({"allow_dirs": [str(sb.dir)]})   # 钩子材料在 root 外，须显式授权
         sb.json_out("create", "glob1", "--cwd", str(sb.dir), "--level", "L0",
                     "--command", "echo hi @enc --from gbk --to utf-8 logs/*.log")
         rc, run = sb.json_out("run", "glob1", "--wait")
@@ -570,6 +576,7 @@ def hook_glob_no_match_fails_loudly():
             "import sys\nprint('ARGV', sys.argv[1:])\n", encoding="utf-8")
         os.environ["ATS_ENCODER_PATH"] = str(tools / "encoding_converter.py")
 
+        sb.write_policy({"allow_dirs": [str(sb.dir)]})   # 钩子材料在 root 外，须显式授权
         sb.json_out("create", "glob0", "--cwd", str(sb.dir), "--level", "L0",
                     "--command", "echo hi @enc --from gbk --to utf-8 missing/*.log")
         rc, run = sb.json_out("run", "glob0", "--wait")
@@ -603,6 +610,7 @@ def hook_glob_rejects_mixed_paths():
         os.environ["ATS_ENCODER_PATH"] = str(tools / "encoding_converter.py")
         (sb.dir / "a.txt").write_text("x", encoding="utf-8")
 
+        sb.write_policy({"allow_dirs": [str(sb.dir)]})   # 钩子材料在 root 外，须显式授权
         sb.json_out("create", "globamb", "--cwd", str(sb.dir), "--level", "L0",
                     "--command", "echo hi @enc a.txt *.txt")
         sb.json_out("run", "globamb", "--wait")
@@ -633,6 +641,7 @@ def hook_glob_skips_flag_values():
         os.environ["ATS_ENCODER_PATH"] = str(tools / "encoding_converter.py")
         (sb.dir / "x.log").write_text("x", encoding="utf-8")
 
+        sb.write_policy({"allow_dirs": [str(sb.dir)]})   # 钩子材料在 root 外，须显式授权
         sb.json_out("create", "globflag", "--cwd", str(sb.dir), "--level", "L0",
                     "--command", "echo hi @enc --from gbk --to utf-8 --include *.log")
         sb.json_out("run", "globflag", "--wait")
@@ -667,6 +676,7 @@ def hook_glob_survives_valueless_flags():
         for name in ("a.log", "b.log"):
             (logs / name).write_text("x", encoding="utf-8")
 
+        sb.write_policy({"allow_dirs": [str(sb.dir)]})   # 钩子材料在 root 外，须显式授权
         sb.json_out("create", "globflag2", "--cwd", str(sb.dir), "--level", "L0",
                     "--command", "echo hi @enc --dry-run --from gbk --to utf-8 logs/*.log")
         sb.json_out("run", "globflag2", "--wait")
@@ -1153,6 +1163,178 @@ def create_derives_level_when_omitted():
         rc, task = sb.json_out("create", "forced", "--command", "echo hi", "--level", "L0")
         expect(task["task"]["level"] == "L0",
                "显式 --level 应优先，实际 %r" % task["task"]["level"])
+    finally:
+        sb.cleanup()
+
+
+# ---------------------------------------------------------------- 路径边界
+
+@case
+def cwd_outside_allowlist_rejected_at_create():
+    """cwd 超出 root 且不在 allow_dirs → 建任务阶段就拒，不留半成品。"""
+    sb = Sandbox()
+    try:
+        outside = sb.dir / "outside"
+        outside.mkdir()
+        rc, out = sb.json_out("create", "bad", "--command", "echo hi",
+                              "--cwd", str(outside))
+        expect(rc == 2, "越界 cwd 应返回 EXIT_USAGE，实际 %s\n%r" % (rc, out))
+        expect(out["error"] == "bad_cwd", "应报 bad_cwd，实际 %r" % out.get("error"))
+        expect(out["reason"] == "cwd_outside_allowlist",
+               "原因应为 cwd_outside_allowlist，实际 %r" % out.get("reason"))
+        expect(not (sb.root / "tasks" / "bad").exists(),
+               "越界 cwd 不应留下任务目录")
+
+        sb.write_policy({"allow_dirs": [str(outside)]})
+        rc, out = sb.json_out("create", "ok", "--command", "echo hi",
+                              "--cwd", str(outside))
+        expect(rc == 0, "白名单内 cwd 应放行，实际 %s\n%r" % (rc, out))
+        expect(Path(out["task"]["cwd"]) == outside.resolve(),
+               "cwd 应落盘为归一化绝对路径，实际 %r" % out["task"].get("cwd"))
+    finally:
+        sb.cleanup()
+
+
+@case
+def relative_cwd_is_root_relative():
+    """相对 cwd 以 ATS root 为基准，不跟随调用方进程的 cwd。"""
+    sb = Sandbox()
+    try:
+        (sb.root / "work").mkdir(parents=True, exist_ok=True)
+        rc, out = sb.json_out("create", "rel", "--command", "echo hi", "--cwd", "work")
+        expect(rc == 0, "相对 cwd 应放行，实际 %s\n%r" % (rc, out))
+        expect(Path(out["task"]["cwd"]) == (sb.root / "work").resolve(),
+               "相对 cwd 应解析到 root/work，实际 %r" % out["task"].get("cwd"))
+    finally:
+        sb.cleanup()
+
+
+@case
+def cwd_gone_blocks_run_without_fallback():
+    """白名单目录在 run 前被删 → cwd_gone 拒绝，不静默回退到 root。"""
+    sb = Sandbox()
+    try:
+        work = sb.root / "work"
+        work.mkdir(parents=True, exist_ok=True)
+        rc, out = sb.json_out("create", "gone", "--command", "echo hi",
+                              "--cwd", str(work))
+        expect(rc == 0, "create 应成功，实际 %s\n%r" % (rc, out))
+        shutil.rmtree(work)
+        rc, out = sb.json_out("run", "gone")
+        expect(rc == 4, "目录消失应返回 EXIT_DENIED，实际 %s\n%r" % (rc, out))
+        expect(out["error"] == "cwd_gone", "应报 cwd_gone，实际 %r" % out.get("error"))
+    finally:
+        sb.cleanup()
+
+
+@case
+def supervise_rechecks_cwd_before_spawn():
+    """绕过 run 直接调 supervise、且 task.json 的 cwd 被改成白名单外 → 拒执行。"""
+    sb = Sandbox()
+    try:
+        outside = sb.dir / "outside"
+        outside.mkdir()
+        marker = sb.dir / "marker.txt"
+        rc, out = sb.json_out("create", "sneak", "--command",
+                              "echo pwned > \"%s\"" % marker)
+        expect(rc == 0, "create 应成功，实际 %s\n%r" % (rc, out))
+        tpath = sb.root / "tasks" / "sneak" / "task.json"
+        task = json.loads(tpath.read_text(encoding="utf-8"))
+        task["cwd"] = str(outside)
+        tpath.write_text(json.dumps(task, ensure_ascii=False), encoding="utf-8")
+
+        rc, out = sb.json_out("supervise", "sneak")
+        expect(rc == 0, "supervise 应返回任务状态而非崩溃，实际 %s\n%r" % (rc, out))
+        t = out.get("task") or {}
+        expect(t.get("status") == "failed",
+               "应把任务标记为 failed，实际 %r" % t.get("status"))
+        expect(t.get("error_type") == "cwd_outside_allowlist",
+               "错误类型应为 cwd_outside_allowlist，实际 %r" % t.get("error_type"))
+        expect(not marker.exists(), "越界 cwd 的命令不应被执行")
+    finally:
+        sb.cleanup()
+
+
+@case
+def policy_reports_allow_dirs_boundary():
+    """policy --json 摊开白名单逐项解析结果；覆盖 root 本身时必须给边界告警。"""
+    sb = Sandbox()
+    try:
+        outside = sb.dir / "outside"
+        outside.mkdir()
+        sb.write_policy({"allow_dirs": [str(outside), str(sb.dir)]})
+        rc, pol = sb.json_out("policy", "--json")
+        expect(rc == 0, "policy 应成功，实际 %s\n%r" % (rc, pol))
+        detail = {d["path"]: d for d in pol.get("allow_dirs_detail") or []}
+        expect(len(detail) == 2, "应逐项摊开两条，实际 %r" % pol.get("allow_dirs_detail"))
+        expect(detail[str(outside.resolve())]["broader_than_root"] is False,
+               "普通白名单项不应标 broader_than_root，实际 %r" % detail)
+        expect(detail[str(sb.dir.resolve())]["broader_than_root"] is True,
+               "覆盖 root 的项应标 broader_than_root，实际 %r" % detail)
+        expect(any("覆盖了 ATS root" in w for w in pol.get("boundary_warnings") or []),
+               "应给出覆盖 root 的告警，实际 %r" % pol.get("boundary_warnings"))
+    finally:
+        sb.cleanup()
+
+
+@case
+def policy_allow_dirs_validates_each_entry():
+    """policy --set allow_dirs 写入前逐项校验：相对路径与不存在的目录都拒。"""
+    sb = Sandbox()
+    try:
+        rc, out = sb.json_out("policy", "--set", "allow_dirs", "relative/path")
+        expect(rc == 2, "相对路径应拒绝，实际 %s\n%r" % (rc, out))
+        expect(out["error"] == "bad_allow_dir",
+               "应报 bad_allow_dir，实际 %r" % out.get("error"))
+        expect(out["relative"] == ["relative/path"],
+               "应指出越界的相对项，实际 %r" % out.get("relative"))
+
+        rc, out = sb.json_out("policy", "--set", "allow_dirs", str(sb.dir / "nope"))
+        expect(rc == 2, "不存在的目录应拒绝，实际 %s\n%r" % (rc, out))
+        expect(out.get("missing") == [str(sb.dir / "nope")],
+               "应指出缺失项，实际 %r" % out.get("missing"))
+
+        rc, out = sb.json_out("policy", "--set", "allow_dirs", str(sb.dir))
+        expect(rc == 0, "合法目录应写入，实际 %s\n%r" % (rc, out))
+        stored = json.loads((sb.root / "policy.json").read_text(encoding="utf-8"))
+        expect(stored["allow_dirs"] == [str(sb.dir.resolve())],
+               "写入值应为归一化绝对路径，实际 %r" % stored.get("allow_dirs"))
+    finally:
+        sb.cleanup()
+
+
+@case
+def plan_step_cwd_respects_allowlist():
+    """Plan step 的 cwd 同样受 allow_dirs 约束：提交即拒，放行后落盘为绝对路径。"""
+    sb = Sandbox()
+    try:
+        outside = sb.dir / "outside"
+        outside.mkdir()
+        spec = sb.dir / "plan-cwd.json"
+        spec.write_text(json.dumps({
+            "id": "cwdplan", "title": "t",
+            "stages": [{"id": "s1", "mode": "serial", "steps": [
+                {"id": "x", "command": "echo hi", "level": "L0",
+                 "timeout": 60, "cwd": str(outside)}]}],
+        }, ensure_ascii=False), encoding="utf-8")
+        rc, payload = sb.json_out_plan("submit_plan", "--spec", spec)
+        expect(rc == 2, "越界 step cwd 应被拒，实际 %s\n%s" % (rc, payload))
+        expect(payload.get("error") == "spec_invalid",
+               "应报 spec_invalid，实际 %r" % payload.get("error"))
+        errors = payload.get("errors") or []
+        expect(any("cwd_outside_allowlist" in e for e in errors),
+               "应含 cwd_outside_allowlist，实际 %r" % (errors,))
+        expect(not (sb.root / "schedules" / "cwdplan").exists(),
+               "被拒时不应落盘 schedule")
+
+        sb.write_policy({"allow_dirs": [str(outside)]})
+        rc, payload = sb.json_out_plan("submit_plan", "--spec", spec)
+        expect(rc == 0, "白名单内 step cwd 应放行，实际 %s\n%s" % (rc, payload))
+        plan = json.loads(
+            (Path(payload["plan_dir"]) / "plan.json").read_text(encoding="utf-8"))
+        step_cwd = plan["stages"][0]["steps"][0]["cwd"]
+        expect(Path(step_cwd) == outside.resolve(),
+               "step cwd 应落盘为归一化绝对路径，实际 %r" % step_cwd)
     finally:
         sb.cleanup()
 
@@ -2625,6 +2807,325 @@ def restricted_policy_set_requires_passphrase():
         expect(rc == 0, "持口令应允许改无害键，实际 %s\n%s" % (rc, out))
         expect(json.loads(out).get("stall_seconds") == 120, "改动应生效")
     finally:
+        sb.cleanup()
+
+
+# ---------------------------------------------------------------- 控制台鉴权
+
+def free_port():
+    sock = socket.socket()
+    try:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+    finally:
+        sock.close()
+
+
+def http_call(method, url, payload=None, token=None, timeout=10):
+    """发一次 HTTP 请求，401/4xx 也照常返回 (状态码, 响应体)，不抛异常。"""
+    data = None
+    headers = {}
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode("utf-8", "replace")
+
+
+class UiServer:
+    """在沙箱里跑一个真实的 ats_ui.py 进程，用例结束务必 stop()。"""
+
+    def __init__(self, sb, token_file=None, host="127.0.0.1"):
+        self.port = free_port()
+        self.base = "http://127.0.0.1:%d" % self.port
+        self.log = sb.dir / ("ui-%d.log" % self.port)
+        args = [sys.executable, str(ATS_UI), "--root", str(sb.root),
+                "--host", host, "--port", str(self.port), "--serve"]
+        if token_file:
+            args += ["--token-file", str(token_file)]
+        env = dict(os.environ)
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        self._fh = open(self.log, "w", encoding="utf-8")
+        self.proc = subprocess.Popen(args, stdout=self._fh, stderr=subprocess.STDOUT,
+                                     env=env, cwd=str(sb.dir))
+
+    def text(self):
+        try:
+            self._fh.flush()
+            return Path(self.log).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    def wait(self, token=None, timeout=30, any_status=False):
+        """等到端口能应答；any_status=True 时 401 也算就绪（此时还不知道令牌）。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                raise AssertionError("控制台进程提前退出 rc=%s\n%s"
+                                     % (self.proc.returncode, self.text()))
+            try:
+                code, _ = http_call("GET", self.base + "/api/ping", token=token, timeout=1)
+                if any_status or code == 200:
+                    return True
+            except OSError:
+                pass
+            time.sleep(0.2)
+        raise AssertionError("控制台 %s 在 %ss 内未就绪\n%s"
+                             % (self.base, timeout, self.text()))
+
+    def stop(self):
+        try:
+            if self.proc.poll() is None:
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    self.proc.wait(timeout=10)
+        finally:
+            try:
+                self._fh.close()
+            except OSError:
+                pass
+
+
+@case
+def ui_refuses_public_bind_without_token():
+    """绑非回环地址又没给 --token-file：拒绝启动，并给出能直接复制的补救命令。"""
+    sb = Sandbox()
+    try:
+        port = free_port()
+        cmd = [sys.executable, str(ATS_UI), "--root", str(sb.root),
+               "--host", "0.0.0.0", "--port", str(port), "--serve"]
+        env = dict(os.environ)
+        env["PYTHONIOENCODING"] = "utf-8"          # 子进程默认按 cp936 输出，这里对齐成 UTF-8
+        env["PYTHONUTF8"] = "1"
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90, env=env,
+                              encoding="utf-8", errors="replace")
+        out = (proc.stdout or "") + (proc.stderr or "")
+        expect(proc.returncode == 2,
+               "应拒绝启动并返回 2，实际 rc=%s\n%s" % (proc.returncode, out))
+        expect("拒绝启动" in out, "应说明为什么拒绝，实际输出：\n%s" % out)
+        expect("--token-file" in out, "补救命令里应带 --token-file，实际输出：\n%s" % out)
+        expect(str(port) in out, "补救命令应沿用同一个端口 %s，实际输出：\n%s" % (port, out))
+        expect(not (Path(sb.root) / "ui_tmp" / "server.json").exists(),
+               "被拒时不应留下服务进程记录")
+    finally:
+        sb.cleanup()
+
+
+@case
+def ui_token_gate():
+    """--token-file：无令牌 401、错令牌 401、对令牌放行；文件缺失时自动生成。"""
+    sb = Sandbox()
+    token_file = sb.dir / "ui_token" / "token.txt"
+    srv = UiServer(sb, token_file=token_file)
+    try:
+        srv.wait(any_status=True)
+        expect(token_file.is_file(), "令牌文件不存在时应自动生成：%s" % token_file)
+        token = token_file.read_text(encoding="utf-8-sig").strip()
+        expect(len(token) >= 20, "自动生成的令牌太短：%r" % token)
+
+        code, body = http_call("GET", srv.base + "/api/ping")
+        expect(code == 401, "无令牌读 /api/ping 应 401，实际 %s %s" % (code, body))
+        expect("unauthorized" in body, "401 应说明 unauthorized，实际 %s" % body)
+
+        code, body = http_call("GET", srv.base + "/api/ping", token="wrong-" + token)
+        expect(code == 401, "错令牌应 401，实际 %s %s" % (code, body))
+
+        code, body = http_call("GET", srv.base + "/api/ping", token=token)
+        expect(code == 200, "正确令牌应放行，实际 %s %s" % (code, body))
+
+        code, body = http_call("POST", srv.base + "/api/action", {"action": "ping"})
+        expect(code == 401,
+               "无令牌调写接口 /api/action 必须 401（不能只挡读接口），实际 %s %s" % (code, body))
+
+        code, body = http_call("POST", srv.base + "/api/action",
+                               {"action": "no.such.action"}, token=token)
+        expect(code == 400 and "bad_action" in body,
+               "带令牌应穿过鉴权、落到动作分发（bad_action 400），实际 %s %s" % (code, body))
+
+        code, page = http_call("GET", srv.base + "/")
+        expect(code == 200, "首页应可访问（令牌输入框在页面里），实际 %s" % code)
+        expect("authGate" in page and '"auth": true' in page,
+               "首页应带令牌输入框并告知已启用鉴权")
+
+        # --status 不带令牌时，不能把「在跑但 401」误报成「未运行」
+        cmd = [sys.executable, str(ATS_UI), "--root", str(sb.root),
+               "--port", str(srv.port), "--status"]
+        env = dict(os.environ)
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90, env=env,
+                              encoding="utf-8", errors="replace")
+        out = (proc.stdout or "") + (proc.stderr or "")
+        expect(proc.returncode == 0,
+               "服务在跑时 --status 应返回 0，实际 rc=%s\n%s" % (proc.returncode, out))
+        expect("需要访问令牌" in out,
+               "--status 应说明「在跑但要令牌」而不是「未运行」，实际输出：\n%s" % out)
+
+        # --stop 只读 pid 文件，不该顺手生成令牌文件
+        ghost = sb.dir / "ui_token" / "ghost.txt"
+        cmd = [sys.executable, str(ATS_UI), "--root", str(sb.root),
+               "--port", str(srv.port), "--stop", "--token-file", str(ghost)]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90, env=env,
+                              encoding="utf-8", errors="replace")
+        expect(not ghost.exists(), "--stop 不该生成令牌文件：%s" % ghost)
+    finally:
+        srv.stop()
+        sb.cleanup()
+
+
+@case
+def ui_loopback_without_token():
+    """默认回环模式不强迫本机用户配令牌，但页面要知道自己没开鉴权。"""
+    sb = Sandbox()
+    srv = UiServer(sb)
+    try:
+        srv.wait()
+        code, body = http_call("GET", srv.base + "/api/ping")
+        expect(code == 200, "回环地址免令牌应放行，实际 %s %s" % (code, body))
+        code, page = http_call("GET", srv.base + "/")
+        expect(code == 200, "首页应可访问，实际 %s" % code)
+        expect('"auth": false' in page, "页面应知道当前没开鉴权")
+    finally:
+        srv.stop()
+        sb.cleanup()
+
+
+@case
+def ui_allow_dirs_panel():
+    """路径白名单面板的写入链路：经 /api/action policy.set 落盘，非法项原样报错，缓存立即失效。"""
+    sb = Sandbox()
+    srv = None
+    try:
+        sb.seal()
+        outside = sb.dir / "outside"
+        outside.mkdir()
+        srv = UiServer(sb)
+        srv.wait()
+
+        code, body = http_call("GET", srv.base + "/api/state", timeout=60)
+        expect(code == 200, "/api/state 应可读，实际 %s %s" % (code, body))
+        expect((json.loads(body).get("policy") or {}).get("allow_dirs") == [],
+               "初始白名单应为空")
+
+        code, body = http_call("POST", srv.base + "/api/action",
+                               {"action": "policy.set",
+                                "patch": {"allow_dirs": [str(outside)]},
+                                "passphrase": TEST_PASSPHRASE}, timeout=120)
+        payload = json.loads(body)
+        expect(code == 200 and payload.get("ok") is True,
+               "面板保存白名单应成功，实际 %s %s" % (code, body))
+        stored = json.loads((sb.root / "policy.json").read_text(encoding="utf-8"))
+        expect(stored.get("allow_dirs") == [str(outside)],
+               "写入值应落盘为归一化绝对路径，实际 %r" % stored.get("allow_dirs"))
+
+        code, body = http_call("GET", srv.base + "/api/state", timeout=60)
+        pol = json.loads(body).get("policy") or {}
+        expect(pol.get("allow_dirs") == [str(outside)],
+               "保存后 /api/state 应立刻反映新值（15s 缓存必须失效），实际 %r"
+               % pol.get("allow_dirs"))
+        detail = pol.get("allow_dirs_detail") or []
+        expect(detail and detail[0].get("raw") == str(outside)
+               and detail[0].get("exists") is True,
+               "面板要并排显示「写了什么 / 认成什么」，detail 应带 raw 与 exists，实际 %r"
+               % detail)
+
+        code, body = http_call("POST", srv.base + "/api/action",
+                               {"action": "policy.set",
+                                "patch": {"allow_dirs": ["relative/path"]},
+                                "passphrase": TEST_PASSPHRASE}, timeout=120)
+        payload = json.loads(body)
+        expect(payload.get("ok") is False and "bad_allow_dir" in body,
+               "相对路径应被拒并把 bad_allow_dir 原样回传，实际 %s %s" % (code, body))
+        stored = json.loads((sb.root / "policy.json").read_text(encoding="utf-8"))
+        expect(stored.get("allow_dirs") == [str(outside)], "被拒的写入不应落盘")
+    finally:
+        if srv is not None:
+            srv.stop()
+        sb.cleanup()
+
+
+@case
+def ui_task_cwd_is_select():
+    """新建任务 / 指令包的 cwd 必须是白名单下拉，页面不得再留自由文本框。"""
+    sb = Sandbox()
+    srv = None
+    try:
+        sb.seal()
+        srv = UiServer(sb)
+        srv.wait()
+        code, page = http_call("GET", srv.base + "/", timeout=60)
+        expect(code == 200, "控制台首页应可读，实际 %s" % code)
+        expect('<select id="tCwd"></select>' in page,
+               "新建任务的 cwd 应是下拉 #tCwd，否则用户仍能手打任意路径")
+        expect('<select id="pCwd"></select>' in page,
+               "指令包的 cwd 应是下拉 #pCwd")
+        expect('<input id="tCwd">' not in page and '<input id="pCwd">' not in page,
+               "不应残留自由文本框")
+        expect("function renderCwdOptions" in page, "页面应有 renderCwdOptions")
+        expect("renderAllowDirs(); renderCwdOptions();" in page,
+               "render() 必须调用 renderCwdOptions，否则刷新后下拉不会被填")
+        expect("allow_dirs_detail" in page,
+               "下拉选项应取自 allow_dirs_detail（写什么/认成什么），而不是只看 allow_dirs")
+        expect("（默认：root 内部）" in page, "应提供「默认 root」空值项")
+        expect("目录缺失" in page, "缺失目录要在选项上标出来，不能静默可选")
+        expect("el.disabled = empty" in page, "白名单为空时应禁用下拉并提示")
+
+        code, body = http_call("GET", srv.base + "/api/state", timeout=60)
+        pol = json.loads(body).get("policy") or {}
+        expect(pol.get("allow_dirs") == [] and pol.get("allow_dirs_detail") == [],
+               "白名单为空时 detail 应为空数组，下拉只剩默认项，实际 %r"
+               % (pol.get("allow_dirs_detail"),))
+    finally:
+        if srv is not None:
+            srv.stop()
+        sb.cleanup()
+
+
+@case
+def ui_narrow_screen_cards():
+    """窄屏适配：表格在 ≤860px 转卡片，每格必须带 data-label 才能读出字段名。"""
+    sb = Sandbox()
+    srv = None
+    try:
+        sb.seal()
+        srv = UiServer(sb)
+        srv.wait()
+        code, page = http_call("GET", srv.base + "/", timeout=60)
+        expect(code == 200, "控制台首页应可读，实际 %s" % code)
+        expect("@media(max-width:860px)" in page, "应有窄屏断点（860 而非 720，见下）")
+        expect("@media(max-width:900px)" in page, "900 档的 KPI 两列规则应保留")
+        expect("tbody td::before{content:attr(data-label)" in page,
+               "卡片化后字段名靠 data-label 伪元素显示，缺了就只能看到值")
+        expect("thead{display:none}" in page, "窄屏应隐藏表头（否则只剩列名无数据）")
+        expect("table{min-width:0}" in page,
+               "原表 min-width:760px 会让窄屏继续横向滚动，必须归零")
+        expect("input,select,textarea{font-size:16px}" in page,
+               "移动端输入框 <16px 会触发 iOS 聚焦缩放")
+        expect("button{min-height:38px}" in page, "窄屏按钮要够到触控尺寸")
+        expect(".head-right{flex-wrap:wrap;width:100%" in page,
+               "顶栏右侧不换行会把口令框与刷新按钮推出视口")
+        expect(".mcpbar .row .sub{min-width:0;word-break:break-all}" in page,
+               "MCP 端点长串不折行会撑破卡片")
+        expect("data-label" in page and page.count("data-label") >= 16,
+               "两个表格各 7 格都要 data-label，实际 %d 处" % page.count("data-label"))
+        for label in ("状态", "命令", "退出", "当前 Plan", "步数"):
+            expect('data-label="%s"' % label in page, "缺 data-label=%s" % label)
+        expect('<th>状态</th>' in page and '<th>步数</th>' in page,
+               "宽屏表头不能被删掉")
+    finally:
+        if srv is not None:
+            srv.stop()
         sb.cleanup()
 
 

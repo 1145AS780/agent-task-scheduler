@@ -1,4 +1,4 @@
-# 错误分类与重试矩阵 — agent-task-scheduler v3.3.0-R0
+# 错误分类与重试矩阵 — agent-task-scheduler v4.0.0-R0
 
 本文把调度器可能产生的一切「不正常」拆成可判别的类别，给出**判别依据**（退出码 / JSON 字段 / 事件 / 文件）、**含义**与**处置动作**，并说明哪些错误可以交给 `retry` 自动消化、哪些必须人工改代码。
 
@@ -74,7 +74,9 @@ if ($out.task.status -ne "succeeded") { Write-Host "任务失败: $($out.task.st
 | `bad_env` | `create --env` | `--env` 的值不含 `=` | 写成 `--env K=V`；值里可以有 `=`（按第一个 `=` 切分） |
 | `bad_level` | `create --level` | 等级不在 `L0..L3`（argparse 会先拦，但 spec 里的 `level` 会走到这里） | 用大写 `L0`-`L3` |
 | `bad_timeout` | `create` | `timeout` 不是整数（通常来自 spec 的字符串） | spec 里写数字，不要写 `"900"` |
-| `bad_cwd` | `create` / `pack` | `cwd` 路径不存在 | 先确认目录存在；`~` 会被展开 |
+| `bad_cwd` | `create` / `pack` | `cwd` 路径不存在，或超出允许范围（`reason` 为 `cwd_missing` / `cwd_outside_allowlist`） | 先确认目录存在；`~` 会被展开。越界就改回 root 内部，或把目录补进 `policy.allow_dirs` |
+| `cwd_gone` | `run` | 任务建好后 `cwd` 被删/移走/盘符未挂载（执行前二次校验失败） | 恢复目录后重试；**不会自动回退到 root** |
+| `bad_allow_dir` | `policy --set allow_dirs` | 白名单项是相对路径（`relative`）或当前不存在（`missing`） | 一律写绝对路径，且写入时目录必须已存在 |
 | `bad_hook` | `create` | `@enc` 前后缺内容（主命令为空或钩子参数为空） | 写成 `<命令> @enc <参数>` |
 | `bad_hook_item` | `pack` | 某条目 `@enc` 前后缺内容（`indexes` 指出位置，1 起） | 修正该条目；**整包不落盘** |
 | `pack_empty` | `pack` | 传入内容为空（或只有空白） | 至少给一条命令 |

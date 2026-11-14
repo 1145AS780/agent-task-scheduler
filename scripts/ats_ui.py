@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ats_ui.py — agent-task-scheduler 人类用本地 Web 面板 (v3.3.0-R0)
+"""ats_ui.py — agent-task-scheduler 人类用本地 Web 面板 (v4.0.0-R0)
 
 只读监控 + 运行控制 + 审批 + 创建编排。纯标准库，无第三方依赖。
 
@@ -7,15 +7,19 @@
   python scripts/ats_ui.py [--root DIR] [--host 127.0.0.1] [--port 8765] [--open]
   python scripts/ats_ui.py [--root DIR] --ensure --open   # 未运行则后台自启动，再打开浏览器
   python scripts/ats_ui.py [--root DIR] --status | --stop
+  python scripts/ats_ui.py --host 0.0.0.0 --token-file <root>/ui_tmp/token.txt   # 暴露到网络必须带令牌
 """
 
 import argparse
+import hmac
 import json
 import os
+import secrets
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 import uuid
 import webbrowser
@@ -24,7 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "3.3.0-R0"
+VERSION = "4.0.0-R0"
 SERVER_START = int(time.time())
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -34,6 +38,9 @@ PLAN = SCRIPT_DIR / "ats_plan.py"
 
 ROOT = Path.cwd() / ".ats"
 PORT = 8765
+TOKEN = None                            # 非空时 /api/* 一律要求 Authorization: Bearer <TOKEN>
+TOKEN_FILE = None                       # 令牌文件路径，仅用于提示，不参与校验
+LOOPBACK_HOSTS = ("", "127.0.0.1", "localhost", "::1", "0:0:0:0:0:0:0:1")
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(SCRIPT_DIR))
 try:                                    # MCP HTTP 端点；工具表复用同目录 ats_mcp.py
@@ -61,6 +68,59 @@ def resolve_root(value):
     if env:
         return Path(env).expanduser().resolve()
     return default_root().resolve()
+
+
+def is_loopback(host):
+    return (host or "").strip().lower() in LOOPBACK_HOSTS
+
+
+def default_token_file(root):
+    return Path(root) / "ui_tmp" / "token.txt"
+
+
+def read_token(path):
+    try:
+        return Path(path).read_text(encoding="utf-8-sig").strip()
+    except OSError:
+        return ""
+
+
+def resolve_token(root, token_file):
+    """返回 (token, path)。token_file 为空时返回 (None, None)，即「回环地址免令牌」模式。
+
+    文件不存在或内容为空时自动生成一个新令牌写进去：不提供「无鉴权降级」，
+    只要指定了 --token-file，/api/* 就一定要求 Bearer 令牌。
+    """
+    if not token_file:
+        return None, None
+    path = Path(token_file).expanduser().resolve()
+    token = read_token(path)
+    if token:
+        return token, path
+    token = secrets.token_urlsafe(32)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(token + "\n", encoding="utf-8")
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    except OSError as exc:
+        print("无法写入令牌文件 %s：%s" % (path, exc))
+        return None, path
+    print("已生成访问令牌：%s" % path)
+    return token, path
+
+
+def host_guard_message(host, root, port, token_file):
+    """非回环地址且没给 --token-file 时，给出可直接复制运行的补救命令。"""
+    target = Path(token_file).expanduser() if token_file else default_token_file(root)
+    return ("拒绝启动：--host %s 会把控制台（含 task.run / task.delete）暴露给网络，"
+            "此时必须启用访问令牌。\n"
+            "复制运行（令牌文件不存在会自动生成，把里面那串字符填到网页右上角）：\n"
+            "  python \"%s\" --root \"%s\" --host %s --port %d --token-file \"%s\"\n"
+            "只想本机用就别带 --host：默认 127.0.0.1，只有本机能访问。"
+            % (host, SCRIPT_FILE, root, host, port, target))
 
 
 def to_ts(value):
@@ -714,6 +774,15 @@ pre.log{background:#0b0f15;border:1px solid var(--line);border-radius:8px;paddin
 .drawer-body{padding:16px 18px;overflow:auto;flex:1}
 .overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:35;display:none}
 .overlay.on{display:block}
+.authgate{position:fixed;inset:0;background:rgba(6,9,13,.82);z-index:70;display:none;
+  align-items:center;justify-content:center;padding:18px}
+.authgate.on{display:flex}
+.authbox{width:min(520px,96vw);background:#11161e;border:1px solid var(--line);border-radius:12px;
+  padding:20px 22px;box-shadow:0 24px 70px rgba(0,0,0,.55)}
+.authbox h2{margin:0 0 8px;font-size:16px}
+.authbox .sub{color:var(--muted);font-size:12.5px;line-height:1.7}
+.authbox .field{margin:12px 0}
+.authbox input{width:100%}
 .tabsline{display:flex;gap:6px;margin:12px 0}
 .tabsline button{padding:4px 11px;font-size:12px}
 .tabsline button.on{color:var(--accent);border-color:rgba(61,219,192,.45);background:rgba(61,219,192,.1)}
@@ -731,10 +800,48 @@ pre.log{background:#0b0f15;border:1px solid var(--line);border-radius:8px;paddin
 .mcpbar.running{border-left-color:var(--ok);background:rgba(62,207,142,.05)}
 .mcpbar.failed{border-left-color:var(--bad);background:rgba(255,107,107,.06)}
 .mcpbar .row{display:flex;gap:14px;flex-wrap:wrap;align-items:center}
+.mcpbar .row .sub{min-width:0;word-break:break-all}
 .mcpbar .spacer{flex:1}
 .mcpbar .hint{margin-top:6px;color:var(--muted);word-break:break-all}
 .mcpbar .hint.bad{color:var(--bad)}
 @media(max-width:900px){.kpis{grid-template-columns:repeat(2,1fr)}main{padding:12px 12px 40px}header{padding:10px 12px} .mcpbar{margin:10px 12px 0}}
+@media(max-width:860px){
+  header{flex-wrap:wrap;gap:8px}
+  .head-right{flex-wrap:wrap;width:100%;justify-content:flex-start;gap:8px}
+  .passinput{width:auto;flex:1 1 130px;min-width:0}
+  .brand{min-width:0}
+  .brand .sub{word-break:break-all}
+  .kpis{gap:8px;padding:10px 10px 2px}
+  .kpi{padding:8px 10px}
+  .kpi .v{font-size:19px}
+  nav.tabs{padding:8px 10px 0;gap:4px}
+  .tab{padding:7px 11px;font-size:13px}
+  main{padding:10px 10px 40px}
+  .banner,.mcpbar{margin-left:10px;margin-right:10px}
+  .cards{grid-template-columns:1fr}
+  .grid2,.grid3{grid-template-columns:1fr}
+  .toolbar input.search{max-width:none;flex:1 1 100%}
+  .tablewrap{background:transparent;border:none;border-radius:0;overflow:visible}
+  table{min-width:0}
+  thead{display:none}
+  tbody tr{display:block;background:var(--panel);border:1px solid var(--line);border-radius:10px;
+    padding:6px 10px;margin-bottom:8px}
+  tbody tr:hover{background:var(--panel)}
+  tbody td{display:flex;gap:8px;align-items:flex-start;border-bottom:none;padding:4px 0;
+    font-size:13px;word-break:break-all}
+  tbody td::before{content:attr(data-label);flex:0 0 76px;color:var(--muted);font-size:11.5px;
+    line-height:1.6;white-space:nowrap}
+  tbody td[data-label=""]::before{content:none}
+  tbody td[data-label=""]{display:block;padding:0}
+  .ev{flex-direction:column;gap:3px}
+  .ev .t{padding-top:0}
+  .step{flex-wrap:wrap}
+  button{min-height:38px}
+  input,select,textarea{font-size:16px}
+  .toasts{left:10px;right:10px;bottom:10px;max-width:none}
+  .drawer{width:100vw}
+  .drawer-body{padding:12px}
+}
 </style>
 </head>
 <body>
@@ -823,6 +930,16 @@ pre.log{background:#0b0f15;border:1px solid var(--line);border-radius:8px;paddin
       <div class="hint">生效方式：下一次 run 立即生效（policy.json 热读）。</div>
       <div class="hint">策略写入与批准/拒绝都要口令：口令填在页面顶部输入框，只存本页内存，经 stdin 交给子进程，不进命令行参数。</div>
     </div>
+    <div class="card" style="margin-bottom:12px">
+      <h3>路径白名单 <span class="sub" id="allowCount"></span></h3>
+      <div class="hint">任务的 cwd 必须落在「ATS root 内部」或下列目录（含其全部子孙）才允许创建；白名单为空 = 只允许 root 内部。</div>
+      <div id="allowBody"></div>
+      <div class="field"><label>编辑（一行一个绝对路径；清空即只允许 root 内部）</label>
+        <textarea id="allowDirs" rows="4" spellcheck="false" placeholder="/home/me/project&#10;D:\work\repo"></textarea></div>
+      <div class="actions"><button class="primary" id="btnSaveAllow">保存路径白名单</button>
+        <span class="hint" id="allowHint"></span></div>
+      <div class="hint">相对路径与不存在的目录都会被拒绝：相对串以 ATS root 为基准解析，与你的本意容易错位。保存要口令，写入后同样重封签。</div>
+    </div>
     <div class="cards" id="approvalBody"></div>
   </section>
 
@@ -844,9 +961,10 @@ pre.log{background:#0b0f15;border:1px solid var(--line);border-radius:8px;paddin
           <div class="field"><label>等级</label><select id="tLevel"><option>L1</option><option>L0</option><option>L2</option><option>L3</option></select></div>
         </div>
         <div class="grid2">
-          <div class="field"><label>工作目录（可空）</label><input id="tCwd"></div>
+          <div class="field"><label>工作目录（白名单内）</label><select id="tCwd"></select></div>
           <div class="field"><label>超时（秒，0 不限）</label><input id="tTimeout" type="number" value="0"></div>
         </div>
+        <div class="hint" id="cwdHint">正在读取路径白名单…</div>
         <div class="field"><label>描述（可空）</label><input id="tDesc"></div>
         <div class="field"><label>环境变量（每行 K=V，可空）</label><textarea id="tEnv" rows="2"></textarea></div>
         <div class="actions"><button class="primary" id="btnCreateTask">创建任务</button></div>
@@ -862,9 +980,10 @@ pre.log{background:#0b0f15;border:1px solid var(--line);border-radius:8px;paddin
           <div class="field"><label>等级</label><select id="pLevel"><option>L1</option><option>L0</option><option>L2</option><option>L3</option></select></div>
         </div>
         <div class="grid2">
-          <div class="field"><label>工作目录（可空）</label><input id="pCwd"></div>
+          <div class="field"><label>工作目录（白名单内）</label><select id="pCwd"></select></div>
           <div class="field"><label>超时（秒）</label><input id="pTimeout" type="number" value="0"></div>
         </div>
+        <div class="hint" id="cwdHint2">正在读取路径白名单…</div>
         <div class="field"><label>描述（可空）</label><input id="pDesc"></div>
         <div class="actions"><button class="primary" id="btnCreatePack">加载指令包</button></div>
         <div class="hint">每行会按英文逗号拼成 CLI 的 commands 参数；条目中含英文逗号时请改用 CLI。</div>
@@ -893,13 +1012,49 @@ pre.log{background:#0b0f15;border:1px solid var(--line);border-radius:8px;paddin
   </div>
   <div class="drawer-body" id="drawerBody"></div>
 </aside>
+<div class="authgate" id="authGate">
+  <div class="authbox">
+    <h2>需要访问令牌</h2>
+    <p class="sub">这个控制台启用了鉴权（服务端带 <code>--token-file</code> 启动）。
+      令牌是一串随机字符，存在服务端指定的令牌文件里，把文件内容整段粘到下面即可。</p>
+    <div class="field"><label>访问令牌</label>
+      <input type="password" id="authToken" autocomplete="off" placeholder="粘贴令牌文件的内容"></div>
+    <div class="actions">
+      <button class="primary" id="btnAuthSave">保存并加载</button>
+      <button class="ghost" id="btnAuthClear">清除本页已存令牌</button>
+    </div>
+    <div class="hint" id="authHint"></div>
+  </div>
+</div>
 <div class="toasts" id="toasts"></div>
 
 <script>
 const SRV = __SRV__;
+const TOKEN_KEY = 'ats_ui_token';
 const $ = s => document.querySelector(s);
 let DATA = null, TAB = 'tasks', SEL_TASK = null, SEL_PLAN = null, LOGFILE = 'stdout';
 let FILTER_STATUS = 'all', TIMER = null, TICK = 0;
+
+function getToken(){ try{ return localStorage.getItem(TOKEN_KEY) || ''; }catch(e){ return ''; } }
+function setToken(v){ try{ if(v) localStorage.setItem(TOKEN_KEY, v); else localStorage.removeItem(TOKEN_KEY); }catch(e){} }
+function authHeaders(extra){
+  const h = Object.assign({}, extra || {});
+  const t = getToken();
+  if(t) h['Authorization'] = 'Bearer ' + t;
+  return h;
+}
+function showAuthGate(){
+  const g = $('#authGate');
+  if(!g) return;
+  g.classList.add('on');
+  const i = $('#authToken');
+  if(i && !i.value) i.value = getToken();
+  const hint = $('#authHint');
+  if(hint) hint.innerHTML = SRV.auth_file
+    ? '令牌文件：<code>' + esc(SRV.auth_file) + '</code>'
+    : '令牌文件路径见控制台启动时的输出（<code>--token-file</code> 指定的那个文件）。';
+}
+function hideAuthGate(){ const g = $('#authGate'); if(g) g.classList.remove('on'); }
 
 function esc(v){ return String(v==null?'':v).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function toSec(v){
@@ -931,9 +1086,12 @@ async function api(path, opts, timeoutMs){
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeoutMs || 25000);
   try{
-    const r = await fetch(path, Object.assign({cache:'no-store', signal:ctl.signal}, opts||{}));
+    const init = Object.assign({cache:'no-store', signal:ctl.signal}, opts||{});
+    init.headers = authHeaders((opts && opts.headers) || {});
+    const r = await fetch(path, init);
     let data = null;
     try{ data = await r.json(); }catch(e){}
+    if(r.status === 401){ showAuthGate(); throw new Error('需要访问令牌（HTTP 401）'); }
     if(!r.ok && !data) throw new Error('HTTP '+r.status);
     return data;
   }catch(e){
@@ -967,7 +1125,11 @@ function bannerWarn(msg){
 }
 
 async function pingOnce(){
-  try{ const r = await fetch('/api/ping', {cache:'no-store'}); return r.ok ? await r.json() : null; }
+  try{
+    const r = await fetch('/api/ping', {cache:'no-store', headers: authHeaders()});
+    if(r.status === 401){ showAuthGate(); return null; }
+    return r.ok ? await r.json() : null;
+  }
   catch(e){ return null; }
 }
 
@@ -985,6 +1147,7 @@ async function refresh(){
   try{
     d = await api('/api/state', {}, 25000);
   }catch(e){
+    if(String((e && e.message) || '').indexOf('401') >= 0) return;   // 令牌缺失，已弹出输入框
     const p = await pingOnce();
     if(p){
       setLive('warn', '状态读取失败');
@@ -1030,7 +1193,7 @@ function render(){
   $('#cntTasks').textContent = c.tasks || 0;
   $('#cntPlans').textContent = c.schedules || 0;
   $('#cntApprovals').textContent = c.pending_approvals || 0;
-  renderTasks(); renderPlans(); renderApprovals(); renderEvents(); renderMcp(); renderPolicyControls();
+  renderTasks(); renderPlans(); renderApprovals(); renderEvents(); renderMcp(); renderPolicyControls(); renderAllowDirs(); renderCwdOptions();
   if(SEL_TASK && TICK % 3 === 0) loadTask(true);
   if(SEL_PLAN && TICK % 3 === 0) loadPlan(true);
 }
@@ -1128,14 +1291,14 @@ function renderTasks(){
   $('#taskBody').innerHTML = rows.length ? rows.map(t => {
     const hook = t.post_hook ? ' <span class="pill s-'+esc(t.post_hook.status||'pending')+'">@enc '+esc(t.post_hook.status||'待执行')+'</span>' : '';
     return '<tr data-id="'+esc(t.id)+'">'
-      + '<td>'+pill(t.status)+'</td>'
-      + '<td class="mono">'+esc(t.id)+'</td>'
-      + '<td>'+esc(t.level||'-')+'</td>'
-      + '<td class="mono">'+esc((t.command||'').slice(0,120))+(t.command&&t.command.length>120?'…':'')+hook+'</td>'
-      + '<td>'+esc(t.exit_code==null?'-':t.exit_code)+'</td>'
-      + '<td>'+esc(dur(t.started_at,t.ended_at,t.status))+'</td>'
-      + '<td class="muted">'+esc(ts(t.created_at))+'</td></tr>';
-  }).join('') : '<tr><td colspan="7"><div class="empty">没有匹配的任务</div></td></tr>';
+      + '<td data-label="状态">'+pill(t.status)+'</td>'
+      + '<td class="mono" data-label="ID">'+esc(t.id)+'</td>'
+      + '<td data-label="等级">'+esc(t.level||'-')+'</td>'
+      + '<td class="mono" data-label="命令">'+esc((t.command||'').slice(0,120))+(t.command&&t.command.length>120?'…':'')+hook+'</td>'
+      + '<td data-label="退出">'+esc(t.exit_code==null?'-':t.exit_code)+'</td>'
+      + '<td data-label="用时">'+esc(dur(t.started_at,t.ended_at,t.status))+'</td>'
+      + '<td class="muted" data-label="创建">'+esc(ts(t.created_at))+'</td></tr>';
+  }).join('') : '<tr><td colspan="7" data-label=""><div class="empty">没有匹配的任务</div></td></tr>';
   $('#taskBody').querySelectorAll('tr[data-id]').forEach(tr => tr.onclick = () => openTask(tr.dataset.id));
 }
 
@@ -1145,14 +1308,14 @@ function renderPlans(){
     const counts = s.counts || {};
     const ctext = Object.keys(counts).map(k => esc(k)+':'+counts[k]).join(' ') || '-';
     return '<tr data-ident="'+esc(s.schedule_id)+'">'
-      + '<td class="mono">'+esc(s.schedule_id)+'</td>'
-      + '<td>'+esc(s.type||'-')+'</td>'
-      + '<td>'+pill(s.status)+'</td>'
-      + '<td>'+esc((s.runs==null?'-':s.runs)+(s.max_runs?' / '+s.max_runs:''))+'</td>'
-      + '<td class="muted">'+esc(s.next_run?ts(s.next_run):'-')+'</td>'
-      + '<td class="mono">'+pill(s.plan_status||'none')+' '+esc(s.current_plan||'')+'</td>'
-      + '<td class="muted">'+ctext+'</td></tr>';
-  }).join('') : '<tr><td colspan="7"><div class="empty">暂无计划或周期</div></td></tr>';
+      + '<td class="mono" data-label="ID">'+esc(s.schedule_id)+'</td>'
+      + '<td data-label="类型">'+esc(s.type||'-')+'</td>'
+      + '<td data-label="状态">'+pill(s.status)+'</td>'
+      + '<td data-label="运行">'+esc((s.runs==null?'-':s.runs)+(s.max_runs?' / '+s.max_runs:''))+'</td>'
+      + '<td class="muted" data-label="下次">'+esc(s.next_run?ts(s.next_run):'-')+'</td>'
+      + '<td class="mono" data-label="当前 Plan">'+pill(s.plan_status||'none')+' '+esc(s.current_plan||'')+'</td>'
+      + '<td class="muted" data-label="步数">'+ctext+'</td></tr>';
+  }).join('') : '<tr><td colspan="7" data-label=""><div class="empty">暂无计划或周期</div></td></tr>';
   $('#planBody').querySelectorAll('tr[data-ident]').forEach(tr => tr.onclick = () => openPlan(tr.dataset.ident));
 }
 
@@ -1234,7 +1397,7 @@ function renderApprovals(){
 }
 
 const APPROVAL_MODES = [['auto','auto（按身份直通）'],['ask','ask（人工审批）'],['deny-only','deny-only（直接拒绝）']];
-let POLICY_SIG = '';
+let POLICY_SIG = '', ALLOW_SIG = '';
 
 function fillModeSelect(el, val){
   if(!el) return;
@@ -1261,6 +1424,74 @@ function renderPolicyControls(){
   $('#polOverride').checked = !!p.denied_injection_allow_override;
   $('#polDry').checked = !!p.preflight_dry_run;
   $('#polIso').checked = !!p.win32_isolation;
+}
+
+function renderAllowDirs(){
+  const p = DATA && DATA.policy;
+  if(!p || !$('#allowBody')) return;
+  const raw = p.allow_dirs || [];
+  const detail = p.allow_dirs_detail || [];
+  const warns = p.boundary_warnings || [];
+  const sig = JSON.stringify([raw, detail, warns]);
+  const editing = document.activeElement && document.activeElement.id === 'allowDirs';
+  if(sig === ALLOW_SIG || editing) return;
+  ALLOW_SIG = sig;
+  $('#allowCount').textContent = raw.length ? '('+raw.length+' 项)' : '(空)';
+  const rows = detail.map(d => '<div class="ev"><div class="t">'+(d.exists?'存在':'缺失')+'</div>'
+    + '<div class="type">'+esc(d.raw)+'</div>'
+    + '<div class="body">'+esc(d.path)+(d.broader_than_root?' · <b>覆盖 root</b>':'')+'</div></div>');
+  $('#allowBody').innerHTML = (rows.length ? rows.join('') : '<div class="empty">未配置：任务 cwd 只允许 root 内部</div>')
+    + warns.map(w => '<div class="hint bad">'+esc(w)+'</div>').join('');
+  $('#allowDirs').value = raw.join('\n');
+}
+
+let CWD_SIG = '';
+
+function renderCwdOptions(){
+  const p = DATA && DATA.policy;
+  const detail = (p && p.allow_dirs_detail) || [];
+  const sig = JSON.stringify(detail);
+  if(sig === CWD_SIG) return;
+  CWD_SIG = sig;
+  const opts = [['', '（默认：root 内部）']].concat(detail.map(d => [d.raw,
+    d.raw + (d.path !== d.raw ? '  →  ' + d.path : '') + (d.exists ? '' : '  [目录缺失]')]));
+  const html = opts.map(o => '<option value="'+esc(o[0])+'">'+esc(o[1])+'</option>').join('');
+  const empty = !detail.length;
+  ['#tCwd','#pCwd'].forEach(sel => {
+    const el = $(sel);
+    if(!el) return;
+    const keep = el.value;
+    el.innerHTML = html;
+    el.value = opts.some(o => o[0] === keep) ? keep : '';
+    el.disabled = empty;
+  });
+  const msg = empty
+    ? '白名单为空：当前仅允许 root 内部。要指定其他目录，请到「审批」页添加。'
+    : '只能选白名单里的目录；增删目录请到「审批」页的路径白名单卡片。';
+  ['#cwdHint','#cwdHint2'].forEach(sel => { const el = $(sel); if(el) el.textContent = msg; });
+}
+
+async function saveAllowDirs(){
+  const lines = $('#allowDirs').value.split('\n').map(s => s.trim()).filter(Boolean);
+  const pass = uiPass();
+  if(!pass){ $('#allowHint').textContent = '未填口令，未保存'; return; }
+  $('#allowHint').textContent = '保存中…';
+  try{
+    const d = await api('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({action:'policy.set',patch:{allow_dirs:lines},passphrase:pass})}, 60000);
+    if(d.ok){
+      ALLOW_SIG = '';
+      $('#allowHint').textContent = '已保存 '+new Date().toLocaleTimeString('zh-CN',{hour12:false});
+      toast('路径白名单已保存','ok');
+      refresh();
+    }else{
+      $('#allowHint').textContent = '保存失败';
+      toast(errText(d),'bad');
+    }
+  }catch(e){
+    $('#allowHint').textContent = '保存失败';
+    toast('请求失败：'+e.message,'bad');
+  }
 }
 
 async function savePolicy(){
@@ -1463,6 +1694,7 @@ $('#interval').onchange = restartTimer;
 $('#taskSearch').oninput = renderTasks;
 $('#showAllApprovals').onchange = renderApprovals;
 $('#btnSavePolicy').onclick = savePolicy;
+$('#btnSaveAllow').onclick = saveAllowDirs;
 document.querySelectorAll('.tab').forEach(b => b.onclick = () => showTab(b.dataset.tab));
 
 $('#btnCreateTask').onclick = () => {
@@ -1483,8 +1715,24 @@ $('#btnSubmitPlan').onclick = () => {
   if(!spec) return toast('spec 不能为空','bad');
   act('plan.submit',{spec_text:spec,id:$('#planId').value.trim()}, null);
 };
+$('#btnAuthSave').onclick = () => {
+  const v = ($('#authToken').value || '').trim();
+  if(!v) return toast('令牌不能为空','bad');
+  setToken(v);
+  hideAuthGate();
+  toast('令牌已保存在本浏览器','ok');
+  refresh();
+};
+$('#btnAuthClear').onclick = () => {
+  setToken('');
+  $('#authToken').value = '';
+  toast('已清除本页保存的令牌','warn');
+};
+$('#authToken').addEventListener('keydown', e => { if(e.key === 'Enter') $('#btnAuthSave').click(); });
 
-restartTimer(); refresh();
+restartTimer();
+if(SRV.auth && !getToken()) showAuthGate();
+refresh();
 </script>
 </body>
 </html>
@@ -1504,7 +1752,8 @@ class Handler(BaseHTTPRequestHandler):
         except (ConnectionResetError, BrokenPipeError):
             self.close_connection = True
 
-    def _send(self, body, content_type="application/json; charset=utf-8", code=200):
+    def _send(self, body, content_type="application/json; charset=utf-8", code=200,
+              headers=None):
         if isinstance(body, (dict, list)):
             body = json.dumps(body, ensure_ascii=False)
         data = body.encode("utf-8") if isinstance(body, str) else body
@@ -1512,23 +1761,45 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         try:
             self.wfile.write(data)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _authorized(self):
+        """TOKEN 为空即「回环免令牌」模式；非空时 /api/* 一律要 Bearer 令牌。"""
+        if not TOKEN:
+            return True
+        header = (self.headers.get("Authorization") or "").strip()
+        given = header[7:].strip() if header.lower().startswith("bearer ") else ""
+        return bool(given) and hmac.compare_digest(given, TOKEN)
+
+    def _deny(self):
+        hint = ("控制台启用了访问令牌：把令牌文件里的那串字符粘到页面上的「访问令牌」框。"
+                "令牌文件：%s" % (TOKEN_FILE if TOKEN_FILE else "（未指定 --token-file）"))
+        return self._send({"ok": False, "error": "unauthorized", "hint": hint},
+                          code=401, headers={"WWW-Authenticate": "Bearer"})
+
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path in ("/", "/index.html"):
             srv = json.dumps({"root": str(ROOT), "script": str(SCRIPT_FILE),
-                              "port": PORT, "version": VERSION}, ensure_ascii=False)
+                              "port": PORT, "version": VERSION,
+                              "auth": bool(TOKEN),
+                              "auth_file": str(TOKEN_FILE) if TOKEN_FILE else ""},
+                             ensure_ascii=False)
             return self._send(HTML.replace("__SRV__", srv), "text/html; charset=utf-8")
         if parsed.path == "/favicon.ico":
             self.send_response(204)
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+
+        if parsed.path.startswith("/api/") and not self._authorized():
+            return self._deny()
 
         query = parse_qs(parsed.query)
         try:
@@ -1574,6 +1845,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        if not self._authorized():
+            return self._deny()
         if parsed.path != "/api/action":
             return self._send({"error": "not_found"}, code=404)
         try:
@@ -1595,12 +1868,34 @@ def pid_file(root):
     return Path(root) / "ui_tmp" / "server.json"
 
 
-def probe_ping(host, port, timeout=2.0):
+def probe_ping(host, port, timeout=2.0, token=None):
     probe_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
     url = "http://%s:%d/api/ping" % (probe_host, port)
+    req = urllib.request.Request(url)
+    if token:
+        req.add_header("Authorization", "Bearer " + token)
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def probe_code(host, port, timeout=2.0, token=None):
+    """返回 HTTP 状态码；连不上返回 None。
+
+    用来区分两种「探测失败」：端口没开（真没跑）与端口开着但回 401（在跑、只是要令牌）。
+    """
+    probe_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+    url = "http://%s:%d/api/ping" % (probe_host, port)
+    req = urllib.request.Request(url)
+    if token:
+        req.add_header("Authorization", "Bearer " + token)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
     except Exception:
         return None
 
@@ -1631,12 +1926,14 @@ def spawn_wmi(args, cwd):
         return None
 
 
-def launch_detached(root, host, port):
+def launch_detached(root, host, port, token_file=None):
     tmp = Path(root) / "ui_tmp"
     tmp.mkdir(parents=True, exist_ok=True)
     log = tmp / "ui.log"
     args = [sys.executable, str(SCRIPT_FILE), "--root", str(root), "--host", host,
             "--port", str(port), "--log", str(log), "--serve"]
+    if token_file:
+        args += ["--token-file", str(token_file)]
     pid = spawn_wmi(args, str(SCRIPT_DIR))
     if pid is None:
         with open(log, "ab") as fh:
@@ -1658,21 +1955,24 @@ def launch_detached(root, host, port):
     return pid, log
 
 
-def ensure_running(root, host, port, open_browser):
+def ensure_running(root, host, port, open_browser, token_file=None):
     url = "http://%s:%d/" % (host, port)
-    info = probe_ping(host, port)
+    token, token_path = resolve_token(root, token_file)
+    info = probe_ping(host, port, token=token)
     if info:
         print("控制台已在运行: %s  (PID %s, root %s)" % (url, info.get("pid"), info.get("root")))
         if open_browser:
             webbrowser.open(url)
         return 0
-    pid, log = launch_detached(root, host, port)
+    pid, log = launch_detached(root, host, port, token_path)
     for _ in range(40):
         time.sleep(0.25)
-        info = probe_ping(host, port, timeout=1.0)
+        info = probe_ping(host, port, timeout=1.0, token=token)
         if info:
             print("控制台已自动启动: %s  (PID %s)" % (url, info.get("pid")))
             print("ATS_ROOT: %s" % root)
+            if token_path:
+                print("访问令牌文件: %s（网页第一次打开时把内容粘进「访问令牌」框）" % token_path)
             if open_browser:
                 webbrowser.open(url)
             return 0
@@ -1711,11 +2011,12 @@ def stop_server(root):
     return 0
 
 
-def serve(root, host, port, open_browser, log_path=None, mcp_port=None):
-    global ROOT, PORT, MCP_ENDPOINT
+def serve(root, host, port, open_browser, log_path=None, mcp_port=None, token_file=None):
+    global ROOT, PORT, TOKEN, TOKEN_FILE, MCP_ENDPOINT
     ROOT = root
     PORT = port
     MCP_ENDPOINT = None
+    TOKEN, TOKEN_FILE = resolve_token(root, token_file)
     if mcp_http is not None:                     # 默认关闭，仅在内存里准备端点对象
         MCP_ENDPOINT = mcp_http.Endpoint(root, mcp_port or (port + 1))
     if log_path:
@@ -1737,6 +2038,9 @@ def serve(root, host, port, open_browser, log_path=None, mcp_port=None):
     url = "http://%s:%d/" % (host, port)
     print("ATS 控制台 v%s: %s" % (VERSION, url))
     print("ATS_ROOT: %s" % root)
+    if TOKEN_FILE:
+        print("访问令牌: 已启用（Bearer），令牌文件 %s" % TOKEN_FILE)
+        print("网页第一次打开会让你粘贴令牌；命令行客户端请带 Authorization: Bearer <令牌>")
     print("按 Ctrl+C 退出")
     if open_browser:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
@@ -1762,24 +2066,37 @@ def main():
     parser.add_argument("--ensure", action="store_true", help="未运行则在后台自启动，然后（可配合 --open）打开浏览器")
     parser.add_argument("--status", action="store_true", help="查看控制台是否在运行")
     parser.add_argument("--stop", action="store_true", help="停止由 --ensure 启动的控制台")
+    parser.add_argument("--token-file", default=None,
+                        help="访问令牌文件；指定后 /api/* 一律要求 Bearer 令牌（文件不存在会自动生成）。"
+                             "绑定非回环地址时必填")
     parser.add_argument("--serve", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--log", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     root = resolve_root(args.root)
+    if not is_loopback(args.host) and not args.token_file:
+        print(host_guard_message(args.host, root, args.port, args.token_file))
+        return 2
+    if args.stop:
+        return stop_server(root)            # 只读 pid 文件，不经 HTTP，也就不碰令牌
     if args.status:
-        info = probe_ping(args.host, args.port)
+        token, _ = resolve_token(root, args.token_file)
+        info = probe_ping(args.host, args.port, token=token)
         if info:
             print("运行中: http://%s:%d/  PID %s  root %s  v%s"
                   % (args.host, args.port, info.get("pid"), info.get("root"), info.get("version")))
             return 0
+        code = probe_code(args.host, args.port, token=token)
+        if code == 401:
+            print("运行中，但需要访问令牌：http://%s:%d/ 返回 401。" % (args.host, args.port))
+            print("补上 --token-file <令牌文件> 再查一次；路径见控制台启动时的输出。")
+            return 0
         print("未运行：http://%s:%d/ 无响应" % (args.host, args.port))
         return 1
-    if args.stop:
-        return stop_server(root)
     if args.ensure:
-        return ensure_running(root, args.host, args.port, args.open)
-    return serve(root, args.host, args.port, args.open, args.log, args.mcp_port)
+        return ensure_running(root, args.host, args.port, args.open, args.token_file)
+    return serve(root, args.host, args.port, args.open, args.log, args.mcp_port,
+                 args.token_file)
 
 
 if __name__ == "__main__":

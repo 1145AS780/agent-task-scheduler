@@ -1,4 +1,4 @@
-# 权限与审批 — agent-task-scheduler v3.3.0-R0
+# 权限与审批 — agent-task-scheduler v4.0.0-R0
 
 本文描述 L0-L3 分级、策略上限、白名单、审批闭环与存活租约免审。实现见 `scripts/ats.py` 的
 `policy()`、`whitelist_match()`、`lease_state()`、`lease_autonomy()`、`permission_gate()`、
@@ -107,6 +107,7 @@
 | `max_level` | `L3` | `ATS_MAX_LEVEL` | 硬上限 |
 | `actor_level` | `L3` | `ATS_ACTOR_LEVEL` | 当前身份 |
 | `allow_rules` | `[]` | `ATS_ALLOW_RULES` | 正则，`\|\|` 分隔 |
+| `allow_dirs` | `[]` | `ATS_ALLOW_DIRS` | 允许 `cwd` 落在 root 之外的目录；JSON 数组或 `\|\|`/换行分隔，**不用逗号** |
 | `approval_ttl_seconds` | `86400` | `ATS_APPROVAL_TTL` | 审批有效期，`<=0` 不过期 |
 | `keep_runs_per_plan` | `5` | `ATS_KEEP_RUNS` | 快照保留数，`<=0` 不清理 |
 | `stall_seconds` | `300` | `ATS_STALL` | 停滞阈值，`<=0` 关闭 |
@@ -133,6 +134,28 @@ python scripts/ats.py policy --json
 ```
 
 **注意**：环境变量优先于文件，便于临时提升/收紧权限。L2/L3 是否需要审批由 `approval_mode` / `approval_mode_by_level` 决定（默认 L2/L3 为 `ask`），与 `actor_level` 无关；`actor_level` 只在 `auto` 档（默认 L0/L1）参与「等级 ≤ 身份即直通」的判定。生产环境建议把 `actor_level` 设低（如 L1），并让受控等级保持 `ask`。
+
+### 4.1 路径边界（`allow_dirs`）
+
+`cwd` 本身就是权限面：命令在哪个目录跑，就决定了它能读写什么。所以只看「目录存不存在」是不够的，还要看**在不在允许范围内**。
+
+- 允许范围 = ATS root 内部（含全部子孙）∪ `allow_dirs` 每一项及其全部子孙
+- 白名单项必须**绝对**且**写入时已存在**（`policy --set allow_dirs` 逐项校验，相对路径与缺失目录直接拒）
+- 相对 `cwd` 一律以 **ATS root** 为基准解析，不跟调用方的进程目录，避免「校验一处、执行另一处」
+- 越界在 `create` 阶段就拒（`bad_cwd` / `reason=cwd_outside_allowlist`），不会出现「任务建好、批完、跑起来才报错」
+- `run` 前二次校验：白名单可能被改、目录可能被删；失效判 `cwd_gone`，**不静默回退到 root**
+- `supervise` 直接调用也重算一次边界（`supervise` 是子命令，不能只靠 `run` 那一道闸）：越界把任务标 `failed`，**不拉起进程**
+- Plan 层同一套判定：`submit_plan` / `submit_schedule` 提交即校验每个 step 的 `cwd`（`spec_invalid`），执行前 `ensure_step_permission` 再校验一次（`cwd_gone`）
+- 判定统一走 `resolve_cwd()` 归一化后再比：`..` 会被消解、大小写按 Windows 语义等价、目录联接（junction）跟到真实目标。前缀匹配带路径分隔符，`D:\a` 不会误吞 `D:\ab`
+
+`policy --json` 会把白名单逐项摊开成 `allow_dirs_detail`（`path` / `exists` / `broader_than_root`）；某一项把 root 本身也覆盖进去时，额外给 `boundary_warnings` —— 那等价于放开整层上层目录，必须在输出里显式标注，而不是让人以为只放开了一个子目录。
+
+```bash
+python scripts/ats.py policy --set allow_dirs '["D:/proj/web","E:/build"]'
+python scripts/ats.py policy --set allow_dirs 'D:/proj/web||E:/build'
+```
+
+`allow_dirs` 刻意**不支持逗号分隔**：Windows 下 `D:\a,b` 是合法目录名，逗号切分会把它劈成两个不存在的路径。它属于受限键，改它要持口令（与其它放宽执行范围的键一致），写完会重封签。
 
 ---
 

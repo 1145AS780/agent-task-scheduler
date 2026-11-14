@@ -1,4 +1,4 @@
-# 编排规格 — agent-task-scheduler v3.3.0-R0
+# 编排规格 — agent-task-scheduler v4.0.0-R0
 
 本文是 Plan / Schedule 层的权威规格。实现以 `scripts/ats_plan.py` 为准；若文档与实现不一致，以脚本行为为准并修正文档。
 
@@ -41,7 +41,8 @@
 
 - `command` 为字符串；`shell=true` 时通过系统 shell 解释
 - `--no-shell` 时整串按可执行文件路径解释（不拆分参数），适合无空格路径
-- `cwd` 必须存在，否则 `bad_cwd`（exit 2）
+- `cwd` 必须存在，否则 `bad_cwd`（exit 2）；且必须落在允许范围内（ATS root 内部或其子孙，或 `policy.allow_dirs` 列出的目录及其子孙），越界同样 `bad_cwd`，`reason=cwd_outside_allowlist`
+- 相对 `cwd` 以 ATS root 为基准解析；`run` 前会二次校验，目录已消失则 `cwd_gone`（exit 4），不回退到 root
 - `id` 可指定；已存在需 `--force`，否则 `task_exists`（exit 3）
 - `level` 必须是 L0-L3；默认 L1
 - `timeout` 是秒；`0` = 不限时

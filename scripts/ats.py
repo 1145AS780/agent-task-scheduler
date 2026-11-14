@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""agent-task-scheduler — Task 层执行器 (v3.3.0-R0)
+"""agent-task-scheduler — Task 层执行器 (v4.0.0-R0)
 
 命令：
   create <id> --command "..." [--cwd DIR] [--level L0..L3] [--timeout SEC]
@@ -105,6 +105,8 @@ POLICY_DEFAULTS = {
     "max_level": DEFAULT_MAX_LEVEL,
     "actor_level": DEFAULT_ACTOR_LEVEL,
     "allow_rules": [],
+    # 路径白名单：空 = 只允许 ATS root 内部；非空 = root 内部 + 各项及其子孙
+    "allow_dirs": [],
     "approval_ttl_seconds": DEFAULT_APPROVAL_TTL,
     "keep_runs_per_plan": KEEP_RUNS_DEFAULT,
     "stall_seconds": STALL_SECONDS_DEFAULT,
@@ -127,6 +129,7 @@ POLICY_ENV = {
     "max_level": "ATS_MAX_LEVEL",
     "actor_level": "ATS_ACTOR_LEVEL",
     "allow_rules": "ATS_ALLOW_RULES",
+    "allow_dirs": "ATS_ALLOW_DIRS",
     "approval_ttl_seconds": "ATS_APPROVAL_TTL",
     "keep_runs_per_plan": "ATS_KEEP_RUNS",
     "stall_seconds": "ATS_STALL",
@@ -151,7 +154,8 @@ APPROVAL_MODES = ("auto", "ask", "deny-only")
 
 # 放松型键：改这些等于放宽执行许可，必须持口令（任何 --set 都要求口令，
 # 这里只是把「会放宽的键」在拒绝载荷里点名，便于人判断风险）
-RESTRICTED_POLICY_KEYS = ("max_level", "actor_level", "allow_rules", "approval_mode",
+RESTRICTED_POLICY_KEYS = ("max_level", "actor_level", "allow_rules", "allow_dirs",
+                          "approval_mode",
                           "approval_mode_by_level", "operation_levels",
                           "denied_injection_allow_override", "win32_isolation",
                           "preflight_fail_closed", "preflight_dry_run",
@@ -428,6 +432,33 @@ def pack_level(explicit, commands):
     return str(max([explicit or derived, derived, floor], key=level_rank)).upper()
 
 
+def dir_list(value):
+    """解析目录白名单。接受 JSON 数组、换行分隔、`||` 分隔。
+
+    刻意**不支持逗号分隔**：Windows 允许 `D:\\a,b` 这样的目录名，按逗号切会把
+    一条路径劈成两条。`allow_rules` 那条按逗号切的老写法不能照搬到这里。
+    """
+    if isinstance(value, (list, tuple)):
+        items = [str(x) for x in value]
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+            except (TypeError, ValueError):
+                parsed = None
+            items = ([str(x) for x in parsed] if isinstance(parsed, list)
+                     else text.splitlines())
+        else:
+            # `|` 在 Windows 文件名里非法，所以 `||` 当分隔符不会和路径撞车
+            items = text.replace("||", "\n").splitlines()
+    else:
+        items = []
+    return [x.strip() for x in items if str(x).strip()]
+
+
 def policy(root, data=None):
     """读取策略：默认值 < policy.json < 环境变量。
 
@@ -479,6 +510,7 @@ def policy(root, data=None):
     if isinstance(rules, str):
         rules = [x.strip() for x in rules.split(",") if x.strip()]
     pol["allow_rules"] = list(rules or [])
+    pol["allow_dirs"] = dir_list(pol.get("allow_dirs"))
     for key in INT_POLICY_KEYS:
         try:
             pol[key] = int(pol[key])
@@ -513,6 +545,57 @@ def _copy_policy(data):
     return {key: (dict(value) if isinstance(value, dict) else
                   list(value) if isinstance(value, (list, tuple)) else value)
             for key, value in (data or {}).items()}
+
+
+def _path_within(child, parent) -> bool:
+    """child 是否在 parent 内部（含 parent 自身）。大小写按平台归一。"""
+    c = os.path.normcase(os.path.abspath(str(child)))
+    p = os.path.normcase(os.path.abspath(str(parent)))
+    if c == p:
+        return True
+    if not p.endswith(os.sep):
+        p += os.sep
+    # 带分隔符比较：否则 /allowed 会把 /allowed-evil 误判成子孙
+    return c.startswith(p)
+
+
+def resolve_cwd(root, cwd):
+    """把任务 cwd 归一成绝对路径；空值返回 None。
+
+    相对路径一律以 ATS root 为基准，**不用调用方进程的 cwd**：执行时 supervisor
+    的工作目录就是 root，若校验按调用方 cwd、执行按 root，同一个相对串会落到
+    两个不同目录——校验的是一处，真正跑的是另一处。
+    """
+    if cwd is None:
+        return None
+    raw = str(cwd).strip()
+    if not raw:
+        return None
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = Path(root) / p
+    try:
+        return Path(p).resolve()
+    except OSError:
+        return Path(p).absolute()
+
+
+def cwd_allowed(root, cwd, pol=None):
+    """判定 cwd 是否落在允许范围。返回 (ok, resolved, reason)。
+
+    允许范围 = ATS root 内部 + policy 的 allow_dirs 每一项及其全部子孙。
+    allow_dirs 为空时等价于「只允许 root 内部」。
+    """
+    target = resolve_cwd(root, cwd)
+    if target is None:
+        return True, None, None
+    if _path_within(target, Path(root)):
+        return True, target, None
+    for item in (pol or policy(root)).get("allow_dirs") or []:
+        base = resolve_cwd(root, item)
+        if base is not None and _path_within(target, base):
+            return True, target, None
+    return False, target, "cwd_outside_allowlist"
 
 
 def normalize_floor_level(value, floor) -> str:
@@ -1642,9 +1725,18 @@ def cmd_create(root, args):
 
     cwd = args.cwd or spec.get("cwd")
     if cwd:
-        cwd = str(Path(cwd).expanduser())
+        ok, resolved, reason = cwd_allowed(root, cwd)
+        if not ok:
+            print(json.dumps({"error": "bad_cwd", "cwd": str(resolved), "reason": reason,
+                              "hint": "cwd 超出允许范围：只能是 ATS root 内部，或 "
+                                      "policy.allow_dirs 列出的目录（含全部子孙）"},
+                             ensure_ascii=False))
+            return EXIT_USAGE
+        cwd = str(resolved)
         if not Path(cwd).exists():
-            print(json.dumps({"error": "bad_cwd", "cwd": cwd}, ensure_ascii=False))
+            print(json.dumps({"error": "bad_cwd", "cwd": cwd, "reason": "cwd_missing",
+                              "hint": "cwd 指向的目录不存在：先建目录，或改成已存在的路径"},
+                             ensure_ascii=False))
             return EXIT_USAGE
 
     now = now_ts()
@@ -2006,9 +2098,15 @@ def cmd_pack(root, args):
                           EXIT_USAGE)
     cwd = args.cwd
     if cwd:
-        cwd = str(Path(cwd).expanduser())
+        ok, resolved, reason = cwd_allowed(root, cwd)
+        if not ok:
+            return print_json({"error": "bad_cwd", "cwd": str(resolved), "reason": reason,
+                               "hint": "cwd 超出允许范围：只能是 ATS root 内部，或 "
+                                       "policy.allow_dirs 列出的目录（含全部子孙）"},
+                              EXIT_USAGE)
+        cwd = str(resolved)
         if not Path(cwd).exists():
-            return print_json({"error": "bad_cwd", "cwd": cwd,
+            return print_json({"error": "bad_cwd", "cwd": cwd, "reason": "cwd_missing",
                                "hint": "cwd 指向的目录不存在：先建目录，或改成已存在的绝对路径"},
                               EXIT_USAGE)
 
@@ -2085,6 +2183,27 @@ def _start_task(root, task_id, approval=None, wait=False, force=False):
         if task.get("status") in ("failed", "timeout", "killed", "succeeded") and not force:
             return {"error": "rerun_requires_force", "task_id": task["id"],
                     "status": task.get("status")}, EXIT_CONFLICT
+
+        # 路径边界二次校验：任务建好后 allow_dirs 可能被改、白名单目录可能被删或移走。
+        # 这里重算一次并落盘归一化结果，绝不静默回退到 root。
+        cwd = task.get("cwd")
+        if cwd:
+            ok, resolved, reason = cwd_allowed(root, cwd)
+            if not ok:
+                log_event(root, "task_start_rejected", task_id=task["id"],
+                          reason=reason, cwd=str(cwd))
+                return {"error": reason, "task_id": task["id"], "cwd": str(resolved),
+                        "hint": "cwd 已不在 policy.allow_dirs 允许范围内；"
+                                "改回 root 内部目录，或先补白名单再运行"}, EXIT_DENIED
+            if resolved is not None and not resolved.exists():
+                log_event(root, "task_start_rejected", task_id=task["id"],
+                          reason="cwd_gone", cwd=str(resolved))
+                return {"error": "cwd_gone", "task_id": task["id"], "cwd": str(resolved),
+                        "hint": "任务的工作目录已不存在（可能被删或盘符未挂载）；"
+                                "修正目录后重试，不会自动回退到 root"}, EXIT_DENIED
+            if resolved is not None and str(resolved) != str(cwd):
+                task["cwd"] = str(resolved)
+                save_task(root, task)
 
         gate = permission_gate(root, gate_text, approval,
                                {"required_level": task.get("level") or DEFAULT_TASK_LEVEL,
@@ -2284,6 +2403,25 @@ def _supervise(root, task_id):
     env = os.environ.copy()
     env.update({str(k): str(v) for k, v in (task.get("env") or {}).items()})
     cwd = task.get("cwd") or None
+    if cwd:
+        # 兜底校验：`supervise` 是可以直接调用的子命令，不能只靠 _start_task 拦。
+        # 两者都过同一套判定，避免「走这条路校验、走那条路不校验」。
+        ok, resolved, reason = cwd_allowed(root, cwd)
+        err = None
+        if not ok:
+            err = reason or "cwd_outside_allowlist"
+        elif not Path(str(resolved)).exists():
+            err = "cwd_gone"
+        if err:
+            task["status"] = "failed"
+            task["error_type"] = err
+            task["ended_at"] = now_ts()
+            task["exit_code"] = None
+            save_task(root, task)
+            log_event(root, "task_failed", task_id=task_id, error_type=err,
+                      cwd=str(resolved))
+            return task
+        cwd = str(resolved)
     timeout = int(task.get("timeout") or 0)
 
     argv = task.get("argv")
@@ -3182,6 +3320,35 @@ def cmd_policy(root, args):
                                                "不能是字符串或数组"},
                                       EXIT_USAGE)
                 stored[key] = parsed
+            elif key == "allow_dirs":
+                text = str(raw).strip()
+                items = dir_list(text)
+                if not items and text not in ("", "[]"):
+                    return print_json({"error": "bad_value", "key": key, "value": raw,
+                                       "hint": "allow_dirs 解析不出目录：用 JSON 数组 "
+                                               '["D:\\\\work"]，或换行/`||` 分隔；'
+                                               "不要用逗号（路径里逗号是合法字符）"},
+                                      EXIT_USAGE)
+                absolute, missing = [], []
+                for item in items:
+                    cand = Path(item).expanduser()
+                    if not cand.is_absolute():
+                        absolute.append(item)
+                    elif not cand.exists():
+                        missing.append(item)
+                if absolute:
+                    return print_json({"error": "bad_allow_dir", "key": key,
+                                       "relative": absolute,
+                                       "hint": "allow_dirs 每一项都必须是绝对路径；"
+                                               "相对路径的基准会随调用方漂移"},
+                                      EXIT_USAGE)
+                if missing:
+                    return print_json({"error": "bad_allow_dir", "key": key,
+                                       "missing": missing,
+                                       "hint": "这些目录当前不存在（可能盘符未挂载或路径写错）；"
+                                               "白名单建时即校验，避免运行到一半才发现"},
+                                      EXIT_USAGE)
+                stored[key] = [str(Path(x).expanduser().resolve()) for x in items]
             else:
                 stored[key] = raw
         jwrite(path, stored)
@@ -3206,6 +3373,26 @@ def cmd_policy(root, args):
         "scope": (record or {}).get("scope"),
         "ats_autonomy": (record or {}).get("ats_autonomy"),
     }
+    # 白名单里的字符串和系统实际认到的路径可能不是一回事，逐项摊开给人看。
+    # 尤其「白名单项覆盖了 root 本身」等价于放开整层上层目录，必须显式标注。
+    detail, warnings = [], []
+    for item in pol.get("allow_dirs") or []:
+        resolved = resolve_cwd(root, item)
+        if resolved is None:
+            continue
+        exists = Path(str(resolved)).exists()
+        broader = _path_within(Path(root), resolved)
+        detail.append({"raw": item, "path": str(resolved), "exists": exists,
+                       "broader_than_root": broader})
+        if broader:
+            warnings.append("allow_dirs 项 %s 覆盖了 ATS root 本身：等价于放开其全部上层目录"
+                            % resolved)
+        if not exists:
+            warnings.append("allow_dirs 项 %s 当前不存在：相关任务会在 run 前被判 cwd_gone"
+                            % resolved)
+    pol["allow_dirs_detail"] = detail
+    if warnings:
+        pol["boundary_warnings"] = warnings
     if args.json:
         return print_json(pol)
     print(json.dumps(pol, ensure_ascii=False, indent=2))
@@ -3871,7 +4058,7 @@ def print_json(data, code=EXIT_OK):
 def build_parser():
     ap = argparse.ArgumentParser(
         prog="ats.py",
-        description="agent-task-scheduler — Task 层执行器 (v3.3.0-R0)",
+        description="agent-task-scheduler — Task 层执行器 (v4.0.0-R0)",
     )
     ap.add_argument("--root", default=None,
                     help="状态根目录，默认 <ats 本体目录>/.ats（即 OCSKIS/.ats）；"

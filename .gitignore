@@ -17,6 +17,10 @@ venv/
 # enter the repo. Everything here is ignored on purpose.
 temp/
 
+# Raw conversation transcripts used for context recovery (2.8 MB, machine-local).
+# Kept on disk for reference; they must not bloat the shipped repo.
+tests/split/
+
 # Backups
 *.bak
 *.bak-*

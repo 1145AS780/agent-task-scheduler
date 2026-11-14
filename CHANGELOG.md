@@ -8,6 +8,80 @@ GitHub Releases 和从 SKILL.md 会读到两套说法。
 
 ---
 
+## 4.0.0-R0 — 2026-11-14
+
+> ⚠️ **升级必读：本版收窄了执行目录边界，升级后既有任务可能被拒跑，且必须重新封签。**
+>
+> 1. **行为不兼容**：任务 `cwd` 从「任意已存在的目录」收窄为「ATS root 内部 + `policy.allow_dirs`
+>    每一项及其全部子孙」。旧状态文件照旧能读，但 `cwd` 落在 root 之外的任务，新建时直接
+>    `bad_cwd`（`reason=cwd_outside_allowlist`），已有任务在 `run` 前被判 `cwd_gone`。
+>    升级后先跑 `python scripts/ats.py policy --json`，看 `allow_dirs_detail` 逐项状态，
+>    把确实要用的目录补进白名单再继续。
+> 2. **控制台不再允许裸奔**：`ats_ui.py` 绑非回环地址（如 `0.0.0.0`）时，若没给 `--token-file`
+>    就直接以退出码 2 拒绝启动，并打印可复制运行的补救命令；不再像 3.3.0-R0 那样明文对外。
+> 3. **必须重新封签**：本次改动了 `scripts/` 下**四个** `.py`（`ats.py`、`ats_plan.py`、
+>    `ats_torrent.py`、`ats_ui.py`），`ats_guard_manifest.json` 覆盖的 10 个核心 `.py` 中有
+>    4 个 digest 失配，`ats.py` 启动的准入握手会直接失败。
+>    在 `OCSKIS/` 下运行 `setup.bat`，口令与上次相同；口令只经 stdin，不进 argv、不进命令历史。
+> 4. **自检**：`python scripts/ats_guard.py verify` 应返回 `"ok": true`、`"problems": []`。
+
+### 为什么是 4.0.0 而不是 3.3.1
+
+`v3.3.0-R0` 的 tag 已指向 `1b8443c` 并推送到 origin。本次最重的一条改动不是「加了功能」，而是
+**权限门本身的重写**：`cwd` 的合法范围被收窄，判定要同时落在建阶段、执行前、Plan 层三处，
+`allow_dirs` 本身还被列为受限策略键（改它必须持人类口令）。按
+[versioning.md](references/versioning.md) §2，「安全边界、审核机制的加强」属 A 进位，
+且 A 进位时 `B`、`C` 强制清零，因此是 `4.0.0-R0`。
+
+把它记成 `3.3.1` 会误导：只读 `C` 的人会以为「小修补、不用重封签、不用看安全警告」，
+而实际既有任务会因为边界收窄而拒跑。
+
+### 安全与边界（A 级变更）
+
+- **`cwd` 白名单 `allow_dirs`**：允许范围 = ATS root 内部（含全部子孙）∪ `allow_dirs` 每一项及其
+  全部子孙。白名单项必须**绝对**且**写入时已存在**，`policy --set allow_dirs` 逐项校验，相对路径
+  （`bad_allow_dir` / `relative`）与缺失目录（`bad_allow_dir` / `missing`）直接拒。
+- **判定统一走 `resolve_cwd()`**：`~` 展开、`..` 消解、大小写按 Windows 语义等价、目录联接
+  （junction）跟到真实目标；前缀匹配带路径分隔符，`D:\a` 不会误吞 `D:\ab`。相对 `cwd` 一律以
+  **ATS root** 为基准，不跟调用方的进程目录，避免「校验一处、执行另一处」。
+- **越界就地拒，不静默回退**：`create` / `pack` 阶段即拒（`bad_cwd`）；`run` 前二次校验
+  （白名单可能被改、目录可能被删）失效判 `cwd_gone`；`supervise` 是子命令，自己重算一次边界，
+  越界把任务标 `failed` 而不是拉起进程；Plan 层 `submit_plan` / `submit_schedule` 提交即校验每个
+  step 的 `cwd`，执行前 `ensure_step_permission` 再校验一次。**任何一处都不回退到 root。**
+- **`allow_dirs` 进 `RESTRICTED_POLICY_KEYS`**：改白名单等于改权限边界，必须持口令。
+- **`policy --json` 暴露 `allow_dirs_detail`**（`path` / `exists` / `broader_than_root`），某项把
+  root 也覆盖进去时额外给 `boundary_warnings`——那等于放开整层上层目录，必须显式标注。
+- **控制台令牌闸门**：`--token-file` 指定令牌文件后，`/api/*` 一律要求 `Authorization: Bearer`；
+  token 用 `secrets.compare_digest` 比较，缺失/错误返回 401。绑非回环且无令牌 → 退出码 2。
+  回环地址免令牌模式保留（本地自用不必每次输令牌）。
+
+### 新增
+
+- **控制台「执行目录白名单」面板**：`allowDirs` 文本域读写 `policy.allow_dirs`，保存走
+  `policy.set` 并**要求输入口令**（与 CLI 同一道闸门，控制台不是绕过口）。面板同时展示每项
+  `exists` / `broader_than_root` 状态与 `boundary_warnings`。
+- **任务/指令包创建表单的 `cwd` 下拉**（`#tCwd` / `#pCwd`）：选项来自 root + 白名单目录，
+  仍允许手填（下拉只是把「常用且合法」的路径提到手边，不做校验替代）。
+- **移动端窄屏适配**：900px / 860px 两档断点，KPI 改两列、任务列表转卡片式、表单与按钮放大到
+  触控尺寸，窄屏下不再出现横向滚动。
+- **库级编排层 `api/ats_api.py`**：`AtsClient`（`CONTRACT = 1`），提供 `create` / `run` / `stop` /
+  `status` / `check` / `list_tasks` / `show` / `logs` / `events` / `approve` / `reject` /
+  `approve_all` / `wait_for_approval` / `wait_task` / `run_and_wait` / `plan_call`。
+  自我约束三条：只以**子进程**调 CLI、绝不 `import ats.py` / `ats_plan.py`、不内置或缓存口令、
+  不重实现任何权限判断——所以它落在 `scripts/` 之外，不进封签哈希范围。
+
+### 测试与文档
+
+- `tests/selftest.py` 从 82 条增至 **95 条**（新增 13 条，覆盖 `allow_dirs` 边界判定、越界拒绝、
+  `cwd_gone`、`bad_allow_dir`、控制台令牌闸门、公开绑定拒启、白名单面板、`cwd` 下拉、窄屏卡片）。
+- `tests/lint.py` 的 `TARGETS` 增加 `api`，`api/ats_api.py` 纳入静态检查（当前 14 个文件全绿）。
+- `references/` 同步更新：`permissions.md`（§4.1 路径边界）、`error-taxonomy.md`（`bad_cwd` /
+  `cwd_gone` / `bad_allow_dir` 三条）、`orchestration-spec.md`、`data-model.md`、`command-guide.md`、
+  `versioning.md`（20 处落点与 §6 判定）。
+- `.gitignore` 增加 `tests/split/`（上下文恢复用的原始对话记录，仅本机留存，不进仓库）。
+
+---
+
 ## 3.3.0-R0 — 2026-11-14
 
 > ⚠️ **升级必读：拉取本版本后必须重新封签，否则看门狗会拒绝执行。**

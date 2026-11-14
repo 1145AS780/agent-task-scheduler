@@ -1,4 +1,4 @@
-# API 指南 — agent-task-scheduler v3.3.0-R0
+# API 指南 — agent-task-scheduler v4.0.0-R0
 
 本文分两半：**前半是对外协议**（外部人类 / Agent 怎么调、怎么读 JSON、怎么处理退出码与审批），
 **后半是内部扩展点**（新增策略键、审批模式、子命令、UI 动作时要同步改哪些地方）。
@@ -63,9 +63,9 @@ python scripts/ats.py status build1 --root D:\run\state     # 报错：status �
 | 码 | 含义 | 典型 `error` |
 | --- | --- | --- |
 | `0` | 成功 | — |
-| `2` | 参数错误 / 缺少确认 | `missing_command`、`bad_level`、`bad_cwd`、`bad_timeout`、`unknown_keys` |
+| `2` | 参数错误 / 缺少确认 | `missing_command`、`bad_level`、`bad_cwd`、`bad_timeout`、`bad_allow_dir`、`unknown_keys` |
 | `3` | 不存在 / 状态冲突 | `not_found`、`task_exists`、`state_conflict` |
-| `4` | 权限不足 / 被闸门拦截 | `approval_required`、`denied_policy`、`denied_mode`、`denied_injection`、`insufficient_level` |
+| `4` | 权限不足 / 被闸门拦截 | `approval_required`、`denied_policy`、`denied_mode`、`denied_injection`、`insufficient_level`、`cwd_gone` |
 
 **判断成败优先看 `error` 字段与退出码，不要只看有没有输出。**
 `approve --all` 是批量语义，恒返回 `0`，必须逐项检查 `approvals[].ok`。
@@ -359,7 +359,7 @@ python scripts/ats.py run deploy1 --approval $apId --wait
 ## 9. HTTP 控制台（`scripts/ats_ui.py`）
 
 启动参数：`--root`、`--host`（默认 `127.0.0.1`）、`--port`（默认 `8765`）、`--mcp-port`、
-`--open`、`--ensure`、`--status`、`--stop`。
+`--token-file`、`--open`、`--ensure`、`--status`、`--stop`。
 
 ### 9.1 GET
 
@@ -388,6 +388,33 @@ python scripts/ats.py run deploy1 --approval $apId --wait
 `{"ok": false, "exit_code": 4, "result": {"error": "passphrase_required"}}`，不启动子进程；
 带值时控制台只把它写进子进程 stdin 并附 `--passphrase-stdin`，**绝不拼进 argv**，
 请求体也不写日志、不落盘。口令错误由 `ats.py` 判为 `passphrase_mismatch`，控制台原样回传。
+
+`policy.set` 的 `patch` 是「键 → 值」对象，逐项转成 `policy --set <键> <值>`（布尔转 `true`/`false`，
+对象与数组转单行 JSON）。路径白名单即 `{"patch": {"allow_dirs": ["D:\\work\\repo", ...]}}`；
+面板的 `#allowDirs` 一行一个绝对路径，提交前过滤空行，清空即写回 `[]`（= 只允许 root 内部）。
+相对路径与不存在的目录由 CLI 逐项拒为 `bad_allow_dir`，控制台原样回传，**UI 不做二次判断**。
+
+`/api/state` 与 `/api/policy` 里的 `policy` 字段附带两个**只读派生项**，供面板展示而不改语义：
+
+| 字段 | 内容 |
+| --- | --- |
+| `allow_dirs_detail[]` | 每项 `{raw, path, exists, broader_than_root}`：`raw` 是配置里的原始写法，`path` 是系统归一后的绝对路径，`broader_than_root` 为真表示该项覆盖了 root 本身（等价于放开其全部上层目录） |
+| `boundary_warnings[]` | 人话告警：覆盖 root、目录当前不存在（后者会导致相关任务在 run 前被判 `cwd_gone`） |
+
+### 9.3 访问令牌（`--token-file`）
+
+- **非回环地址 + 没给 `--token-file` = 拒绝启动**（返回码 2），不提供「无鉴权降级」；
+  报错里直接给出带 `--token-file` 的可复制命令。
+- 回环地址（`127.0.0.1` / `localhost` / `::1`）默认免令牌，本机体验不变。
+- 令牌只从文件读，**不进 argv**（避免进程列表泄露）；文件不存在或为空时自动生成
+  `secrets.token_urlsafe(32)` 写进去并 `chmod 600`。
+- 指定了 `--token-file` 后，所有 `/api/*`（含 `POST /api/action`）都要求
+  `Authorization: Bearer <令牌>`；缺失/错误一律 401 + `WWW-Authenticate: Bearer`，
+  响应体是 `{"ok": false, "error": "unauthorized", "hint": "..."}`。
+- `/` 页面本身放行（否则没法输入令牌），但页面拿到的是 `{"auth": true, "auth_file": "..."}`，
+  前端弹令牌输入框，令牌存浏览器 `localStorage`，之后每次 `fetch` 自动带 `Authorization` 头。
+- 令牌只证明「你能打开这个面板」，**不等于能执行动作**：动作权限仍由 CLI 侧的
+  权限门与审批判定，UI 不代批、不持有口令。
 
 ---
 

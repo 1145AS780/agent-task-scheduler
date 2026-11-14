@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""agent-task-scheduler — Plan / Schedule 层执行器 (v3.3.0-R0)
+"""agent-task-scheduler — Plan / Schedule 层执行器 (v4.0.0-R0)
 
 命令：
   submit_plan --spec plan.json [--id ID]
@@ -215,7 +215,7 @@ def order_steps(steps) -> list:
     return [by_id[sid] for sid in out]
 
 
-def validate_spec(spec):
+def validate_spec(spec, root=None):
     errors = []
     if not isinstance(spec, dict):
         return ["spec_not_object"]
@@ -272,6 +272,18 @@ def validate_spec(spec):
             timeout = step.get("timeout", 0)
             if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 0:
                 errors.append("stage[%s].step[%s].timeout_invalid" % (stage_id, step_id))
+            cwd = step.get("cwd")
+            if cwd is not None:
+                if not isinstance(cwd, str):
+                    errors.append("stage[%s].step[%s].cwd_invalid" % (stage_id, step_id))
+                elif root is not None:
+                    ok, resolved, _reason = ats.cwd_allowed(root, cwd)
+                    if not ok:
+                        errors.append("stage[%s].step[%s].cwd_outside_allowlist:%s"
+                                      % (stage_id, step_id, resolved))
+                    elif not Path(str(resolved)).exists():
+                        errors.append("stage[%s].step[%s].cwd_missing:%s"
+                                      % (stage_id, step_id, resolved))
         stage_ids = {s.get("id") for s in steps if isinstance(s, dict) and s.get("id")}
         for step in steps:
             if not isinstance(step, dict):
@@ -393,6 +405,12 @@ def default_step_state(step):
 
 
 def materialize_plan(root, sdir, spec, plan_id=None, attempt=1):
+    for stage in (spec.get("stages") or []):
+        if not isinstance(stage, dict):
+            continue
+        for step in (stage.get("steps") or []):
+            if isinstance(step, dict) and step.get("cwd"):
+                step["cwd"] = str(ats.resolve_cwd(root, step["cwd"]))
     pid = plan_id or spec.get("id") or ("p-" + uuid.uuid4().hex[:6])
     pdir = plan_dir(sdir, pid)
     pdir.mkdir(parents=True, exist_ok=True)
@@ -524,7 +542,8 @@ def start_step(root, sdir, plan, stage, step):
     env.update({str(k): str(v) for k, v in (step.get("env") or {}).items()})
     cwd = step.get("cwd") or plan.get("cwd") or None
     if cwd:
-        cwd = str(Path(cwd).expanduser())
+        # 统一以 ATS root 为基准解析，不跟调度器进程目录（否则「校验一处、执行另一处」）
+        cwd = str(ats.resolve_cwd(root, cwd))
     out = (tdir / "stdout.log").open("a", encoding="utf-8", errors="replace")
     err = (tdir / "stderr.log").open("a", encoding="utf-8", errors="replace")
     proc = subprocess.Popen(str(step.get("command")), cwd=cwd, env=env, shell=True,
@@ -691,6 +710,28 @@ def ensure_step_permission(root, plan, sdir, stage, step, approval):
     pdir = plan_dir(sdir, plan["id"])
     state = load_step(pdir, stage.get("id"), step.get("id"))
     command = step.get("command")
+    # cwd 是权限面：越界或目录已消失都必须在这里拦下，不能等 Popen 抛异常。
+    # 提交时已校验过一次，但白名单可能被改、目录可能被删/移走，所以执行前重算。
+    cwd = step.get("cwd") or plan.get("cwd")
+    if cwd:
+        ok, resolved, reason = ats.cwd_allowed(root, cwd)
+        err = None
+        if not ok:
+            err = reason or "cwd_outside_allowlist"
+        elif not Path(str(resolved)).exists():
+            err = "cwd_gone"
+        if err:
+            state["status"] = "failed"
+            state["error_type"] = err
+            state["ended_at"] = now_ts()
+            save_step(pdir, stage.get("id"), step.get("id"), state)
+            emit(sdir, {"type": "task_failed", "schedule_id": Path(sdir).name,
+                        "plan_id": plan.get("id"), "stage_id": stage.get("id"),
+                        "step_id": step.get("id"), "status": "failed",
+                        "error_type": err, "cwd": str(resolved)})
+            plan_log(root, plan, "task_failed", stage_id=stage.get("id"),
+                     step_id=step.get("id"), status="failed", error_type=err)
+            return "failed", {"error": err, "cwd": str(resolved)}
     context = {
         "required_level": str(step.get("level") or ats.DEFAULT_TASK_LEVEL).upper(),
         "source": "plan",
@@ -710,7 +751,7 @@ def ensure_step_permission(root, plan, sdir, stage, step, approval):
             gate["allowed"] or gate["reason"] == "approval_required"):
         preflight = ats_preflight.review(
             root, command, context.get("required_level"),
-            context=dict(context, cwd=step.get("cwd") or plan.get("cwd")),
+            context=dict(context, cwd=(str(ats.resolve_cwd(root, cwd)) if cwd else None)),
             pol=ats.policy(root), shell=True)
 
     if preflight and preflight.get("verdict") == "deny_injection":
@@ -1338,7 +1379,7 @@ def cmd_submit_plan(root, args):
     spec, err = _load_spec(args.spec)
     if err:
         return ats.print_json({"error": err, "spec": args.spec}, EXIT_USAGE)
-    errors = validate_spec(spec)
+    errors = validate_spec(spec, root)
     if errors:
         return ats.print_json({"error": "spec_invalid", "errors": errors}, EXIT_USAGE)
 
@@ -1387,7 +1428,7 @@ def cmd_submit_schedule(root, args):
     plan_spec, perr = _load_spec(plan_ref)
     if perr:
         return ats.print_json({"error": "plan_%s" % perr, "plan": plan_ref}, EXIT_USAGE)
-    errors = validate_spec(plan_spec)
+    errors = validate_spec(plan_spec, root)
     if errors:
         return ats.print_json({"error": "spec_invalid", "errors": errors}, EXIT_USAGE)
     every = spec.get("every")
@@ -1979,7 +2020,7 @@ def cmd_prune(root, args):
 def build_parser():
     ap = argparse.ArgumentParser(
         prog="ats_plan.py",
-        description="agent-task-scheduler — Plan / Schedule 层执行器 (v3.3.0-R0)",
+        description="agent-task-scheduler — Plan / Schedule 层执行器 (v4.0.0-R0)",
     )
     ap.add_argument("--root", default=None, help="ATS_ROOT，默认 <ats 本体目录>/.ats")
     sub = ap.add_subparsers(dest="command_name")

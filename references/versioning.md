@@ -1,4 +1,4 @@
-# 版本号规范 — agent-task-scheduler v3.3.0-R0
+# 版本号规范 — agent-task-scheduler v4.0.0-R0
 
 本文规定版本号怎么写、什么时候进位、发版前必须做什么。实现落点是文末的「版本号落点清单」，
 改版本号时按那份清单逐个核对，别只改 SKILL.md 头部。
@@ -78,31 +78,54 @@
 
 | 文件 | 位置 | 形态 |
 | --- | --- | --- |
-| `SKILL.md` | 第 4 行 | `version: "3.3.0-R0"` |
-| `SKILL.md` | 第 7 行 | `# agent-task-scheduler v3.3.0-R0` |
-| `SKILL.md` | 版本历史表首行 | `\| 3.3.0-R0 \|` |
-| `references/*.md`（10 份，含本文件） | 第 1 行 | `# … — agent-task-scheduler v3.3.0-R0` |
-| `scripts/ats.py` | docstring + `build_parser` 的 `description`（2 处） | `(v3.3.0-R0)` |
-| `scripts/ats_plan.py` | docstring + `description`（2 处） | `(v3.3.0-R0)` |
-| `scripts/ats_ui.py` | docstring + `VERSION` 常量（2 处） | `(v3.3.0-R0)` / `VERSION = "3.3.0-R0"` |
-| `scripts/ats_torrent.py` | docstring（1 处） | `(v3.3.0-R0)` |
+| `SKILL.md` | 第 4 行 | `version: "4.0.0-R0"` |
+| `SKILL.md` | 第 7 行 | `# agent-task-scheduler v4.0.0-R0` |
+| `SKILL.md` | 版本历史表首行 | `\| 4.0.0-R0 \|` |
+| `references/*.md`（10 份，含本文件） | 第 1 行 | `# … — agent-task-scheduler v4.0.0-R0` |
+| `scripts/ats.py` | docstring + `build_parser` 的 `description`（2 处） | `(v4.0.0-R0)` |
+| `scripts/ats_plan.py` | docstring + `description`（2 处） | `(v4.0.0-R0)` |
+| `scripts/ats_ui.py` | docstring + `VERSION` 常量（2 处） | `(v4.0.0-R0)` / `VERSION = "4.0.0-R0"` |
+| `scripts/ats_torrent.py` | docstring（1 处） | `(v4.0.0-R0)` |
 
 `scripts/ats_mcp_http.py` 的 `(v1.0)` 与 `scripts/ats_mcp.py` 的 `SERVER_VERSION = "0.1.0"`
 都是**模块自身**的版本号，不是项目版本，不随本项目进位（MCP 服务器有独立的协议与客户端兼容问题，
 跟着项目版本一起跳只会让客户端误判）。
 
-## 6. 当前判定（v3.3.0-R0 为什么是 B 而不是 C）
+## 6. 当前判定（v4.0.0-R0 为什么是 A 而不是 B）
+
+`v3.3.0-R0` 的 tag 已打到 `1b8443c` 并推到 origin，发出去的内容是 Task Visa / Plan Visa（82 条用例）。
+本次待发版的是三块内容：**P0 执行目录边界**（`allow_dirs`）、**P1 控制台升级**（令牌闸门 / 白名单面板 /
+`cwd` 下拉 / 窄屏适配）、**库级编排层** `api/ats_api.py`。
+
+为什么进位到 A 而不是 B：第 2 节把「安全边界、审核机制的加强」明确列在 A 之下，而本次最重的一条
+正是权限门本身的重写——任务 `cwd` 从「任意已存在的目录」收窄为「ATS root 内部 + `policy.allow_dirs`
+每一项及其全部子孙」，边界要同时落在建阶段（`create` / `pack`）、执行前（`_start_task` / `_supervise`
+两道二次校验）和 Plan 层的四个位置；`allow_dirs` 本身被列入 `RESTRICTED_POLICY_KEYS`，改它必须持人类
+口令。控制台侧同理：绑非回环地址时从「谁都能连」变成「没有令牌文件就直接拒绝启动」，没有降级路径。
+
+A 的第二条依据是行为不兼容：旧状态文件仍可读，但**既有任务的 `cwd` 若落在 root 之外，升级后会直接
+`bad_cwd` / `cwd_outside_allowlist` 拒跑**。这属于「升级后行为改变」，必须按 A 的纪律在版本历史与
+Release Notes 顶部加安全警告并通知使用者。
+
+为什么不是 B：B 的定义是「加入此前完全没有的能力」。本次确实也新增了能力（白名单面板、`cwd` 下拉、
+窄屏卡片、库级编排层），但把它们单独记成 B，会让只看 B 的人以为「不用看安全警告、不用重封签」，
+而实际既有任务会因为边界收窄而拒跑。按第 2 节纪律，A 进位时 `B`、`C` 强制清零，故为 `4.0.0-R0`。
+
+重封签：本次改了 `scripts/` 下三个 `.py`（`ats.py` / `ats_plan.py` / `ats_ui.py`），
+按第 4 节第 4 条这是机械约束，与 A/B/C 无关，封完才能提交打 tag。
+
+### 6.1 历史判定：v3.3.0-R0 为什么是 B 而不是 C
 
 `v3.2.0-R0` 的 tag 已经在 2026-11-14 13:55:05 打到 `49d7476` 并推到 origin（tag 对象
 `0899650`），发出去的内容是 extend 插件层 + torrent 公共 Tracker + 基础签证（75 条用例）。
-本次待发版的是**此前完全没有的能力**：Task Visa / Plan Visa（作用域三选一、`approval_required`
+那一版待发的是**此前完全没有的能力**：Task Visa / Plan Visa（作用域三选一、`approval_required`
 自动放行、Plan 级联匹配、`unlimited` 只对 plan 开放）。按第 2 节，新增能力属 B、`C` 强制清零，
 因此是 `v3.3.0-R0`，不是 `v3.2.1-R0`。
 
 为什么不塞回已发布的 3.2.0-R0：tag 一旦推出去就是对外承诺。同一个版本号下改内容，会让
 「拉 tag 的人」和「读 CHANGELOG 的人」拿到两套事实，且无法事后分辨。要改已发布内容只能新版本。
 
-### 6.1 历史判定：v3.2.0-R0 为什么是 B 而不是 C
+### 6.2 历史判定：v3.2.0-R0 为什么是 B 而不是 C
 
 本次待发版内容包含一项**此前完全没有的能力**：`torrent` 自动注入 138 条公共 Tracker
 （`DEFAULT_TRACKERS` + `ATS_TRACKERS` 覆盖开关 + `sanitize_trackers` 清洗 + 新事件字段
