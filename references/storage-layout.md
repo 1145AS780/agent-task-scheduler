@@ -1,6 +1,6 @@
-# 存储布局 — agent-task-scheduler v3.1.1
+# 存储布局 — agent-task-scheduler v3.2.0-R0
 
-所有状态都在 `ATS_ROOT` 下（默认 `<cwd>/.ats`）。本文描述目录结构、文件语义、生命周期与清理策略。
+所有状态都在 `ATS_ROOT` 下（默认 `<ats 本体目录>/.ats`；`ats_ui.py` 例外，默认 `<cwd>/.ats`）。本文描述目录结构、文件语义、生命周期与清理策略。
 
 ---
 
@@ -10,7 +10,7 @@
 
 1. 命令行 `--root <dir>`
 2. 环境变量 `ATS_ROOT`
-3. 当前工作目录下的 `.ats`
+3. `<ats 本体目录>/.ats`（即 `OCSKIS/.ats`；`ats_ui.py` 例外，为当前工作目录下的 `.ats`）
 
 ```bash
 # 显式指定

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""agent-task-scheduler — Plan / Schedule 层执行器 (v3.1.1)
+"""agent-task-scheduler — Plan / Schedule 层执行器 (v3.2.0-R0)
 
 命令：
   submit_plan --spec plan.json [--id ID]
@@ -1918,9 +1918,9 @@ def cmd_prune(root, args):
 def build_parser():
     ap = argparse.ArgumentParser(
         prog="ats_plan.py",
-        description="agent-task-scheduler — Plan / Schedule 层执行器 (v3.1.1)",
+        description="agent-task-scheduler — Plan / Schedule 层执行器 (v3.2.0-R0)",
     )
-    ap.add_argument("--root", default=None, help="ATS_ROOT，默认 <cwd>/.ats")
+    ap.add_argument("--root", default=None, help="ATS_ROOT，默认 <ats 本体目录>/.ats")
     sub = ap.add_subparsers(dest="command_name")
 
     p = sub.add_parser("submit_plan", help="提交一次性计划")

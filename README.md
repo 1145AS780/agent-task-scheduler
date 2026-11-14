@@ -11,7 +11,7 @@
 A purely local, daemon-free task scheduler for AI agents. Commands are split into three entity layers, the filesystem is the single source of truth, and the agent advances state between turns.
 
 - No external services, no third-party libraries — Python 3 standard library only
-- All state lives in `ATS_ROOT` (default `<cwd>/.ats`): plain text, editable by hand, versionable, backup-friendly
+- All state lives in `ATS_ROOT` (default `<ats root dir>/.ats`, i.e. `OCSKIS/.ats`; `ats_ui.py` defaults to `<cwd>/.ats`): plain text, editable by hand, versionable, backup-friendly
 - Every command prints JSON so an agent can parse it; exit codes are stable
 - Zero background processes. Nothing runs unless the agent (or a human) asks it to
 

@@ -57,7 +57,7 @@ def current_status(data):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="轮询 Plan 直到终态")
     ap.add_argument("ident", help="plan_id（如 ci1-a1）或 schedule_id")
-    ap.add_argument("--root", default=None, help="ATS_ROOT，默认读环境变量或 <cwd>/.ats")
+    ap.add_argument("--root", default=None, help="ATS_ROOT，默认 <ats 本体目录>/.ats")
     ap.add_argument("--interval", type=int, default=5, help="两次轮询间隔秒数（默认 5）")
     ap.add_argument("--timeout", type=int, default=0, help="总超时秒数，0 表示不限")
     ap.add_argument("--quiet", action="store_true", help="不打印进度")

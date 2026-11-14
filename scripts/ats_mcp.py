@@ -14,7 +14,7 @@ stdout 只允许出现协议消息；所有日志、traceback、调试输出一�
 用法：
   python scripts/ats_mcp.py [--root DIR]
 
-  --root 透传给 ats.py / ats_plan.py；缺省则由 ATS_ROOT 或 <cwd>/.ats 决定。
+  --root 透传给 ats.py / ats_plan.py；缺省则由 ATS_ROOT 或 <ats 本体目录>/.ats 决定。
 """
 
 from __future__ import annotations

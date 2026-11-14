@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = 'Stop'
+﻿﻿﻿﻿$ErrorActionPreference = 'Stop'
 
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 

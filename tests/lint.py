@@ -6,6 +6,7 @@
   2. 缩进不使用制表符
   3. 行尾无多余空白
   4. 文件以换行结尾
+  5. print_json({"error": ...}) 的错误返回体必须带 hint 或 message
 
 退出码 0 表示全部通过。
 
@@ -16,6 +17,7 @@
 """
 from __future__ import annotations
 
+import ast
 import re
 import sys
 from pathlib import Path
@@ -62,6 +64,36 @@ def check_final_newline(f):
         problems.append("%s: 文件未以换行结尾" % f.relative_to(REPO))
 
 
+def check_actionable_error(f):
+    """错误返回体必须给出下一步：print_json({"error": ...}) 要有 hint 或 message。
+
+    只报错误码的返回体，调用方拿到后无法判断该改什么，只能去读源码 —— 这是
+    「可修但不可猜」的失败，防呆设计上等价于没有返回体。只扫字面量字典：
+    动态拼出来的返回体（**kwargs、变量）不猜，避免误报。
+    ats_plan.py 的错误走 emit() 写 events.jsonl、不打 stdout，本项对它自然为 0。
+    """
+    try:
+        tree = compile(f.read_bytes(), str(f), "exec", ast.PyCF_ONLY_AST)
+    except (SyntaxError, ValueError):
+        return                       # 语法错误已由 check_compiles 报过，不重复报
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not isinstance(node.func, ast.Name) or node.func.id != "print_json":
+            continue
+        if not node.args or not isinstance(node.args[0], ast.Dict):
+            continue
+        keys = {k.value for k in node.args[0].keys
+                if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+        if "error" not in keys:
+            continue
+        if "hint" in keys or "message" in keys:
+            continue
+        problems.append("%s:%d: print_json({\"error\": ...}) 缺 hint/message —— "
+                        "错误返回体必须给出可直接照做的下一步"
+                        % (f.relative_to(REPO), node.lineno))
+
+
 def utf8_console():
     """把 stdout/stderr 切到 UTF-8，避免 Windows 管道下打印中文抛 UnicodeEncodeError。"""
     for stream in (sys.stdout, sys.stderr):
@@ -85,6 +117,7 @@ def main():
         check_tabs(f)
         check_trailing_ws(f)
         check_final_newline(f)
+        check_actionable_error(f)
 
     if problems:
         for p in problems:

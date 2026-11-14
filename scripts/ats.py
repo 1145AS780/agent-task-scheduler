@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""agent-task-scheduler — Task 层执行器 (v2.7)
+"""agent-task-scheduler — Task 层执行器 (v3.2.0-R0)
 
 命令：
   create <id> --command "..." [--cwd DIR] [--level L0..L3] [--timeout SEC]
@@ -28,7 +28,7 @@
 退出码：0 正常 / 2 参数或确认缺失 / 3 不存在或状态冲突 / 4 权限不足
 
 设计约束：
-  * 所有状态落在 ATS_ROOT（默认 <cwd>/.ats），可用环境变量覆盖。
+  * 所有状态落在 ATS_ROOT（默认 <ats 本体目录>/.ats，即仓库根的 .ats），可用环境变量覆盖。
   * Task 层事件统一写 <root>/events.jsonl；Plan 层事件写
     <root>/schedules/<schedule_id>/events.jsonl（由 ats_plan.py 触发）。
   * 审批记录 <root>/approvals/<approval_id>.json，命令原文绑定 + 有效期。
@@ -159,12 +159,17 @@ RESTRICTED_POLICY_KEYS = ("max_level", "actor_level", "allow_rules", "approval_m
 # ---------------------------------------------------------------- 基础 IO
 
 def ats_root(root: str | None = None) -> Path:
+    """解析状态根。优先级：显式 root > 环境变量 ATS_ROOT > <ats 本体目录>/.ats。
+
+    默认取脚本所在目录的父目录（即 OCSKIS/），而不是当前工作目录：
+    否则从不同 cwd 调用会各自生成一份 .ats，信任根被拆散。
+    """
     if root:
         return Path(root)
     env = os.environ.get("ATS_ROOT")
     if env:
         return Path(env)
-    return Path.cwd() / ".ats"
+    return Path(__file__).resolve().parent.parent / ".ats"
 
 
 def now_ts() -> int:
@@ -380,7 +385,7 @@ def derive_level(command, default=None) -> str:
 
 DERIVE_FLOOR_L2_PATTERN = re.compile(
     r"(\|\s*(sh|bash)\b|curl\s+\S+\s*\|\s*(sh|bash)|"
-    r"invoke-expression|\biex\b|\biwr\b|>\s*[A-Za-z~/]|\.ssh|"
+    r"invoke-expression|\biex\b|\biwr\b|(?<!-)>\s*[A-Za-z~/]|\.ssh|"
     r"\bset-content\b|\btaskkill[^\n]*/f\b)",
     re.IGNORECASE)
 
@@ -1918,17 +1923,24 @@ def cmd_pack(root, args):
 
     level = pack_level(args.level, [hook_gate_text(c, hook) for c, hook in parsed])
     if level not in LEVEL_RANK:
-        return print_json({"error": "bad_level", "level": level}, EXIT_USAGE)
+        return print_json({"error": "bad_level", "level": level,
+                           "allowed": sorted(LEVEL_RANK),
+                           "hint": "等级只接受 L0/L1/L2/L3；--level 从 allowed 里挑一个"},
+                          EXIT_USAGE)
     timeout = args.timeout if args.timeout is not None else DEFAULT_TIMEOUT
     try:
         timeout = int(timeout or 0)
     except (TypeError, ValueError):
-        return print_json({"error": "bad_timeout"}, EXIT_USAGE)
+        return print_json({"error": "bad_timeout",
+                           "hint": "超时必须是整数秒：用 --timeout 600；省略则取默认值"},
+                          EXIT_USAGE)
     cwd = args.cwd
     if cwd:
         cwd = str(Path(cwd).expanduser())
         if not Path(cwd).exists():
-            return print_json({"error": "bad_cwd", "cwd": cwd}, EXIT_USAGE)
+            return print_json({"error": "bad_cwd", "cwd": cwd,
+                               "hint": "cwd 指向的目录不存在：先建目录，或改成已存在的绝对路径"},
+                              EXIT_USAGE)
 
     pack_id = args.pack_id or ("pk-" + uuid.uuid4().hex[:6])
     total = len(items)
@@ -2462,12 +2474,17 @@ def cmd_download(root, args):
     """创建下载任务并立刻交给 run 链路（权限/审批/状态/日志全部复用）。"""
     spec, err = _build_download_spec(args)
     if err:
-        return print_json({"error": err}, EXIT_USAGE)
+        return print_json({"error": err,
+                           "hint": "download 参数不合法：对照 ats.py download --help "
+                                   "检查 --url / --file / --out 的必填关系"},
+                          EXIT_USAGE)
 
     task_id = args.id or ("dl-" + uuid.uuid4().hex[:6])
     tdir = task_dir(root, task_id)
     if (tdir / "task.json").exists():
-        return print_json({"error": "task_exists", "task_id": task_id}, EXIT_CONFLICT)
+        return print_json({"error": "task_exists", "task_id": task_id,
+                           "hint": "换一个 --id，或先 ats.py show <task_id> 确认是不是要复用的任务"},
+                          EXIT_CONFLICT)
     tdir.mkdir(parents=True, exist_ok=True)
     spec_path = tdir / "download.json"
     jwrite(spec_path, spec)
@@ -2560,7 +2577,9 @@ def cmd_torrent(root, args):
     else:
         torrent = Path(args.torrent).expanduser().resolve()
         if not torrent.is_file():
-            return print_json({"error": "torrent_not_found", "path": str(torrent)}, EXIT_USAGE)
+            return print_json({"error": "torrent_not_found", "path": str(torrent),
+                               "hint": "--torrent 要指向存在的 .torrent 文件；磁力链改用 --magnet"},
+                              EXIT_USAGE)
         source = {"type": "torrent", "path": str(torrent)}
 
     aria2 = _resolve_aria2()
@@ -2572,7 +2591,9 @@ def cmd_torrent(root, args):
     task_id = args.id or ("tor-" + uuid.uuid4().hex[:6])
     tdir = task_dir(root, task_id)
     if (tdir / "task.json").exists():
-        return print_json({"error": "task_exists", "task_id": task_id}, EXIT_CONFLICT)
+        return print_json({"error": "task_exists", "task_id": task_id,
+                           "hint": "换一个 --id，或先 ats.py show <task_id> 确认是不是要复用的任务"},
+                          EXIT_CONFLICT)
     tdir.mkdir(parents=True, exist_ok=True)
 
     seed_time = max(0.0, float(args.seed_time or 0))
@@ -3053,7 +3074,10 @@ def cmd_policy(root, args):
         unknown = sorted(k for k in changes if k not in POLICY_DEFAULTS)
         if unknown:
             return print_json({"error": "unknown_keys", "keys": unknown,
-                               "allowed": sorted(POLICY_DEFAULTS)}, EXIT_USAGE)
+                               "allowed": sorted(POLICY_DEFAULTS),
+                               "hint": "只接受 allowed 里的键：ats.py policy --set <KEY> <VALUE>；"
+                                       "未知键不会写进 policy.json"},
+                              EXIT_USAGE)
         path = Path(root) / "policy.json"
         stored = jread(path, {})
         if not isinstance(stored, dict):
@@ -3066,16 +3090,25 @@ def cmd_policy(root, args):
                     stored[key] = int(raw)
                 except (TypeError, ValueError):
                     return print_json({"error": "bad_value", "key": key,
-                                       "value": raw}, EXIT_USAGE)
+                                       "value": raw,
+                                       "hint": "该键需要整数：ats.py policy --set <KEY> <整数>"},
+                                      EXIT_USAGE)
             elif key == "approval_mode_by_level":
                 try:
                     parsed = json.loads(raw)
                 except (TypeError, ValueError):
                     return print_json({"error": "bad_value", "key": key,
-                                       "value": raw}, EXIT_USAGE)
+                                       "value": raw,
+                                       "hint": "该键要 JSON 对象，如 "
+                                               'ats.py policy --set approval_mode_by_level '
+                                               '{"L2": "ask"}'},
+                                      EXIT_USAGE)
                 if not isinstance(parsed, dict):
                     return print_json({"error": "bad_value", "key": key,
-                                       "value": raw}, EXIT_USAGE)
+                                       "value": raw,
+                                       "hint": "该键要 JSON 对象（形如 {\"L2\": \"ask\"}），"
+                                               "不能是字符串或数组"},
+                                      EXIT_USAGE)
                 stored[key] = parsed
             else:
                 stored[key] = raw
@@ -3162,7 +3195,9 @@ def cmd_extend_check(root, args):
     action, argv, bad = ats_extend.check_args(args.action_name, args.arg)
     if bad:
         return print_json({"error": bad["code"], "extend_id": args.extend_id,
-                           "detail": bad["detail"], "executed": False},
+                           "detail": bad["detail"], "executed": False,
+                           "hint": "按 detail 修参数后重试；参数不能含双引号或换行、"
+                                   "单条不超过 1024 字符，指令名只允许字母数字_-"},
                           EXIT_USAGE)
     if item["state"] != "active":
         return print_json({
@@ -3239,7 +3274,10 @@ def cmd_extend_run(root, args):
     action, argv_args, bad = ats_extend.check_args(args.action_name, args.arg)
     if bad:
         return print_json({"error": bad["code"], "extend_id": args.extend_id,
-                           "detail": bad["detail"], "executed": False}, EXIT_USAGE)
+                           "detail": bad["detail"], "executed": False,
+                           "hint": "按 detail 修参数后重试；参数不能含双引号或换行、"
+                                   "单条不超过 1024 字符，指令名只允许字母数字_-"},
+                          EXIT_USAGE)
     if item["state"] != "active":
         return print_json({
             "extend_id": args.extend_id, "state": item["state"],
@@ -3252,24 +3290,34 @@ def cmd_extend_run(root, args):
     if action is not None and action not in commands:
         return print_json({"error": "unknown_action", "extend_id": args.extend_id,
                            "action": action, "known": sorted(commands),
-                           "executed": False}, EXIT_USAGE)
+                           "executed": False,
+                           "hint": "用 ats.py extend help <extend_id> 看可用指令，"
+                                   "known 是当前清单"},
+                          EXIT_USAGE)
     argv = ats_extend.extend_argv(item, action, argv_args)
     text = ats_extend.gate_text(item, action, argv_args)
     if argv is None or text is None:
         return print_json({"error": "missing_entry_point", "extend_id": args.extend_id,
-                           "executed": False}, EXIT_CONFLICT)
+                           "executed": False,
+                           "hint": "入口缺失或越界：跑 ats.py extend check <extend_id> 看 problems"},
+                          EXIT_CONFLICT)
     level, level_note = ats_extend.task_level(item)
 
     task_id = args.id or new_task_id()
     tdir = task_dir(root, task_id)
     if (tdir / "task.json").exists() and not args.force:
-        return print_json({"error": "task_exists", "task_id": task_id}, EXIT_CONFLICT)
+        return print_json({"error": "task_exists", "task_id": task_id,
+                           "hint": "换一个 --id，或对已存在的任务用 ats.py run <task_id>；"
+                                   "确认要覆盖加 --force"},
+                          EXIT_CONFLICT)
 
     timeout = args.timeout if args.timeout is not None else DEFAULT_TIMEOUT
     try:
         timeout = int(timeout or 0)
     except (TypeError, ValueError):
-        return print_json({"error": "bad_timeout"}, EXIT_USAGE)
+        return print_json({"error": "bad_timeout",
+                           "hint": "超时必须是整数秒：--timeout 600（0 为不限）"},
+                          EXIT_USAGE)
 
     now = now_ts()
     task = {
@@ -3567,9 +3615,10 @@ def guard_handshake(root, skip_guard=False, guard_approval=None):
                         "重新封签，口令须与 init 时一致")
             elif payload.get("next_action") == "restore_key":
                 hint = ("密钥文件丢失，本次命令不执行，seal 也修不好（seal 要口令校验，"
-                        "口令校验要读密钥）。请从 git 恢复 ats_guard_key.json 与 "
-                        "ats_guard_manifest.json；确认要全新开始，须由人先手动删除这两个"
-                        "文件，再重跑 init --confirm 与 seal --confirm")
+                        "口令校验要读密钥）。本仓的 ats_guard_key.json 与 "
+                        "ats_guard_manifest.json 当前未被 git 跟踪，无法从 git 恢复；"
+                        "确认要全新开始，须由人先手动删除这两个文件，"
+                        "再重跑 init --confirm 与 seal --confirm")
             else:
                 hint = ("核心脚本未通过看门狗校验，本次命令不执行。确认改动可信后由人执行 "
                         "seal --confirm 重封签")
@@ -3595,9 +3644,11 @@ def print_json(data, code=EXIT_OK):
 def build_parser():
     ap = argparse.ArgumentParser(
         prog="ats.py",
-        description="agent-task-scheduler — Task 层执行器 (v2.7)",
+        description="agent-task-scheduler — Task 层执行器 (v3.2.0-R0)",
     )
-    ap.add_argument("--root", default=None, help="ATS_ROOT，默认 <cwd>/.ats")
+    ap.add_argument("--root", default=None,
+                    help="状态根目录，默认 <ats 本体目录>/.ats（即 OCSKIS/.ats）；"
+                         "也可用环境变量 ATS_ROOT 指定")
     sub = ap.add_subparsers(dest="command_name")
 
     p = sub.add_parser("create", help="创建任务")

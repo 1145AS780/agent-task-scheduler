@@ -35,7 +35,7 @@
 信任基线。本地文件权限相等时，代码无法阻止删除，这条只能由人守。
 ==================================================================
 
-用法：
+用法（--root 省略时默认 <ats 本体目录>/.ats，即 OCSKIS/.ats；也可用 ATS_ROOT 环境变量）：
     python ats_guard.py verify [--root DIR] [--json]
     python ats_guard.py seal   [--root DIR] --confirm [--passphrase-stdin]
     python ats_guard.py init   [--root DIR] --confirm [--passphrase-stdin]
@@ -91,12 +91,17 @@ def core_files():
 
 
 def resolve_root(root):
+    """解析状态根。优先级：显式 root > 环境变量 ATS_ROOT > <ats 本体目录>/.ats。
+
+    默认取脚本所在目录的父目录（即 OCSKIS/），而不是当前工作目录：
+    否则从不同 cwd 调用会各自生成一份 .ats，信任根被拆散。
+    """
     if root:
         return Path(root)
     env = os.environ.get("ATS_ROOT")
     if env:
         return Path(env)
-    return Path.cwd() / ".ats"
+    return SCRIPT_DIR.parent / ".ats"
 
 
 def manifest_path(root):
@@ -228,8 +233,8 @@ def cmd_init(root, confirm, passphrase):
         return emit({"ok": False, "error": "already_initialized",
                      "manifest": str(manifest_path(root)),
                      "existing": existing,
-                     "hint": "清单或密钥已存在，禁止重建密钥。密钥丢失请从 git 恢复 "
-                             "ats_guard_key.json 与 ats_guard_manifest.json；"
+                     "hint": "清单或密钥已存在，禁止重建密钥。本仓的 ats_guard_key.json "
+                             "与 ats_guard_manifest.json 当前未被 git 跟踪，无法从 git 恢复；"
                              "确认要全新开始，须由人先手动删除这两个文件"},
                     EXIT_MISMATCH)
     if len(passphrase) < PASSPHRASE_MIN:

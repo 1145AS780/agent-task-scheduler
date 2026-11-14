@@ -1,4 +1,4 @@
-# 数据模型 — agent-task-scheduler v3.1.1
+# 数据模型 — agent-task-scheduler v3.2.0-R0
 
 本文列出所有落盘 JSON 结构的字段、类型与语义。字段以实际脚本为准。
 

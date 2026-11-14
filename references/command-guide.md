@@ -1,4 +1,4 @@
-# 命令书写与调用规范 — agent-task-scheduler v3.1.1
+# 命令书写与调用规范 — agent-task-scheduler v3.2.0-R0
 
 本文面向「由 Agent 调用调度器脚本」这一使用场景，规定**怎么把命令传进去、怎么把结果读出来、怎么避免被 shell 吃掉引号**。几乎所有「调度器行为诡异」的事故都源于本文某一条被违反。
 
@@ -51,7 +51,7 @@ python scripts/ats.py create deploy1 --command "bash deploy.sh" --env STAGE=prod
 
 ## 2. `--root`：状态目录定位
 
-优先级：`--root <dir>` > 环境变量 `ATS_ROOT` > `<当前工作目录>/.ats`。
+优先级：`--root <dir>` > 环境变量 `ATS_ROOT` > `<ats 本体目录>/.ats`（`ats_ui.py` 例外，默认 `<cwd>/.ats`）。
 
 `--root` 是**两个脚本的全局参数**，必须写在子命令**之前**：
 

@@ -1,15 +1,15 @@
 ---
 name: agent-task-scheduler
 description: A local task scheduler an AI agent starts, polls, and steers between turns. Three entity layers (Task / Plan / Schedule), L0-L3 permission tiers with human approval, intra-stage dependency orchestration with failure propagation, step retry with backoff, stall detection, run snapshots and logs, a built-in HTTP downloader with resume and integrity check, torrent and magnet download via aria2c, and automatic encoding conversion via the @enc hook. Use when a long-running command must leave the chat turn, when commands need staged orchestration, when work repeats on a schedule, when batch-downloading files or torrents, or when a high-risk command needs approval first. 中文触发：面向 AI Agent 的本地任务调度技能，Agent 能在轮次之间启动、轮询并中途转向。三层实体（Task / Plan / Schedule）、L0-L3 分级权限与人工审批闭环（有效期、批量批准、白名单放行、存活租约免审、启动准入看门狗与口令闸门）、Stage 内依赖编排（depends_on + 失败传播）、步骤自动重试与退避、停滞检测（plan_stalled）、运行快照与调度器日志、内置 HTTP 下载器（断点续传、自动重试、完整性校验、并发与限速）、种子/磁力下载（aria2c）、命令成功后自动编码转换（`@enc` 钩子）。当需要让长时间运行的命令脱离对话轮次、分阶段编排多条命令、按周期反复执行、批量下载文件或种子、把多条命令一次性登记为指令包（仅登记不执行）、或需要审批才能执行高风险命令时使用。Licensed MIT. Source: github.com/1145AS780
-version: "3.1.1"
+version: "3.2.0-R0"
 ---
 
-# agent-task-scheduler v3.1.1
+# agent-task-scheduler v3.2.0-R0
 
 一个纯本地、无守护进程的调度器。它把「命令」分成三层实体，用文件系统作为唯一状态源，由 Agent 在轮次之间启动、轮询并中途转向。
 
 - 不依赖外部服务、不依赖第三方库（仅 Python 3 标准库）
-- 所有状态落在 `ATS_ROOT`（默认 `<cwd>/.ats`），可用文本编辑、可版本控制、可异地备份
+- 所有状态落在 `ATS_ROOT`（默认 `<ats 本体目录>/.ats`，即 `OCSKIS/.ats`；`ats_ui.py` 例外，默认 `<cwd>/.ats` 并把它显式传给子进程），可用文本编辑、可版本控制、可异地备份
 - 每个命令都以 JSON 输出，便于 Agent 解析；退出码语义稳定
 
 ---
@@ -336,7 +336,31 @@ winget install --id aria2.aria2 -e
 - 找不到 aria2c 时任务以退出码 `3` 失败，`stdout.log` 里是 `aria2_not_found` + 安装提示
 - aria2c 带 `--stop-with-process=<worker pid>`：worker 被强杀时它自行退出，不留孤儿
 
-**stdout 协议**（`tasks/<id>/stdout.log`，JSONL）：`aria2_start` / `torrent_start` / `torrent_metadata` / `torrent_progress`（约 5 秒一条）/ `torrent_done` / `torrent_error` / `summary`（最后一行）。
+**公共 Tracker 自动注入**
+
+aria2c 启动时默认带上 `--bt-tracker=<内置公共 Tracker 列表>`（138 条，udp / http / https 各取主流节点）。磁力链和 `.torrent` 走同一个参数——前者靠它拿到元数据，后者靠它找到 peer，**不需要你区分场景**。
+
+要换自己的列表，设一个环境变量即可，优先级高于内置表：
+
+```powershell
+$env:ATS_TRACKERS = "udp://tracker.opentrackr.org:1337/announce,http://tracker.example.org:80/announce"
+```
+
+```bash
+export ATS_TRACKERS="udp://tracker.opentrackr.org:1337/announce,http://tracker.example.org:80/announce"
+```
+
+规则与防呆：
+
+- 分隔符只认英文逗号。换行、制表符、反引号、多余空格、空项、重复项都会被自动清洗掉，你不用手工整理——直接从网页或 Markdown 里整段复制粘贴即可
+- 只接受 `udp://`、`http://`、`https://` 三种 scheme；`wss://`（WebTorrent 专用）等会被静默丢弃，因为 aria2c 不支持
+- 缺路径的地址（如 `udp://tracker.example.org:6969`）会自动补 `/announce`
+- 把 `ATS_TRACKERS` 设成空字符串 = **显式关闭注入**，此时完全用种子自带的 tracker
+- 变量里一条合法地址都没有时，任务不会崩，`stdout.log` 里会多一条 `tracker_warning` 事件告诉你列表被丢弃了
+
+每次启动的 `aria2_start` 事件都带 `trackers`（生效条数）和 `tracker_source`（`default` / `env:ATS_TRACKERS` / `env:ATS_TRACKERS(disabled)`）。**下载慢时先看这两个字段**：条数正常说明注入生效，慢的原因是种子本身没节点；条数为 0 才去查环境变量。
+
+**stdout 协议**（`tasks/<id>/stdout.log`，JSONL）：`aria2_start` / `torrent_start` / `torrent_metadata` / `torrent_progress`（约 5 秒一条）/ `torrent_done` / `torrent_error` / `tracker_warning` / `summary`（最后一行）。
 
 **退出码**：worker 完成 `0`、下载失败 `1`、spec 非法 `2`、找不到 aria2c `3`。`--wait` 本身仍按 Task 语义返回 `0/2/4`。
 
@@ -399,6 +423,20 @@ python scripts/ats.py extend run hello --action run --wait
 | 非 active | 不建 Task、不执行，直接 `inactive_extend`（退出码 4） |
 | 静态扫描 | 入口绝对路径在门禁文本里，预检会自动扫到插件源码 |
 
+**`--arg` 传参规则**（`check` 与 `run` 走同一个 `check_args` / `extend_argv`，行为完全一致）：
+
+| 写法 | 插件收到的 argv 片段 | 说明 |
+| --- | --- | --- |
+| `--arg k=v` | `k=v` | 整串作为**一个** argv 元素；**没有** `K=V` 解析，`=` 只是普通字符 |
+| `--arg "k=v"` | `k=v` | 与上一行等价：引号被 shell 吃掉，不会传进插件 |
+| `--arg "a b"` | `a b` | 值里有空格必须加引号，否则被 shell 拆成两个元素 |
+| `--arg a --arg b` | `a`、`b` | 可重复（argparse `action="append"`），按给出顺序逐个追加，不合并、不排序 |
+
+- **不经 shell**：参数作为 `argv` 列表元素交给 `Popen(shell=false)`，`;` `|` `>` `&` `$` 都只是普通字符。
+- **插件从 `sys.argv` 读**：进程内看到的是 `['<entry>', '--action', 'run', 'k=v', 'x=y']`；想要 `k=v` 语义由插件自己 `split("=", 1)`，调度器不解析。
+- **拒收规则**（`check_args`，退出码 2）：单个参数含 `"` 或换行 → `bad_extend_arg`；单条超过 1024 字符 → `bad_extend_arg`；指令名不匹配 `^[A-Za-z0-9_-]+$` → `bad_action`。空串**允许**，进 argv 是空字符串，门禁文本写成 `""`。
+- **门禁文本与执行同源**：`check` 打印的 `gate_text` 就是 `run` 实际 argv 的加引号投影（含空格或为空的参数带双引号，其余原样），所以审批绑定看到的就是真正要跑的东西。
+
 **返回结构**（`extend check --json`）：
 
 ```json
@@ -409,7 +447,7 @@ python scripts/ats.py extend run hello --action run --wait
 
 ### 4.7 全局参数
 
-两个脚本都支持 `--root <dir>`，优先级：`--root` > 环境变量 `ATS_ROOT` > `<cwd>/.ats`。
+`ats.py` / `ats_plan.py` / `ats_guard.py` 都支持 `--root <dir>`，优先级：`--root` > 环境变量 `ATS_ROOT` > `<ats 本体目录>/.ats`（即 `OCSKIS/.ats`，取脚本所在目录的父目录，不随 cwd 漂移）。`ats_ui.py` 是例外：默认 `<cwd>/.ats`，并把它显式传给子进程，所以 UI 与子进程看到的始终是同一个 root。
 
 ### 4.8 `@enc` 后缀钩子（命令成功后自动转码）
 
@@ -653,10 +691,22 @@ python scripts/ats.py run deploy1 --approval ap-3f2a91c4
 
 1. **清单是信任根，但它本身没有签名。** `verify` 只回答「脚本摘要与清单一致」，不回答
    「清单是不是人写的」。把 `ats.py` 改一行、再把清单里 `files.ats.py` 的摘要改成新值，
-   `verify` 会返回 `"ok": true, "checked": 9` —— 篡改照样过关。同理
+   `verify` 会返回 `"ok": true` —— 篡改照样过关。同理
    `ATS_GUARD_MANIFEST` 环境变量能把清单指到任意路径，调用方自己就能换锚点。
    清单没签名这件事代码补不上（验证用的密钥必须能读，能读就能伪造），**只能靠 git**：
    `ats_guard_manifest.json` 的每次改动都该在 `git diff` 里被人看见。
+   **看门狗自身有没有被换**另有最低复核手段（`verify` 管不了、`self` 能）：
+   `python scripts/ats_guard.py self` 输出当前 `ats_guard.py` 的 SHA256，形如
+   `{"ok":true,"file":"ats_guard.py","path":"…","sha256":"<64 位十六进制>"}`；`core_files()` 把看门狗
+   自己也纳入清单，所以这个值与清单 `files["ats_guard.py"]` 同源 —— 两者不一致即
+   「看门狗与清单已被拆开」。要与 git 对照，须在 `OCSKIS/` 目录内跑
+   `git diff HEAD -- scripts/ats_guard.py`（空输出才算与上次提交一致）：父仓根跑
+   `git show HEAD:OCSKIS/scripts/ats_guard.py` 会 `fatal: path ... exists on disk, but not in 'HEAD'`
+   （父仓 `.gitignore:108` 忽略整个 `/OCSKIS/`）。也别拿 `self` 的 sha256 去比 git blob 的 sha1
+   （算法不同）；`git hash-object` 同样不能当基线 —— 它按 `core.autocrlf=true` 归一化后算 sha1，
+   与 HEAD 不等只能说明内容有变，不能说明被换。注意：`ats_guard.py` 当前相对 HEAD 本就有未提交
+   改动（默认根改成 `<ats 目录>/.ats` 那次），这条基线现在不是空的，看到差异先查改动来源。
+   实测（2026-11-14）`verify` 返回 `"checked": 10`，该数等于清单里的文件条目数，随清单变化而变。
 2. **同权限的进程可以删掉清单与密钥后重跑 `init` + `seal` 重建基线。** 本地文件权限
    相等时代码拦不住删除，这条只能由人守。运行期句柄只挡住删除与 rename 替换
    （实测 `PermissionError`），**原地覆写内容不被阻止** —— 共享写是允许的，这条靠
@@ -1043,6 +1093,7 @@ HTTP 层额外状态码：`403`（`forbidden_host` / `forbidden_origin`）、`41
 - [command-guide.md](references/command-guide.md) — 命令书写与调用规范
 - [anti-patterns.md](references/anti-patterns.md) — 常见错误用法
 - [api-guide.md](references/api-guide.md) — 对外协议、退出码、审批协议与扩展点清单
+- [versioning.md](references/versioning.md) — 版本号规范 `vA.B.C-Rx`、进位条件、发版纪律与 19 处落点清单
 - [examples/](references/examples) — 可直接运行的最小样例
 
 ---
@@ -1071,8 +1122,13 @@ HTTP 层额外状态码：`403`（`forbidden_host` / `forbidden_origin`）、`41
 
 ## 15. 版本历史
 
+版本号格式遵循 [versioning.md](references/versioning.md) 的 `vA.B.C-Rx`：`A` 安全/架构级、
+`B` 核心功能新增、`C` 修补、`Rx` 架构重置计数。旧 tag（`v3.1.1` 及更早）保持原样不回改。
+给使用者看的发版文档是 [CHANGELOG.md](CHANGELOG.md)，与本表同源，改版本时两处同步。
+
 | 版本 | 变更 |
 | --- | --- |
+| 3.2.0-R0 | `extend` **扩展插件层**：插件是 `<ATS_ROOT>/extend/<extend_id>/` 下自包含目录，用 `instruction.json` 声明入口与指令；`scripts/ats_extend.py` 的发现层**只扫描、不导入、不执行**，执行时复用普通 Task 全链路（权限门、预检、审批、日志、`stop`）；子命令 `list` / `help` / `check`（纯预演，不写审批、不碰租约、不执行）/ `run`；目录名须等于 `extend_id`、id 匹配 `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`、入口禁目录穿越，任一不符即 `inactive`；等级声明不被信任（`EXTEND_LEVEL_FLOOR = "L2"`，低于 L2 抬到 L2、缺失或非法按 L3）；`run` 的 `command` 与 `check` 的 `gate_text` 逐字相同、`shell=false`、`--arg` 进 argv 不进 shell；非 active 直接 `inactive_extend`（退出码 4）不建 Task。同时新增 `scripts/ats_preflight.py` 静态预检，入口绝对路径进 `gate_text`，因此插件源码会被扫到。**一键安装** `setup.ps1`：口令经 stdin 传入（不进 argv / 进程列表 / 命令历史），密钥不存在时先 `init` 再 `seal`，失败按 `passphrase_too_short` / `passphrase_mismatch` 给出可复制下一步。`torrent` **自动注入公共 Tracker**：`scripts/ats_torrent.py` 常量区新增 `DEFAULT_TRACKERS`（138 条 udp / http / https 公共节点），`start_aria2` 构建 argv 时动态追加 `--bt-tracker=<列表>`，磁力链与 `.torrent` 共用同一参数（前者靠它取元数据、后者靠它找 peer）；可用环境变量 `ATS_TRACKERS` 覆盖，优先级高于内置表，设成空串表示显式关闭注入；新增 `sanitize_trackers` 统一清洗换行 / 制表 / 反引号 / 引号 / 多余空格 / 空项 / 重复项，只保留 `udp://` `http://` `https://`（`wss://` 等 aria2c 不支持的 scheme 静默丢弃），缺路径的地址自动补 `/announce`；`aria2_start` 事件新增 `trackers`（生效条数）与 `tracker_source`（`default` / `env:ATS_TRACKERS` / `env:ATS_TRACKERS(disabled)`），变量里一条合法地址都没有时输出 `tracker_warning` 而非崩溃；错误返回体批量补齐可复制 `hint`，并由 `tests/lint.py` 第 5 项 `check_actionable_error` 强制——字面量 `print_json({"error": ...})` 缺 `hint` / `message` 直接判失败；文档与 `--help` 文本统一 `--root` 默认值口径为 `<ats 本体目录>/.ats`（`ats_ui.py` 例外为 `<cwd>/.ats`）；版本号格式改用 `vA.B.C-Rx`（规范见 [versioning.md](references/versioning.md)），全仓 19 处版本号落点统一到 `3.2.0-R0`，顺带修正 `ats.py` 残留的 `v2.7`（docstring 与 `--help` 两处） |
 | 3.1.1 | `download --file` 支持**通配与多份清单**：`--file` 改为可重复，值里含 `*` `?` `[` 时由 `ats.py` 用 `glob` 展开（仍不经 shell），展开结果按字典序并写入 `tasks/<id>/download.json` 的 `manifests` 字段；0 匹配报 `manifest_no_match:<pattern>`（不再把字面量当文件名）、超 64 份报 `manifest_too_many:<pattern>`（`ATS_DOWNLOAD_MANIFEST_MAX` 可调）；多份清单 `outputs` 不一致且未写 `--out` 时报 `manifest_outputs_conflict:<path>`（写了 `--out` 以它为准，不猜）；清单类错误统一追加 `:<路径或模式>` 便于定位；`--file` 只读清单故**不跳过符号链接**（与 `@enc` 的差别已写明），多个通配值可并存（每份清单是独立输入）；新增 3 条用例（`download_manifest_glob_merges` / `download_manifest_glob_no_match` / `download_manifest_outputs_conflict`，全量 52 条） |
 | 3.1.0 | `@enc` 钩子支持**通配路径**（一条任务覆盖多个文件）：钩子不经 shell、`*` 不会自动展开，改由 `ats.py` 用 `glob` 按任务 `cwd` 展开；只展开位置参数里的 `*` `?` `[`，flag 及其值不动（`--include *.log` 原样传给转换器）；两个通配或通配与手写路径混写报 `hook_glob_ambiguous`，0 匹配报 `hook_glob_no_match`（不再把字面量当文件名交给转换器，避免凭空造文件），超 256 个报 `hook_glob_too_many`（`ATS_HOOK_GLOB_MAX` 可调），符号链接跳过并计数；展开后按字典序**逐条调用**转换器、遇非 0 即停，`post_hook` 新增 `glob`/`expanded`/`skipped_symlinks`/`runs`/`failed_on`，`hook-enc.log` 头部写展开清单可事后核对；`timeout` 为每次调用超时；同时修正参数角色判定：以 `-` 开头的 token 永不被当成「值」，否则 `--dry-run --from gbk --to utf-8 logs/*.log` 会把 `--from` 记成值、`gbk` 记成位置参数而误报 `hook_glob_ambiguous`；新增 5 条用例（`hook_glob_expands_multiple_files` / `hook_glob_no_match_fails_loudly` / `hook_glob_rejects_mixed_paths` / `hook_glob_skips_flag_values` / `hook_glob_survives_valueless_flags`，全量 49 条） |
 | 3.0.1 | 修复 `@enc` 钩子绕过权限门（安全）：修复前钩子参数直接拼进 `shell=True` 的命令串执行，`echo hi @enc x; del f` 会按 `echo hi` 登记成 L0 直通，钩子段却执行任意 shell；现在钩子参数按空白分词（引号包裹段保持完整）后以 **argv 列表**交给转换器、不经 shell，且等级推导 / 预检 / 审批绑定统一改用「主命令 + `@enc` 参数」的完整原文（`hook_gate_text`），同一命令实测被抬到 L2/L3 并命中 `denied_injection`；同时修正 `artifact_digests` 把钩子参数里的 `.py` 当执行体绑定、导致转码目标一改就误报 `artifact_changed` 的问题（现在只扫 `@enc` 之前的主命令）；新增 3 条用例（`hook_args_do_not_run_through_shell` / `hook_args_enter_gate_text` / `hook_target_not_bound_as_artifact`）；同时修正看门狗「密钥丢失」的下一步指引：`verify` 新增 `next_action: restore_key`（`seal` 在无密钥时必然 `key_missing`、`init` 又因清单存在而 `already_initialized`，原来只提示「重封签」是条跑不通的路），`ats.py` 准入失败提示同步改写；新增 2 条用例（`guard_key_loss_points_to_restore` / `guard_manifest_loss_guides_to_seal`）；并给 Plan 层补上钩子边界：Step 走 `shell=True` 直接执行、没有钩子后置，原来写 `@enc` 会被静默当普通参数传过去（实测该 Step 还报 `succeeded`，转换根本没发生），现在 `submit_plan` / `submit_schedule` 校验阶段报 `stage[..].step[..].hook_not_supported` 并整单拒绝；新增 1 条用例（`plan_step_rejects_hook`）；另补 1 条用例锁定「钩子段编码载荷也解码」（`hook_args_decoded_payload_raises_level`，实测钩子参数里写 `powershell -EncodedCommand <b64>` 会被解出 `Remove-Item` 并抬到 L3，全量 44 条） |
