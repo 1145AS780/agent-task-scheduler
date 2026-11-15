@@ -24,6 +24,9 @@
   events [--lines N] [--json]
   logs [--lines N] [--plain] [--json]
   policy [--json]
+  unpack --confirm | --exit [--reason TEXT]      # 停机进维护态 / 退出维护态
+  tryrun [--timeout SEC] [--cwd DIR] [--no-shell] -- "命令"   # 维护态自测
+  repack [--confirm]                             # 维护态重建封签基线
 
 退出码：0 正常 / 2 参数或确认缺失 / 3 不存在或状态冲突 / 4 权限不足
 
@@ -31,17 +34,23 @@
   * 所有状态落在 ATS_ROOT（默认 <ats 本体目录>/.ats，即仓库根的 .ats），可用环境变量覆盖。
   * Task 层事件统一写 <root>/events.jsonl；Plan 层事件写
     <root>/schedules/<schedule_id>/events.jsonl（由 ats_plan.py 触发）。
+  * 任务落终态时追加一行回执到 <root>/telegraph/Receive.txt，格式 `[taskid]: true/false`；
+    该行行号同时写回 task.json 的 receive_line，并在退出 0 时以「战情看板」打到 stderr。
   * 审批记录 <root>/approvals/<approval_id>.json，命令原文绑定 + 有效期。
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import glob
 import hashlib
+import io
 import json
 import os
 import re
+import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -50,6 +59,23 @@ import uuid
 from pathlib import Path
 
 sys.dont_write_bytecode = True
+# —— 拆出的功能模块：战情看板（telegraph）与停机 / 封装生命周期（maintenance）
+# 以脚本方式运行时本模块是 __main__：先登记别名，否则拆出的模块里 `import ats`
+# 会再执行一遍本文件、生成第二份副本，模块级全局（如 GUARD_PASSPHRASE）两边读写不一致。
+sys.modules.setdefault("ats", sys.modules[__name__])
+
+# 这两块都是能力组件（C 类）：缺失时对应功能降级，主链路（create / run / show）照常。
+# 缺 telegraph 只是没有看板；缺 maintenance 时维护态判定退化为「未处于维护态」，
+# 执行类命令仍要过握手（封签校验 + 持句柄 + 冻结策略），安全承诺不依赖这两个模块。
+try:
+    import ats_telegraph
+except Exception:                       # noqa: BLE001
+    ats_telegraph = None
+
+try:
+    import ats_maintenance
+except Exception:                       # noqa: BLE001
+    ats_maintenance = None
 
 try:                                    # 预演模块缺失时退化为纯权限门行为
     import ats_preflight
@@ -60,6 +86,90 @@ try:                                    # 扩展发现层缺失时 extend 子命
     import ats_extend
 except Exception:                       # noqa: BLE001
     ats_extend = None
+
+# —— 能力组件的薄包装：模块缺失时各归各的降级，调用点不必逐个判空
+
+
+def board_text(root, limit=None):
+    """战情看板正文；看板模块缺失时返回空串（等同「没有回执」）。"""
+    if ats_telegraph is None:
+        return ""
+    return ats_telegraph.board_text(root, limit)
+
+
+def emit_board(root):
+    """把战情看板打到 stderr；模块缺失时静默跳过，stdout 仍是纯 JSON。"""
+    if ats_telegraph is None:
+        return None
+    return ats_telegraph.emit_board(root)
+
+
+def read_maintenance(root):
+    """维护态标志；模块缺失时返回 None（视为未处于维护态）。
+
+    维护态只是「核心脚本已改动」时的额外窗口，主防线仍是握手，
+    所以这里缺失只让 unpack / tryrun / repack 不可用，不放宽执行类命令。
+    """
+    if ats_maintenance is None:
+        return None
+    return ats_maintenance.read_maintenance(root)
+
+
+def write_maintenance(root, record):
+    """写维护态标志；模块缺失时返回 None（没有维护窗口可开）。"""
+    if ats_maintenance is None:
+        return None
+    return ats_maintenance.write_maintenance(root, record)
+
+
+def maintenance_path(root):
+    """维护态标志文件路径；模块缺失时返回 None。"""
+    if ats_maintenance is None:
+        return None
+    return ats_maintenance.maintenance_path(root)
+
+
+def _repack_diff(root):
+    """封签基线差异；模块缺失时返回 None（repack 本身已先报错）。"""
+    if ats_maintenance is None:
+        return None
+    return ats_maintenance._repack_diff(root)
+
+
+def _tail_text(text, limit=None):
+    """截取末尾若干行；模块缺失时原样返回。"""
+    if ats_maintenance is None:
+        return text or ""
+    return ats_maintenance._tail_text(text, limit)
+
+
+def _maintenance_unavailable():
+    """维护类命令的缺失分支：明确报错，不是静默跳过。"""
+    return print_json({
+        "ok": False,
+        "error": "maintenance_module_missing",
+        "hint": "scripts/ats_maintenance.py 缺失或无法导入；unpack / tryrun / repack 不可用，"
+                "任务创建与后台执行不受影响",
+    }, EXIT_USAGE)
+
+
+def cmd_unpack(root, args):
+    if ats_maintenance is None:
+        return _maintenance_unavailable()
+    return ats_maintenance.cmd_unpack(root, args)
+
+
+def cmd_tryrun(root, args):
+    if ats_maintenance is None:
+        return _maintenance_unavailable()
+    return ats_maintenance.cmd_tryrun(root, args)
+
+
+def cmd_repack(root, args):
+    if ats_maintenance is None:
+        return _maintenance_unavailable()
+    return ats_maintenance.cmd_repack(root, args)
+
 
 # ---------------------------------------------------------------- 常量
 
@@ -79,6 +189,28 @@ EXIT_OK = 0
 EXIT_USAGE = 2
 EXIT_CONFLICT = 3
 EXIT_DENIED = 4
+
+# —— 人类主动中止（command-ai.md 规则 3）：判据只看 JSON 字段，不看进程退出码。
+# Windows 进程退出码上限 255，101127 落盘会被截断成 7，所以进程码仍用 EXIT_DENIED，
+# 真正的信号放在返回体的 exit_code 字段里。
+EXIT_HUMAN_ABORT = 101127
+ABORT_FILE = "abort.json"             # <root>/abort.json 存在即「人类已中止」
+ABORT_EXEMPT = ("abort",)            # 唯一豁免：否则中止标志一旦落下就没人能解除（含 supervise）
+
+# —— 停机 / 封装生命周期：<root>/maintenance.json 存在即「维护态」
+MAINTENANCE_FILE = "maintenance.json"
+MAINTENANCE_ALLOWED = ("unpack", "repack", "tryrun", "abort", "approve", "visa",
+                       "list", "show", "status", "check", "logs", "events",
+                       "policy", "approval")
+TRYRUN_TIMEOUT_DEFAULT = 300          # 秒；维护态自测的默认上限
+TRYRUN_OUTPUT_LIMIT = 4000            # 输出尾部保留字符数，避免刷屏与日志爆量
+
+# —— 回执板：<root>/telegraph/Receive.txt 一行一条 `[taskid]: true/false`
+TELEGRAPH_DIR = "telegraph"
+RECEIPT_FILE = "Receive.txt"
+BOARD_LIMIT = 10                      # 战情看板最多显示的最近条数
+BOARD_SKIP = ("supervise",)           # 内部派生进程不刷看板（stdout 已重定向到日志）
+RECEIPT_LOCK_TTL = 30                 # 秒；追加回执的锁，崩溃残留超过此龄即可清理
 
 # —— 看门狗（ats_guard.py）：启动准入、跳过审批、运行期句柄与策略快照
 GUARD_FILE = "ats_guard.py"
@@ -167,7 +299,7 @@ RESTRICTED_POLICY_KEYS = ("max_level", "actor_level", "allow_rules", "allow_dirs
 def ats_root(root: str | None = None) -> Path:
     """解析状态根。优先级：显式 root > 环境变量 ATS_ROOT > <ats 本体目录>/.ats。
 
-    默认取脚本所在目录的父目录（即 OCSKIS/），而不是当前工作目录：
+    默认取脚本所在目录的父目录（即仓库根目录），而不是当前工作目录：
     否则从不同 cwd 调用会各自生成一份 .ats，信任根被拆散。
     """
     if root:
@@ -849,6 +981,21 @@ def artifact_changed(record, command, context=None) -> bool:
     return False
 
 
+def _resolve_approval_resume(record):
+    """审批落盘前把 resume 里的占位符换成真实 id。
+
+    两份都留：`resume_template` 是原文（之后还能按新 id 重算），`resume` 是
+    换好 id 的成品（人和 AI 拿到就能直接粘进终端）。换不出来时 `resume` 置 None，
+    不吐一条「看起来能跑、实际要人手改」的命令。
+    """
+    template = record.get("resume_template") or record.get("resume")
+    if not template:
+        return record
+    record["resume_template"] = template
+    record["resume"] = _resume_command(template, record.get("id"), record.get("task_id"))
+    return record
+
+
 def create_approval(root, command, required_level, context=None, ttl=None, resume=None,
                     preflight=None, status="pending"):
     context = dict(context or {})
@@ -864,6 +1011,7 @@ def create_approval(root, command, required_level, context=None, ttl=None, resum
             reuse["artifacts"] = artifact_digests(command, context)
         if status == "denied_injection" and reuse.get("status") == "pending":
             reuse["status"] = "denied_injection"
+        _resolve_approval_resume(reuse)
         save_approval(root, reuse)
         return reuse
     record = {
@@ -891,6 +1039,7 @@ def create_approval(root, command, required_level, context=None, ttl=None, resum
     }
     if preflight is not None:
         record["preflight"] = preflight
+    _resolve_approval_resume(record)
     save_approval(root, record)
     log_event(root, "approval_created",
               approval_id=record["id"],
@@ -1406,6 +1555,16 @@ def gate_operation(root, level, label, approval_id=None, context=None):
 
 # ---------------------------------------------------------------- Task 存储
 
+ARCHIVE_DIRNAME = "archive"
+ARCHIVE_STATUSES = ("failed", "timeout", "killed")
+ARCHIVE_KEEP = ("task.json", "exit_code", "stdout.log", "stderr.log",
+                "supervisor.log", "hook-enc.log", "aria2.log")
+ARCHIVE_MAX_TASKS = 200
+ARCHIVE_MAX_BYTES = 512 * 1024 * 1024
+ARCHIVE_MAX_TASKS_ENV = "ATS_ARCHIVE_MAX_TASKS"
+ARCHIVE_MAX_BYTES_ENV = "ATS_ARCHIVE_MAX_BYTES"
+
+
 def tasks_dir(root) -> Path:
     return Path(root) / "tasks"
 
@@ -1414,29 +1573,386 @@ def task_dir(root, task_id) -> Path:
     return tasks_dir(root) / str(task_id)
 
 
+def archive_root(root) -> Path:
+    return Path(root) / ARCHIVE_DIRNAME
+
+
+def archive_dir(root, task_id) -> Path:
+    return archive_root(root) / str(task_id)
+
+
+def task_files_dir(root, task_id) -> Path:
+    """任务证据目录：运行目录优先，已归档则回退 archive/，都没有时给运行目录。
+
+    `show` / `delete` 这类按路径取文件的命令必须走这里，否则任务一归档就查不到日志。
+    """
+    active = task_dir(root, task_id)
+    if active.exists():
+        return active
+    archived = archive_dir(root, task_id)
+    if archived.exists():
+        return archived
+    return active
+
+
+def task_exists(root, task_id) -> bool:
+    """任务是否已存在：运行目录与 archive/ 都算，避免新任务静默遮住已归档的同 id 任务。"""
+    return (task_dir(root, task_id) / "task.json").is_file() or \
+        (archive_dir(root, task_id) / "task.json").is_file()
+
+
 def load_task(root, task_id):
-    return jread(task_dir(root, task_id) / "task.json")
+    task = jread(task_dir(root, task_id) / "task.json")
+    if task is None:
+        task = jread(archive_dir(root, task_id) / "task.json")
+    return task
 
 
 def save_task(root, task):
     task["updated_at"] = now_ts()
-    return jwrite(task_dir(root, task["id"]) / "task.json", task)
+    base = archive_dir(root, task["id"]) if task.get("archived_at") else task_dir(root, task["id"])
+    return jwrite(base / "task.json", task)
+
+
+def _rebase_task_paths(task, old_base, new_base):
+    """把落在旧任务目录里的绝对路径改到新目录。
+
+    归档/回迁都是搬家，task.json 里记的 `post_hook.log` 这类绝对路径若不跟着改，
+    任务搬完就指向一个已经不存在的文件——证据在，指路牌错了。
+    """
+    if not task:
+        return task
+    hook = task.get("post_hook")
+    if isinstance(hook, dict) and isinstance(hook.get("log"), str):
+        try:
+            rel = Path(hook["log"]).relative_to(Path(old_base))
+        except (ValueError, OSError):
+            rel = None
+        if rel is not None:
+            hook["log"] = str(Path(new_base) / rel)
+    return task
+
+
+def _path_bytes(path):
+    p = Path(path)
+    try:
+        if p.is_dir():
+            return sum(c.stat().st_size for c in p.rglob("*") if c.is_file())
+        return p.stat().st_size
+    except OSError:
+        return 0
 
 
 def new_task_id() -> str:
     return "t-" + uuid.uuid4().hex[:6]
 
 
+def unarchive_task(root, task):
+    """把已归档任务搬回运行目录，供 `run --force` 重跑。
+
+    重跑必须让证据文件回到运行目录：否则 supervisor 会往新目录写日志，
+    而 task.json 还在 archive 里，一次重跑就把证据劈成两半。
+    """
+    if not task or not task.get("archived_at"):
+        return task
+    tid = str(task.get("id") or "")
+    if not tid:
+        return task
+    adir = archive_dir(root, tid)
+    tdir = task_dir(root, tid)
+    tdir.mkdir(parents=True, exist_ok=True)
+    if adir.is_dir():
+        for child in sorted(adir.iterdir(), key=lambda p: p.name):
+            target = tdir / child.name
+            try:
+                if target.is_dir():
+                    shutil.rmtree(target)
+                elif target.exists():
+                    target.unlink()
+                shutil.move(str(child), str(target))
+            except OSError:
+                pass
+        try:
+            adir.rmdir()
+        except OSError:
+            pass
+    for key in ("archived_at", "archive_path", "archive_kept",
+                "archive_removed", "archive_reclaimed"):
+        task.pop(key, None)
+    _rebase_task_paths(task, adir, tdir)
+    save_task(root, task)
+    log_event(root, "task_unarchived", task_id=tid)
+    return task
+
+
+def purge_archive(root, task_id):
+    """丢弃同 id 的归档副本：`create --force` 新建任务时不能留下会复活的旧档。"""
+    adir = archive_dir(root, task_id)
+    if adir.is_dir():
+        try:
+            shutil.rmtree(adir)
+        except OSError:
+            return False
+        return True
+    return False
+
+
+def archive_limits():
+    """归档上限（任务数, 字节数）；0 表示该项不限制，环境变量可覆盖默认值。
+
+    非法值（非整数）回落到默认值而不是报错：上限只是治理手段，不该让归档主流程因为
+    一个写错的配置项整条失败。
+    """
+    def _one(env, default):
+        raw = os.environ.get(env)
+        if raw is None or raw.strip() == "":
+            return default
+        try:
+            return max(0, int(raw.strip()))
+        except ValueError:
+            return default
+    return _one(ARCHIVE_MAX_TASKS_ENV, ARCHIVE_MAX_TASKS), \
+        _one(ARCHIVE_MAX_BYTES_ENV, ARCHIVE_MAX_BYTES)
+
+
+def _archive_entry(path):
+    """归档目录的排序依据与体积：`created_at` → `archived_at` → 目录 mtime。"""
+    path = Path(path)
+    task = jread(path / "task.json") or {}
+    created = task.get("created_at")
+    if not isinstance(created, int):
+        created = task.get("archived_at")
+    if not isinstance(created, int):
+        try:
+            created = int(path.stat().st_mtime)
+        except OSError:
+            created = 0
+    return created, _path_bytes(path)
+
+
+def prune_archive(root, keep_id=None):
+    """按数量/体积上限淘汰最旧的归档任务；未超限时返回 None。
+
+    排序用 `created_at` 而不是 `archived_at`：一个创建很早、今天才失败的任务，归档后
+    仍属最旧，但它刚搬进来就删掉等于白搬一次，所以 `keep_id` 永远跳过。
+    删除失败（Windows 上文件被占用）只记进 errors 并继续下一条——上限清理是尽力而为，
+    不能反过来阻断归档主流程，更不能因为删不掉就把整次归档判失败。
+    """
+    max_tasks, max_bytes = archive_limits()
+    if max_tasks <= 0 and max_bytes <= 0:
+        return None
+    root_dir = archive_root(root)
+    if not root_dir.is_dir():
+        return None
+    entries = []
+    for path in sorted(root_dir.iterdir(), key=lambda p: p.name):
+        if not path.is_dir():
+            continue
+        created, size = _archive_entry(path)
+        entries.append({"id": path.name, "created_at": created,
+                        "bytes": size, "path": path})
+    total_tasks = len(entries)
+    total_bytes = sum(e["bytes"] for e in entries)
+    over_tasks = max_tasks > 0 and total_tasks > max_tasks
+    over_bytes = max_bytes > 0 and total_bytes > max_bytes
+    if not over_tasks and not over_bytes:
+        return None
+
+    candidates = [e for e in entries if e["id"] != str(keep_id)]
+    candidates.sort(key=lambda e: (e["created_at"], e["id"]))
+    pruned, reclaimed, errors = [], 0, []
+    for entry in candidates:
+        over_tasks = max_tasks > 0 and total_tasks > max_tasks
+        over_bytes = max_bytes > 0 and total_bytes > max_bytes
+        if not over_tasks and not over_bytes:
+            break
+        try:
+            shutil.rmtree(entry["path"])
+        except OSError as exc:
+            errors.append("%s:%s" % (entry["id"], type(exc).__name__))
+            continue
+        pruned.append(entry["id"])
+        reclaimed += entry["bytes"]
+        total_tasks -= 1
+        total_bytes -= entry["bytes"]
+    if not pruned and not errors:
+        return None
+
+    emit_event(root, {"type": "task_archive_pruned", "pruned": pruned,
+                      "reclaimed": reclaimed, "remaining": total_tasks,
+                      "max_tasks": max_tasks, "max_bytes": max_bytes,
+                      "errors": errors})
+    log_event(root, "task_archive_pruned", pruned=len(pruned),
+              reclaimed=reclaimed, remaining=total_tasks, errors=len(errors))
+    return {"pruned": pruned, "reclaimed": reclaimed, "remaining": total_tasks,
+            "errors": errors}
+
+
 def list_tasks(root):
+    """列出全部任务：运行目录优先，再补上 archive/ 里已归档的（同 id 不重复）。
+
+    归档只是搬家，不是删除：`list` / `check` / `status` 的可见性与归档前一致。
+    """
     out = []
+    seen = set()
     base = tasks_dir(root)
-    if not base.exists():
-        return out
-    for p in sorted(base.iterdir()):
-        if p.is_dir():
+    if base.is_dir():
+        for p in sorted(base.iterdir()):
+            if not p.is_dir() or p.name == ARCHIVE_DIRNAME:
+                continue
             task = jread(p / "task.json")
             if task:
                 out.append(task)
+                seen.add(str(task.get("id") or p.name))
+    archived = archive_root(root)
+    if archived.is_dir():
+        for p in sorted(archived.iterdir()):
+            if not p.is_dir():
+                continue
+            task = jread(p / "task.json")
+            if task and str(task.get("id") or p.name) not in seen:
+                out.append(task)
+                seen.add(str(task.get("id") or p.name))
+    return out
+
+
+def archive_task_dir(root, task):
+    """错误任务自动瘦身：只留证据、丢掉垃圾，把整个目录搬进 <root>/archive/<id>/。
+
+    只对已落终态（finalized）且状态为 failed/timeout/killed 的任务生效，成功任务不动。
+    命令进程仍活着时直接跳过（Windows 上 stdout.log 被占用，移动会失败）；文件被占用
+    时同样跳过并留 `files_in_use`，下一次查询再重试，绝不半途丢证据。
+
+    task.json 最后搬：中途失败时运行目录里仍有 task.json，任务不会凭空消失。
+    """
+    if not task or not task.get("finalized"):
+        return None
+    if task.get("status") not in ARCHIVE_STATUSES or task.get("archived_at"):
+        return None
+    tid = str(task.get("id") or "")
+    if not tid:
+        return None
+    tdir = task_dir(root, tid)
+    if not (tdir / "task.json").is_file():
+        return None
+    if pid_alive(task.get("pid")):
+        return {"archived": False, "reason": "process_alive", "task_id": tid}
+
+    adir = archive_dir(root, tid)
+    adir.mkdir(parents=True, exist_ok=True)
+    kept, removed, reclaimed, errors = [], [], 0, []
+    for child in sorted(tdir.iterdir(), key=lambda p: p.name):
+        if child.name == "task.json":
+            continue
+        if child.name in ARCHIVE_KEEP:
+            try:
+                target = adir / child.name
+                if target.is_dir():
+                    shutil.rmtree(target)
+                elif target.exists():
+                    target.unlink()
+                shutil.move(str(child), str(target))
+                kept.append(child.name)
+            except OSError as exc:
+                errors.append("%s:%s" % (child.name, type(exc).__name__))
+            continue
+        try:
+            reclaimed += _path_bytes(child)
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+            removed.append(child.name)
+        except OSError as exc:
+            errors.append("%s:%s" % (child.name, type(exc).__name__))
+
+    if errors:
+        return {"archived": False, "reason": "files_in_use", "task_id": tid,
+                "errors": errors, "kept": kept, "removed": removed,
+                "reclaimed": reclaimed}
+
+    try:
+        shutil.move(str(tdir / "task.json"), str(adir / "task.json"))
+    except OSError as exc:
+        return {"archived": False, "reason": "files_in_use", "task_id": tid,
+                "errors": ["task.json:%s" % type(exc).__name__],
+                "kept": kept, "removed": removed, "reclaimed": reclaimed}
+    try:
+        tdir.rmdir()
+    except OSError:
+        pass
+
+    task["archived_at"] = now_ts()
+    task["archive_path"] = str(adir)
+    task["archive_kept"] = kept
+    task["archive_removed"] = removed
+    task["archive_reclaimed"] = reclaimed
+    _rebase_task_paths(task, tdir, adir)
+    save_task(root, task)
+    emit_event(root, {"type": "task_archived", "task_id": tid,
+                      "status": task.get("status"), "archive": str(adir),
+                      "kept": kept, "removed": removed, "reclaimed": reclaimed})
+    log_event(root, "task_archived", task_id=tid, status=task.get("status"),
+              kept=len(kept), removed=len(removed), reclaimed=reclaimed)
+    pruned = prune_archive(root, keep_id=tid)
+    result = {"archived": True, "task_id": tid, "path": str(adir),
+              "kept": kept, "removed": removed, "reclaimed": reclaimed}
+    if pruned:
+        # 未超限时不多这两个字段，归档返回体保持与 3.6 完全一致
+        result["pruned"] = pruned["pruned"]
+        result["prune_reclaimed"] = pruned["reclaimed"]
+    return result
+
+
+# ---------------------------------------------------------------- 回执板
+
+def receipt_path(root) -> Path:
+    return Path(root) / TELEGRAPH_DIR / RECEIPT_FILE
+
+
+def append_receipt(root, task_id, ok) -> int:
+    """追加一条回执，返回它在 Receive.txt 中的物理行号（从 1 起）。
+
+    格式固定为 `[taskid]: true/false`，一行一条。AI 排查批处理失败时只要读这一行，
+    不必再翻 stdout.log / stderr.log —— 行号就是 task.json 里 receive_line 的值。
+    读行数 + 追加必须原子：两个进程同时落终态时若各自算行号，后写的那条会拿到
+    前一条的号，task.json 的索引就指错了，所以这里复用 run lock 的建锁语义。
+    """
+    path = receipt_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = "[%s]: %s" % (task_id, "true" if ok else "false")
+    lock = path.with_name(RECEIPT_FILE + ".lock")
+    lock_path, detail = None, None
+    for _attempt in range(5):
+        lock_path, detail = acquire_run_lock(lock, ttl=RECEIPT_LOCK_TTL)
+        if lock_path:
+            break
+        time.sleep(0.05)                 # 别的进程正在追加，等它落完再算行号
+    else:
+        raise OSError("回执板加锁失败：%r" % (detail,))
+    try:
+        existing = ""
+        if path.is_file():
+            existing = path.read_text(encoding="utf-8", errors="replace")
+        line_no = len(existing.splitlines()) + 1
+        with path.open("a", encoding="utf-8", newline="\n") as fh:
+            if existing and not existing.endswith("\n"):
+                fh.write("\n")           # 末行缺换行时先补齐，避免新回执粘在上一行上
+            fh.write(text + "\n")
+        return line_no
+    finally:
+        release_run_lock(lock_path)
+
+
+def read_receipts(root):
+    """按物理行号读回执，返回 [{"line": N, "text": "[taskid]: true"}]。"""
+    path = receipt_path(root)
+    if not path.is_file():
+        return []
+    out = []
+    for i, raw in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+        if raw.strip():
+            out.append({"line": i, "text": raw.strip()})
     return out
 
 
@@ -1586,6 +2102,15 @@ def finalize_task(root, task, status, exit_code=None, timed_out=False, note=None
     if note:
         task["note"] = note
     task["finalized"] = True
+    if not task.get("receive_line"):
+        # 只在首次落终态时追加：check / stop 反复 finalize 不会刷出重复回执
+        try:
+            task["receive_line"] = append_receipt(root, task["id"],
+                                                  status == "succeeded")
+        except OSError as exc:
+            task["receive_line"] = 0
+            log_event(root, "receipt_write_failed", task_id=task["id"],
+                      detail="%s: %s" % (type(exc).__name__, exc))
     save_task(root, task)
     tdir = task_dir(root, task["id"])
     try:
@@ -1608,10 +2133,15 @@ def finalize_task(root, task, status, exit_code=None, timed_out=False, note=None
 
 
 def refresh_task(root, task):
-    """同步单个运行中任务；返回 (task, changed)。"""
+    """同步单个运行中任务；返回 (task, changed)。
+
+    已落终态的错误任务顺带瘦身归档：这里既是 `status`/`show`/`check` 的公共入口，
+    也是「上次因文件占用没搬成」的重试点。
+    """
     if not task:
         return task, False
     if task.get("status") not in ("starting", "running"):
+        archive_task_dir(root, task)
         return task, False
     tdir = task_dir(root, task["id"])
 
@@ -1623,6 +2153,7 @@ def refresh_task(root, task):
             code = -1
         status = "succeeded" if code == 0 else "failed"
         finalize_task(root, task, status, code)
+        archive_task_dir(root, task)
         return task, True
 
     timeout = int(task.get("timeout") or 0)
@@ -1631,12 +2162,14 @@ def refresh_task(root, task):
         kill_pid(task.get("pid"))
         kill_pid(task.get("supervisor_pid"))
         finalize_task(root, task, "timeout", -1, timed_out=True)
+        archive_task_dir(root, task)
         return task, True
 
     sup = task.get("supervisor_pid")
     if not task.get("finalized") and sup and not pid_alive(sup):
         fresh = load_task(root, task["id"])
         if fresh and fresh.get("finalized"):
+            archive_task_dir(root, fresh)
             return fresh, True
         if code_file.exists():
             try:
@@ -1645,9 +2178,11 @@ def refresh_task(root, task):
                 code = -1
             status = "succeeded" if code == 0 else "failed"
             finalize_task(root, task, status, code)
+            archive_task_dir(root, task)
             return task, True
         finalize_task(root, task, "failed", None,
                       note="supervisor_lost")
+        archive_task_dir(root, task)
         return task, True
     return task, False
 
@@ -1680,9 +2215,12 @@ def cmd_create(root, args):
 
     task_id = args.id or spec.get("id") or new_task_id()
     tdir = task_dir(root, task_id)
-    if (tdir / "task.json").exists() and not args.force:
+    if task_exists(root, task_id) and not args.force:
         print(json.dumps({"error": "task_exists", "task_id": task_id}, ensure_ascii=False))
         return EXIT_CONFLICT
+    if args.force:
+        # 同 id 的归档副本必须一起清掉：否则运行目录里的新任务被删后，旧档会重新冒出来
+        purge_archive(root, task_id)
 
     command = args.command or spec.get("command")
     if isinstance(command, list):
@@ -1694,7 +2232,8 @@ def cmd_create(root, args):
     command, post_hook = split_post_hook(command)
     if post_hook and post_hook.get("error"):
         print(json.dumps({"error": "bad_hook",
-                          "hint": "钩子写法：<命令> @enc <转换器参数>；@enc 前后都要有内容"},
+                          "hint": "钩子写法是「主命令 @enc 转换器参数」，两端都要有内容；"
+                                  "例如 build.bat @enc --from gbk --to utf-8 logs"},
                          ensure_ascii=False))
         return EXIT_USAGE
 
@@ -2080,7 +2619,8 @@ def cmd_pack(root, args):
         parsed.append((command, hook))
     if bad_hook:
         return print_json({"error": "bad_hook_item", "indexes": bad_hook,
-                           "hint": "钩子写法：<命令> @enc <转换器参数>；@enc 前后都要有内容"},
+                           "hint": "钩子写法是「主命令 @enc 转换器参数」，两端都要有内容；"
+                                   "indexes 里是写坏的第几条（从 1 起），改好那几条后重跑"},
                           EXIT_USAGE)
 
     level = pack_level(args.level, [hook_gate_text(c, hook) for c, hook in parsed])
@@ -2174,6 +2714,12 @@ def _start_task(root, task_id, approval=None, wait=False, force=False):
         if not task:
             return {"error": "not_found", "task_id": task_id}, EXIT_CONFLICT
         refresh_task(root, task)
+        if force:
+            # 重跑已归档的任务：先把证据搬回运行目录，再走后面那套状态判定。
+            # 顺序不能反：refresh_task 会把「已落终态且尚未归档」的错误任务当场归档，
+            # 若先搬回运行目录再 refresh，任务会被立刻又搬进 archive/，一次重跑把证据
+            # 劈成两半（task.json 在 archive、新日志在 tasks）。
+            task = unarchive_task(root, task)
         # 权限门与预检看的是「主命令 + @enc 参数」的完整原文：钩子参数虽然只以
         # argv 交给转换器，但它是用户写下的内容，审批要绑同一段文本才不会看漏。
         gate_text = hook_gate_text(task.get("command") or "", task.get("post_hook"))
@@ -2461,17 +3007,21 @@ def _supervise(root, task_id):
                 code = -1
         task = load_task(root, task_id) or task
         if task.get("finalized"):
-            return task
-        if timed_out:
-            return finalize_task(root, task, "timeout", code, timed_out=True)
-        status = "succeeded" if code == 0 else "failed"
-        if status == "succeeded" and task.get("post_hook"):
-            task["post_hook"] = run_post_hook(root, tdir, task, task["post_hook"])
-            save_task(root, task)
-            if task["post_hook"].get("status") != "ok":
-                status = "failed"
-                code = task["post_hook"].get("exit_code") or 1
-        return finalize_task(root, task, status, code)
+            final = task
+        elif timed_out:
+            final = finalize_task(root, task, "timeout", code, timed_out=True)
+        else:
+            status = "succeeded" if code == 0 else "failed"
+            if status == "succeeded" and task.get("post_hook"):
+                task["post_hook"] = run_post_hook(root, tdir, task, task["post_hook"])
+                save_task(root, task)
+                if task["post_hook"].get("status") != "ok":
+                    status = "failed"
+                    code = task["post_hook"].get("exit_code") or 1
+            final = finalize_task(root, task, status, code)
+    # stdout/stderr 句柄已关，此时才搬档：Windows 上占用中的文件移动会失败
+    archive_task_dir(root, final)
+    return final
 
 
 def cmd_supervise(root, args):
@@ -2685,15 +3235,17 @@ def cmd_download(root, args):
     spec, err = _build_download_spec(args)
     if err:
         return print_json({"error": err,
-                           "hint": "download 参数不合法：对照 ats.py download --help "
-                                   "检查 --url / --file / --out 的必填关系"},
+                           "hint": hint_command("download 参数不合法：对照帮助检查 "
+                                                "--url / --file / --out 的必填关系",
+                                                "download", "--help")},
                           EXIT_USAGE)
 
     task_id = args.id or ("dl-" + uuid.uuid4().hex[:6])
     tdir = task_dir(root, task_id)
-    if (tdir / "task.json").exists():
+    if task_exists(root, task_id):
         return print_json({"error": "task_exists", "task_id": task_id,
-                           "hint": "换一个 --id，或先 ats.py show <task_id> 确认是不是要复用的任务"},
+                           "hint": hint_command("换一个 --id，或先确认这个 id 是不是要复用的任务",
+                                                "show", task_id)},
                           EXIT_CONFLICT)
     tdir.mkdir(parents=True, exist_ok=True)
     spec_path = tdir / "download.json"
@@ -2748,7 +3300,7 @@ def cmd_download(root, args):
                            "deduped": spec.get("deduped", 0),
                            "manifests": len(spec.get("manifests") or []),
                            "spec": str(spec_path),
-                           "log": relative_task_path(task_id, "stdout.log")}
+                           "log": relative_task_path(root, task_id, "stdout.log")}
     return print_json(payload, code)
 
 
@@ -2800,9 +3352,10 @@ def cmd_torrent(root, args):
 
     task_id = args.id or ("tor-" + uuid.uuid4().hex[:6])
     tdir = task_dir(root, task_id)
-    if (tdir / "task.json").exists():
+    if task_exists(root, task_id):
         return print_json({"error": "task_exists", "task_id": task_id,
-                           "hint": "换一个 --id，或先 ats.py show <task_id> 确认是不是要复用的任务"},
+                           "hint": hint_command("换一个 --id，或先确认这个 id 是不是要复用的任务",
+                                                "show", task_id)},
                           EXIT_CONFLICT)
     tdir.mkdir(parents=True, exist_ok=True)
 
@@ -2864,12 +3417,18 @@ def cmd_torrent(root, args):
     payload["torrent"] = {"source": source["type"], "outputs": out_dir,
                           "seed_time": seed_time, "spec": str(spec_path),
                           "aria2": aria2,
-                          "log": relative_task_path(task_id, "stdout.log")}
+                          "log": relative_task_path(root, task_id, "stdout.log")}
     return print_json(payload, code)
 
 
-def relative_task_path(task_id, name):
-    return "tasks/%s/%s" % (task_id, name)
+def relative_task_path(root, task_id, name):
+    """任务内文件的 root 相对路径：已归档时自动指向 archive/<id>/。"""
+    base = task_files_dir(root, task_id)
+    try:
+        rel = base.relative_to(Path(root))
+    except ValueError:
+        rel = Path("tasks") / str(task_id)
+    return (rel / name).as_posix()
 
 
 def cmd_check(root, args):
@@ -2928,11 +3487,13 @@ def cmd_show(root, args):
         print(json.dumps({"error": "not_found", "task_id": args.task_id}, ensure_ascii=False))
         return EXIT_CONFLICT
     refresh_task(root, task)
-    tdir = task_dir(root, task["id"])
+    tdir = task_files_dir(root, task["id"])
     payload = dict(task)
     payload["stdout_tail"] = _tail(tdir / "stdout.log", args.lines)
     payload["stderr_tail"] = _tail(tdir / "stderr.log", args.lines)
     payload["files"] = {
+        "dir": str(tdir),
+        "archived": bool(task.get("archived_at")),
         "stdout": str(tdir / "stdout.log"),
         "stderr": str(tdir / "stderr.log"),
         "exit_code": str(tdir / "exit_code"),
@@ -3009,8 +3570,9 @@ def cmd_stop(root, args):
         return print_json({"task": task, "stopped": False,
                            "checked": checked, "leftovers": leftovers}, EXIT_CONFLICT)
     finalize_task(root, task, "killed", task.get("exit_code"), note="stopped_by_user")
+    archive = archive_task_dir(root, task)
     log_event(root, "task_stop", task_id=task["id"], gate=gate.get("reason"))
-    return print_json({"task": task, "stopped": True,
+    return print_json({"task": task, "stopped": True, "archive": archive,
                        "checked": checked, "leftovers": []})
 
 
@@ -3035,20 +3597,27 @@ def cmd_delete(root, args):
                                      % (Path(__file__).name, task["id"])})
     if not gate["allowed"]:
         return print_json(gate, EXIT_DENIED)
-    tdir = task_dir(root, task["id"])
-    for child in tdir.glob("*"):
+    removed_dirs = []
+    for base in (task_dir(root, task["id"]), archive_dir(root, task["id"])):
+        if not base.exists():
+            continue
+        for child in base.glob("*"):
+            try:
+                child.unlink()
+            except OSError:
+                try:
+                    shutil.rmtree(child)
+                except OSError:
+                    pass
         try:
-            child.unlink()
+            base.rmdir()
+            removed_dirs.append(str(base))
         except OSError:
             pass
-    try:
-        tdir.rmdir()
-    except OSError:
-        pass
     purged = purge_task_approvals(root, task["id"])
     log_event(root, "task_deleted", task_id=task["id"], gate=gate.get("reason"))
     return print_json({"task_id": task["id"], "deleted": True,
-                       "purged_approvals": purged})
+                       "dirs": removed_dirs, "purged_approvals": purged})
 
 
 def cmd_approve(root, args):
@@ -3279,14 +3848,18 @@ def cmd_policy(root, args):
             return print_json({"error": "passphrase_required", "restricted": restricted,
                                "detail": auth,
                                "hint": "改策略会重建信任基线（重封签），必须持口令："
-                                       "用 --passphrase-stdin 从标准输入提供一行"},
+                                       "用 --passphrase-stdin 从标准输入提供一行，例如 "
+                                       "echo 口令 | %s policy --set max_level L2 "
+                                       "--passphrase-stdin" % _cmd_prefix()},
                               EXIT_DENIED)
         unknown = sorted(k for k in changes if k not in POLICY_DEFAULTS)
         if unknown:
             return print_json({"error": "unknown_keys", "keys": unknown,
                                "allowed": sorted(POLICY_DEFAULTS),
-                               "hint": "只接受 allowed 里的键：ats.py policy --set <KEY> <VALUE>；"
-                                       "未知键不会写进 policy.json"},
+                               "hint": hint_command("只接受 allowed 里的键，未知键不会写进 "
+                                                    "policy.json；照下面的形式改一个已知键",
+                                                    "policy", "--set",
+                                                    "max_level", DEFAULT_MAX_LEVEL)},
                               EXIT_USAGE)
         path = Path(root) / "policy.json"
         stored = jread(path, {})
@@ -3301,7 +3874,9 @@ def cmd_policy(root, args):
                 except (TypeError, ValueError):
                     return print_json({"error": "bad_value", "key": key,
                                        "value": raw,
-                                       "hint": "该键需要整数：ats.py policy --set <KEY> <整数>"},
+                                       "hint": "该键需要整数，照这个形式复制：%s policy "
+                                               "--set approval_ttl_seconds 600"
+                                               % _cmd_prefix()},
                                       EXIT_USAGE)
             elif key == "approval_mode_by_level":
                 try:
@@ -3309,9 +3884,9 @@ def cmd_policy(root, args):
                 except (TypeError, ValueError):
                     return print_json({"error": "bad_value", "key": key,
                                        "value": raw,
-                                       "hint": "该键要 JSON 对象，如 "
-                                               'ats.py policy --set approval_mode_by_level '
-                                               '{"L2": "ask"}'},
+                                       "hint": "该键要 JSON 对象，照这个形式复制：%s policy "
+                                               "--set approval_mode_by_level "
+                                               '{"L2": "ask"}' % _cmd_prefix()},
                                       EXIT_USAGE)
                 if not isinstance(parsed, dict):
                     return print_json({"error": "bad_value", "key": key,
@@ -3359,7 +3934,8 @@ def cmd_policy(root, args):
         if rc != EXIT_OK or not sealed.get("ok"):
             return print_json({"error": "reseal_failed", "detail": sealed,
                                "hint": "policy.json 已写入但重封签失败，下次启动会被看门狗"
-                                       "拒绝；请人工执行 ats_guard.py seal --confirm"},
+                                       "拒绝；请人工执行 %s"
+                                       % guard_command("seal", "--confirm")},
                               EXIT_DENIED)
         _freeze_policy(root, force=True)
     pol = policy(root)
@@ -3543,32 +4119,37 @@ def cmd_extend_run(root, args):
             "reason": item["reason"], "detail": item["detail"],
             "problems": item["problems"], "error": "inactive_extend",
             "executed": False,
-            "hint": "非 active 插件不参与执行；按 problems 修好后再 run",
+            "hint": hint_command("非 active 插件不参与执行：按 problems 修好插件清单后再跑",
+                                  "extend", "check", args.extend_id),
         }, EXIT_DENIED)
     commands = item.get("commands") or {}
     if action is not None and action not in commands:
         return print_json({"error": "unknown_action", "extend_id": args.extend_id,
                            "action": action, "known": sorted(commands),
                            "executed": False,
-                           "hint": "用 ats.py extend help <extend_id> 看可用指令，"
-                                   "known 是当前清单"},
+                           "hint": hint_command("按 known 清单选一个指令，或先看该插件的可用指令",
+                                                "extend", "help", args.extend_id)},
                           EXIT_USAGE)
     argv = ats_extend.extend_argv(item, action, argv_args)
     text = ats_extend.gate_text(item, action, argv_args)
     if argv is None or text is None:
         return print_json({"error": "missing_entry_point", "extend_id": args.extend_id,
                            "executed": False,
-                           "hint": "入口缺失或越界：跑 ats.py extend check <extend_id> 看 problems"},
+                           "hint": hint_command("入口缺失或越界：看 problems 逐条修",
+                                                "extend", "check", args.extend_id)},
                           EXIT_CONFLICT)
     level, level_note = ats_extend.task_level(item)
 
     task_id = args.id or new_task_id()
     tdir = task_dir(root, task_id)
-    if (tdir / "task.json").exists() and not args.force:
+    if task_exists(root, task_id) and not args.force:
         return print_json({"error": "task_exists", "task_id": task_id,
-                           "hint": "换一个 --id，或对已存在的任务用 ats.py run <task_id>；"
-                                   "确认要覆盖加 --force"},
+                           "hint": hint_command("换一个 --id，或直接跑这个已存在的任务；"
+                                                "确认要覆盖加 --force",
+                                                "run", task_id)},
                           EXIT_CONFLICT)
+    if args.force:
+        purge_archive(root, task_id)
 
     timeout = args.timeout if args.timeout is not None else DEFAULT_TIMEOUT
     try:
@@ -3755,8 +4336,8 @@ def require_passphrase(root):
     """校验启动时从 stdin 读到的口令；缺失/错误都返回 fail-closed 的载荷。"""
     if not GUARD_PASSPHRASE:
         return {"ok": False, "error": "passphrase_missing",
-                "hint": "口令不能为空：用 --passphrase-stdin 从标准输入提供一行，"
-                        "或直接在终端里交互输入"}
+                "hint": "口令不能为空：本命令只从标准输入读口令，没有交互回退；"
+                        "由人加上 --passphrase-stdin，再粘贴一行口令后回车"}
     rc, payload = _run_guard(["auth"], root, GUARD_PASSPHRASE)
     return payload
 
@@ -3818,8 +4399,9 @@ def _guard_self_check(root):
                                    "manifest": str(_guard_manifest_path(root)),
                                    "hint": "看门狗自身与清单不符，它输出的「校验通过」"
                                            "不可信。请用 git 历史逐行比对 "
-                                           "ats_guard.py，确认改动来源后由人执行 "
-                                           "seal --confirm 重封签"}}}
+                                           "scripts/%s，确认改动来源后由人执行 %s"
+                                           " 重封签" % (GUARD_FILE,
+                                                       guard_command("seal", "--confirm"))}}}
 
 
 def _guard_skip_gate(root, approval_id):
@@ -3898,8 +4480,9 @@ def _guard_visa_gate(root, visa_id, verify_payload, files):
                             "detail": {"stage": "guard_visa", "visa_id": visa_id,
                                        "scope_type": scope_type, "files": files,
                                        "hint": "这张签证绑定的是具体任务/计划，不覆盖核心"
-                                               "脚本摘要不符。要么 seal --confirm 重封签，"
-                                               "要么由人签发一张 digest 签证"}}}
+                                               "脚本摘要不符。要么用 %s 重封签，"
+                                               "要么由人签发一张 digest 签证"
+                                               % guard_command("seal", "--confirm")}}}
     rc, result = _run_guard(["visa", "consume", "--id", visa_id], root)
     if rc != EXIT_OK or not result.get("ok"):
         log_event(root, "guard_visa_rejected", visa_id=visa_id, exit_code=rc,
@@ -3913,9 +4496,10 @@ def _guard_visa_gate(root, visa_id, verify_payload, files):
                                        "files": files,
                                        "verify": verify_payload,
                                        "hint": "签证不存在 / 已过期 / 配额耗尽，"
-                                               "本次命令不执行。由人重新执行 "
-                                               "ats_guard.py visa issue 签发新签证，"
-                                               "或 seal --confirm 重封签"}}}
+                                               "本次命令不执行。由人重新签发：%s，"
+                                               "或 %s 重封签"
+                                               % (guard_command("visa", "issue"),
+                                                  guard_command("seal", "--confirm"))}}}
     if result.get("destroyed"):
         # 子进程的 stderr 被 _run_guard 捕获了，这里补一条到父进程控制台
         sys.stderr.write("[Visa] 配额已耗尽，签证已销毁，"
@@ -4017,23 +4601,26 @@ def guard_handshake(root, skip_guard=False, guard_approval=None, visa_id=None):
                 log_event(root, "guard_visa_skipped", visa_id=visa_id, scope=scope)
             error = payload.get("error")
             if error == "manifest_missing" and payload.get("next_action") == "init":
-                hint = ("本 root 尚未建立信任根，本次命令不执行。由人先执行 "
-                        "ats_guard.py init --confirm 创建密钥，再执行 seal --confirm "
-                        "建立基线；两步都要口令")
+                hint = ("本 root 尚未建立信任根，本次命令不执行。由人先执行 %s 创建密钥，"
+                        "再执行 %s 建立基线；两步都要口令"
+                        % (guard_command("init", "--confirm"),
+                           guard_command("seal", "--confirm")))
             elif error == "manifest_missing":
-                hint = ("清单缺失但密钥仍在，本次命令不执行。由人执行 seal --confirm "
-                        "重新封签，口令须与 init 时一致")
+                hint = ("清单缺失但密钥仍在，本次命令不执行。由人执行 %s 重新封签，"
+                        "口令须与 init 时一致" % guard_command("seal", "--confirm"))
             elif payload.get("next_action") == "restore_key":
                 hint = ("密钥文件丢失，本次命令不执行，seal 也修不好（seal 要口令校验，"
                         "口令校验要读密钥）。本仓的 ats_guard_key.json 与 "
                         "ats_guard_manifest.json 当前未被 git 跟踪，无法从 git 恢复；"
                         "确认要全新开始，须由人先手动删除这两个文件，"
-                        "再重跑 init --confirm 与 seal --confirm")
+                        "再重跑 %s 与 %s"
+                        % (guard_command("init", "--confirm"),
+                           guard_command("seal", "--confirm")))
             else:
                 hint = ("核心脚本未通过看门狗校验，本次命令不执行。确认改动可信后由人执行 "
-                        "seal --confirm 重封签")
+                        "%s 重封签" % guard_command("seal", "--confirm"))
             if covered:
-                hint = (hint + "；若只是改了核心脚本、想先跑一轮测试，可带 --visa-id <id> "
+                hint = (hint + "；若只是改了核心脚本、想先跑一轮测试，可带 --visa-id 加签证 id "
                                 "或设环境变量 ATS_VISA_ID 使用人类签发的签证，"
                                 "每次握手消耗 1 次配额")
             return {"code": EXIT_DENIED,
@@ -4050,6 +4637,138 @@ def guard_handshake(root, skip_guard=False, guard_approval=None, visa_id=None):
 
 # ---------------------------------------------------------------- 输出与 CLI
 
+def _cmd_prefix(script=None):
+    """可复制命令的脚本前缀：约定从项目根目录调用，脚本在 scripts/ 下。
+
+    既有 resume 模板写的是 `python ats.py ...`（只有文件名），在项目根目录直接跑会
+    「找不到文件」。tutorial 字段一律补上 scripts/ 前缀，保证人能原样复制。
+    前缀只写相对路径，不带盘符或本机目录名 —— 这段输出会随仓库公开给所有人。
+    `script` 缺省取本文件（`ats.py`）；菜单切到 Plan 层时传 `ats_plan.py`，
+    这样打出来的仍是那一层真实的可复制命令。
+    """
+    return "python scripts/%s" % (script or Path(__file__).name)
+
+
+_PLACEHOLDER_RE = re.compile(r"<[a-z_]+>")
+
+
+def _resume_command(resume, approval_id=None, task_id=None):
+    """把 resume 模板转成可直接复制的命令。
+
+    三件事缺一不可：补 `scripts/` 前缀（否则在项目根目录跑会「找不到文件」）、
+    把 `<approval_id>` / `<task_id>` 换成真实值（占位符粘进终端只会报错）、
+    替换后仍有 `<...>` 就返回 None —— 宁可承认「这条不能直接复制」，
+    也不吐一条看起来能跑、实际要人手改的命令。
+    """
+    if not resume:
+        return None
+    text = str(resume).strip()
+    if approval_id:
+        text = text.replace("<approval_id>", str(approval_id))
+    if task_id:
+        text = text.replace("<task_id>", str(task_id))
+    for name in ("ats.py", "ats_plan.py", "ats_guard.py"):
+        text = text.replace("python " + name, "python scripts/" + name)
+    if _PLACEHOLDER_RE.search(text):
+        return None
+    return text
+
+
+def hint_command(text, *parts):
+    """把「下一步做什么」拼成一句：说明 + 一条能原样复制的命令。
+
+    command-ai.md 规则 2 要求 hint 里给的是命令而不是「去查文档」；这里统一收口，
+    前缀固定走 `_cmd_prefix()`，避免各处手写 `ats.py xxx` 漏掉 scripts/。
+    """
+    tail = " ".join(str(p) for p in parts if p is not None and str(p) != "")
+    return "%s：%s %s" % (str(text).rstrip("。：; "), _cmd_prefix(), tail)
+
+
+def guard_command(*parts):
+    """看门狗命令：同样带 scripts/ 前缀，供 hint 直接复制。
+
+    看门狗和 ats.py 同目录，前缀规则一致；单独一个函数是为了别把
+    `ats.py seal` 这种不存在的组合写出来。
+    """
+    tail = " ".join(str(p) for p in parts if p is not None and str(p) != "")
+    return "python scripts/%s %s" % (GUARD_FILE, tail)
+
+
+def tutorial(summary, commands, doc="command-human.md", extra=None):
+    """「报错即教程」的返回体片段：命令逐条可复制，变量已填好。
+
+    command-ai.md 规则 2 要求报错时必须给出人能直接粘的命令；只给 error 码的
+    返回体在防呆上等价于没报错，所以这里统一成一个结构，AI 直接照抄 commands。
+    """
+    out = {"summary": summary,
+           "commands": [c for c in commands if c],
+           "human_doc": doc}
+    if extra:
+        out.update(extra)
+    return out
+
+
+def abort_path(root):
+    return Path(root) / ABORT_FILE
+
+
+def read_abort(root):
+    """读取人类中止标志；文件损坏按「已中止」处理（fail-closed）。"""
+    path = abort_path(root)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:                    # noqa: BLE001
+        return {"reason": "abort 标志无法解析", "broken": True}
+    return data if isinstance(data, dict) else {"reason": "abort 标志格式不符", "broken": True}
+
+
+def cmd_abort(root, args):
+    """人类主动中止 / 解除中止（command-ai.md 规则 3）。
+
+    这个命令不走看门狗握手：它只读写一个标志文件，不做任何执行动作；若它也过握手，
+    核心脚本一改就会「人想解铃却被拦」，等于自己锁死自己。
+    """
+    path = abort_path(root)
+    if args.clear:
+        if not path.is_file():
+            return print_json({"ok": False, "error": "abort_not_set",
+                               "hint": "当前没有中止标志，无需解除",
+                               "path": str(path)}, EXIT_CONFLICT)
+        try:
+            path.unlink()
+        except OSError as exc:
+            return print_json({"error": "abort_clear_failed", "path": str(path),
+                               "detail": "%s: %s" % (type(exc).__name__, exc),
+                               "hint": "删除中止标志失败，可能是权限问题；"
+                                       "也可由人手动删除该文件",
+                               "tutorial": tutorial("中止标志删不掉，改由人手动删除",
+                                                    [], "command-human.md#场景4")},
+                              EXIT_CONFLICT)
+        log_event(root, "human_abort_cleared", path=str(path))
+        return print_json({"ok": True, "cleared": True, "path": str(path),
+                           "note": "已解除中止，AI 可以继续接单"})
+    reason = (args.reason or "").strip() or "人类主动中止（未填原因）"
+    previous = read_abort(root)
+    record = {"reason": reason, "at": now_ts(), "iso": iso(),
+              "by": "human-cli", "previous_reason": (previous or {}).get("reason")}
+    root_p = Path(root)
+    root_p.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+    log_event(root, "human_abort_set", reason=reason)
+    return print_json({"ok": True, "abort": record, "path": str(path),
+                       "note": "已中止：除 abort / supervise 外的命令都会返回 exit_code=%d"
+                               % EXIT_HUMAN_ABORT,
+                       "resume": "%s abort --clear" % _cmd_prefix(),
+                       "tutorial": tutorial(
+                           "AI 已被急停，恢复前它不会执行任何命令",
+                           ["%s abort --clear" % _cmd_prefix()],
+                           "command-human.md#场景4")})
+
+
 def print_json(data, code=EXIT_OK):
     print(json.dumps(data, ensure_ascii=False, indent=2))
     return code
@@ -4061,7 +4780,7 @@ def build_parser():
         description="agent-task-scheduler — Task 层执行器 (v4.0.0-R0)",
     )
     ap.add_argument("--root", default=None,
-                    help="状态根目录，默认 <ats 本体目录>/.ats（即 OCSKIS/.ats）；"
+                    help="状态根目录，默认 <ats 本体目录>/.ats（即仓库根目录下的 .ats）；"
                          "也可用环境变量 ATS_ROOT 指定")
     sub = ap.add_subparsers(dest="command_name")
 
@@ -4241,6 +4960,28 @@ def build_parser():
     p.add_argument("--task-id", dest="task_id", default=None)
     p.add_argument("--plan-id", dest="plan_id", default=None)
 
+    p = sub.add_parser("abort", help="人类主动中止 / 解除中止（给 AI 的急停开关）")
+    p.add_argument("--reason", default=None, help="中止原因，写进 abort.json 供事后追溯")
+    p.add_argument("--clear", action="store_true", help="解除中止，恢复接单")
+
+    p = sub.add_parser("unpack", help="停机进维护态（停任务、释放句柄、只放行维护命令）")
+    p.add_argument("--confirm", action="store_true",
+                   help="确认停机：运行中任务会被判为 killed，需口令")
+    p.add_argument("--exit", action="store_true", help="退出维护态，恢复准入（不重封签）")
+    p.add_argument("--reason", default=None, help="停机原因，写进 maintenance.json")
+
+    p = sub.add_parser("tryrun", help="维护态下跑命令自测（次数不限，窗口外拒绝）")
+    p.add_argument("--timeout", type=int, default=None,
+                   help="秒；默认 %d" % TRYRUN_TIMEOUT_DEFAULT)
+    p.add_argument("--cwd", default=None, help="工作目录，默认 <root>")
+    p.add_argument("--no-shell", action="store_true", help="不走 shell，按参数逐个传入")
+    p.add_argument("command", nargs=argparse.REMAINDER,
+                   help="-- 之后的命令原文")
+
+    p = sub.add_parser("repack", help="维护态下重建封签基线（不带 --confirm 只出 Diff）")
+    p.add_argument("--confirm", action="store_true",
+                   help="确认重建：校验口令后 seal，等价 ats_guard.py seal --confirm")
+
     return ap
 
 
@@ -4281,7 +5022,7 @@ def _visa_target_plan(root, plan_id):
     sdir, pdir = planmod.resolve_plan(root, plan_id)
     if pdir is None:
         return None, {"error": "plan_not_found", "plan_id": plan_id,
-                      "hint": "先 ats_plan.py list 确认 plan_id 拼写"}
+                      "hint": "先列出计划确认 plan_id 拼写：python scripts/ats_plan.py list"}
     plan = planmod.load_plan(pdir) or {}
     errors = planmod.validate_spec(plan)
     if errors:
@@ -4370,7 +5111,194 @@ HANDLERS = {
     "policy": cmd_policy,
     "extend": cmd_extend,
     "visa": cmd_visa,
+    "abort": cmd_abort,
+    "unpack": cmd_unpack,
+    "tryrun": cmd_tryrun,
+    "repack": cmd_repack,
 }
+
+
+def _dispatch(root, args):
+    """执行子命令；退出 0 时把战情看板打到终端最上方。
+
+    子命令的 stdout 先落进缓冲区，等看板写进 stderr 之后再原样吐出，于是终端里
+    看板在上、JSON 在下。缓冲区是必要的：stdout 是 AI 的机器接口（json.loads），
+    绝不能混进表格；看板走 stderr，两边互不污染。
+    """
+    handler = HANDLERS[args.command_name]
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            code = handler(root, args) or EXIT_OK
+    except BaseException:
+        sys.stdout.write(buf.getvalue())
+        raise
+    if code == EXIT_OK and args.command_name not in BOARD_SKIP:
+        emit_board(root)
+    sys.stdout.write(buf.getvalue())
+    return code
+
+
+MENU_GROUPS = (
+    ("看一眼现状", ("list", "show", "status", "check", "events", "logs", "policy")),
+    ("跑任务", ("create", "run", "pack", "download", "torrent")),
+    ("审批与通行", ("approve", "approval", "visa", "abort", "stop", "delete")),
+    ("维护与扩展", ("unpack", "tryrun", "repack", "extend")),
+)
+MENU_SKIP = ("supervise",)          # run 派生的内部进程，手敲没有意义
+
+PLAN_GROUPS = (
+    ("提交与执行", ("submit_plan", "submit_schedule", "run_plan", "resume")),
+    ("周期驱动", ("check_schedule", "pause", "resume_schedule", "cancel")),
+    ("重跑与回看", ("rerun_task", "rerun_plan", "history", "prune")),
+    ("查看与清理", ("list", "show", "delete")),
+)
+
+
+def _menu_hints(parser):
+    """从 argparse 的 subparsers 取「命令 -> 一句话说明」，不另抄一份文案。"""
+    hints = {}
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for choice in action._choices_actions:
+                hints[choice.dest] = (choice.help or "").strip()
+    return hints
+
+
+def _menu_groups(handlers, groups, skip=()):
+    """按给定分组表排；handlers 里新增但没归类的命令自动落进「其它」。"""
+    rows_all, covered = [], set()
+    for title, names in groups:
+        rows = [n for n in names if n in handlers and n not in skip]
+        if rows:
+            rows_all.append((title, rows))
+            covered.update(rows)
+    rest = [n for n in handlers if n not in covered and n not in skip]
+    if rest:
+        rows_all.append(("其它", rest))
+    return rows_all
+
+
+def _menu_layer(layer, parser=None):
+    """菜单层：task 层用本文件的 parser，plan 层懒加载 ats_plan 的 parser。
+
+    两层命令表各自独立（`MENU_GROUPS` / `PLAN_GROUPS`），说明文案一律从各自的
+    argparse subparsers 现取，所以任何一层新增子命令都不会漏出菜单。
+    plan 层延迟到人真的切过去时才导入：`ats_plan` 反向 `import ats`，
+    顶层互相导入会成环（见 `_plan_module()`）。
+    """
+    if layer == "plan":
+        mod = _plan_module()
+        ap = mod.build_parser()
+        return {
+            "title": "Plan / Schedule 层 —— ats_plan.py",
+            "parser": ap,
+            "hints": _menu_hints(ap),
+            "groups": _menu_groups(mod.HANDLERS, PLAN_GROUPS),
+            "exec": mod.main,
+            "prefix": "ats_plan.py",
+            "switch": ("t", "task", "回到 Task 层（ats.py）"),
+        }
+    ap = parser or build_parser()
+    return {
+        "title": "Task 层 —— ats.py",
+        "parser": ap,
+        "hints": _menu_hints(ap),
+        "groups": _menu_groups(HANDLERS, MENU_GROUPS, MENU_SKIP),
+        "exec": main,
+        "prefix": "ats.py",
+        "switch": ("p", "plan", "切到 Plan / Schedule 层（ats_plan.py）"),
+    }
+
+
+def _menu_available():
+    """菜单只在真终端里开。
+
+    `stdin.isatty()` 单独不可信：实测 AI 通道它同样是 True，此时 `input()` 会去读
+    控制台并永久阻塞。所以要求 stdin 与 stdout 同时是终端 —— 输出被管道抓取时
+    stdout 为 False，自动退回「打 usage、退出 2」的老行为。置 `ATS_NO_MENU`
+    为任意非空值可强制退回老行为。
+    """
+    if (os.environ.get("ATS_NO_MENU") or "").strip():
+        return False
+    try:
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except Exception:                # noqa: BLE001
+        return False
+
+
+def _menu_read(prompt):
+    """读一行；EOF 与 Ctrl-C 返回 None，由调用方安静退出（不报用法错误）。"""
+    try:
+        return input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+
+
+def _menu_args(text):
+    """按 shell 习惯切参数（认引号）；引号没配平就退化为按空白切。"""
+    try:
+        return shlex.split(text)
+    except ValueError:
+        return text.split()
+
+
+def run_menu(parser, root_args=(), layer="task"):
+    """无子命令时的交互菜单：选编号看用法，也可以当场执行。
+
+    两层来回切：`p` 去 Plan / Schedule 层（ats_plan.py 的 15 条），`t` 回 Task 层。
+    q / EOF / Ctrl-C 一律退出 0 —— 人主动离开菜单不算用法错误。
+    执行走的是对应层自己的 `main()`，看门狗、审批门、口令闸门一行都不放宽。
+    """
+    spec = _menu_layer(layer, parser if layer == "task" else None)
+    while True:
+        groups = spec["groups"]
+        flat = [name for _, rows in groups for name in rows]
+        print()
+        print("%s —— 输入编号查看用法，q 退出" % spec["title"])
+        n = 0
+        for title, rows in groups:
+            print("  %s" % title)
+            for name in rows:
+                n += 1
+                print("   %2d) %-15s %s" % (n, name, spec["hints"].get(name, "")))
+        key, target, label = spec["switch"]
+        print("   %s) %s" % (key, label))
+        line = _menu_read("编号> ")
+        if line is None:
+            return EXIT_OK
+        token = line.strip().lower()
+        if token in ("q", "quit", "exit", "0"):
+            return EXIT_OK
+        if token == key:
+            spec = _menu_layer(target, parser if target == "task" else None)
+            continue
+        if not token.isdigit() or not 1 <= int(token) <= len(flat):
+            print("  没有这个编号 %r：输入 1-%d、%s 切换层，或 q 退出"
+                  % (line.strip(), len(flat), key))
+            continue
+        name = flat[int(token) - 1]
+        print()
+        try:
+            spec["parser"].parse_args([name, "--help"])
+        except SystemExit:
+            pass
+        answer = _menu_read("  现在就执行 %s 吗？[y/N]: " % name)
+        if answer is None:
+            return EXIT_OK
+        if answer.strip().lower() not in ("y", "yes", "是"):
+            continue
+        extra = _menu_read("  参数（可留空）> ")
+        if extra is None:
+            return EXIT_OK
+        argv = list(root_args) + [name] + _menu_args(extra)
+        print("  $ %s %s" % (_cmd_prefix(spec["prefix"]), " ".join(argv)))
+        try:
+            spec["exec"](argv)
+        except SystemExit as exc:
+            print("  （已退出，退出码 %s）"
+                  % (exc.code if isinstance(exc.code, int) else EXIT_USAGE))
 
 
 def main(argv=None):
@@ -4383,13 +5311,67 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     if not args.command_name:
+        # 真终端里进交互菜单（选编号看用法，也可当场执行）；输出被管道抓取时
+        # 仍是老行为：打 usage、退出 2。判据见 _menu_available()。
+        if _menu_available():
+            return run_menu(parser,
+                            root_args=(["--root", args.root] if args.root else ()))
         parser.print_help()
         return EXIT_USAGE
     if args.command_name == "approve" and not args.all and not args.approval_id:
         print(json.dumps({"error": "missing_approval_id",
-                          "hint": "使用 approve <id>... 或 --all"}, ensure_ascii=False))
+                          "hint": hint_command("要批准全部待办就加 --all；"
+                                               "只批指定几条就先用事件流查出 approval_id",
+                                               "events", "--json")},
+                         ensure_ascii=False))
         return EXIT_USAGE
     root = ats_root(_pre_scan_root(argv) or args.root)
+    halted = read_abort(root)
+    if halted is not None and args.command_name not in ABORT_EXEMPT:
+        # 急停的优先级高于看门狗准入：代码改没改是次要的，人已经喊停了。
+        # 只豁免 abort（否则标志一落下就没人能解铃）。
+        return print_json({
+            "ok": False,
+            "error": "human_abort",
+            "exit_code": EXIT_HUMAN_ABORT,
+            "reason": halted.get("reason"),
+            "at": halted.get("at"),
+            "hint": "人类已主动中止。这不是权限问题也不是脚本坏了，重试没有意义；"
+                    "等人类解除中止后再接单。",
+            "abort_broken": bool(halted.get("broken")),
+            "resume": "%s abort --clear" % _cmd_prefix(),
+            "tutorial": tutorial("人类已按下急停，恢复前除 abort 外一律拒绝",
+                                 ["%s abort --clear" % _cmd_prefix()],
+                                 "command-human.md#场景4"),
+        }, EXIT_DENIED)
+    if args.command_name == "abort":
+        # 完全跳过握手：abort 只读写一个标志文件，不做任何执行动作。
+        # 若它也过握手，核心脚本一改就会「人想解铃却被拦」，自己锁死自己；
+        # 且握手会持句柄、冻结策略、可能扣签证配额，对一个纯标志操作毫无意义。
+        return cmd_abort(root, args) or EXIT_OK
+    maintenance = read_maintenance(root)
+    if maintenance is not None:
+        # 维护态下核心脚本可能已被改动，握手必失败；放行维护命令与只读命令，
+        # 其余执行类命令一律拒绝。窗口由人类带口令开启，风险由人显式承担。
+        if args.command_name not in MAINTENANCE_ALLOWED:
+            return print_json({
+                "ok": False,
+                "error": "maintenance_mode",
+                "exit_code": EXIT_DENIED,
+                "maintenance": maintenance,
+                "hint": "维护态下执行类命令一律拒绝，只放行 unpack / repack / tryrun "
+                        "与只读命令。改完代码由人执行 repack --confirm 重建基线，"
+                        "或 unpack --exit 直接退出维护态",
+                "resume": "%s repack --confirm" % _cmd_prefix(),
+                "tutorial": tutorial("维护态已生效，执行类命令被拦",
+                                     ["%s tryrun -- \"<命令>\"" % _cmd_prefix(),
+                                      "%s repack --confirm" % _cmd_prefix(),
+                                      "%s unpack --exit" % _cmd_prefix()],
+                                     "command-human.md#场景5"),
+            }, EXIT_DENIED)
+        log_event(root, "guard_bypassed_for_%s" % args.command_name,
+                  reason="maintenance_mode")
+        return _dispatch(root, args)
     denied = guard_handshake(root, skip_guard=skip_guard, guard_approval=guard_approval,
                              visa_id=visa_id)
     if denied is not None:
@@ -4405,8 +5387,7 @@ def main(argv=None):
         log_event(root, "guard_bypassed_for_%s" % args.command_name,
                   action=getattr(args, "visa_action", None),
                   stage=(denied["payload"].get("detail") or {}).get("stage"))
-    handler = HANDLERS[args.command_name]
-    return handler(root, args) or EXIT_OK
+    return _dispatch(root, args)
 
 
 

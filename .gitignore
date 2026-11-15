@@ -17,9 +17,20 @@ venv/
 # enter the repo. Everything here is ignored on purpose.
 temp/
 
+# 重构版工作区（restdesa）：只有说明文档进 git，代码副本与状态不进。
+# 实测：restdesa 下 3 个 *.md 已被 git 跟踪，所以不能整目录忽略。
+restdesa/scripts/
+restdesa/tests/
+restdesa/references/
+restdesa/.ats/
+
 # Raw conversation transcripts used for context recovery (2.8 MB, machine-local).
 # Kept on disk for reference; they must not bloat the shipped repo.
 tests/split/
+
+# Follow-up option list: a machine-local scratch memo of "could do, not done".
+# It changes every session and carries no shipped value, so keep it out of the repo.
+NEXT-OPTIONS.md
 
 # Backups
 *.bak
