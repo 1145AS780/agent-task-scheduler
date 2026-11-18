@@ -3211,7 +3211,7 @@ def http_call(method, url, payload=None, token=None, timeout=10):
 class UiServer:
     """在沙箱里跑一个真实的 ats_ui.py 进程，用例结束务必 stop()。"""
 
-    def __init__(self, sb, token_file=None, host="127.0.0.1"):
+    def __init__(self, sb, token_file=None, host="127.0.0.1", extra_env=None):
         self.port = free_port()
         self.base = "http://127.0.0.1:%d" % self.port
         self.log = sb.dir / ("ui-%d.log" % self.port)
@@ -3223,6 +3223,9 @@ class UiServer:
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUTF8"] = "1"
         env["PYTHONDONTWRITEBYTECODE"] = "1"
+        env["PYTHONUNBUFFERED"] = "1"       # 子进程输出直落日志，卡住时才能看出停在哪一步
+        if extra_env:
+            env.update(extra_env)
         self._fh = open(self.log, "w", encoding="utf-8")
         self.proc = subprocess.Popen(args, stdout=self._fh, stderr=subprocess.STDOUT,
                                      env=env, cwd=str(sb.dir))
@@ -3368,6 +3371,40 @@ def ui_loopback_without_token():
         expect('"auth": false' in page, "页面应知道当前没开鉴权")
     finally:
         srv.stop()
+        sb.cleanup()
+
+
+@case
+def ui_boots_even_when_dns_hangs():
+    """DNS 不通时 getfqdn 会卡几十秒，而它在 listen() 之前跑。
+
+    典型现场是 macOS runner：进程活着、日志空白、端口一直不应答，30s 后测试报
+    「未就绪」。这里用 sitecustomize 把 getfqdn 拖成 30s，模拟同一现场，验证面板
+    不依赖它也能秒起。
+    """
+    sb = Sandbox()
+    srv = None
+    hook = sb.dir / "slowdns"
+    hook.mkdir()
+    (hook / "sitecustomize.py").write_text(
+        "import socket, time\n"
+        "_orig = socket.getfqdn\n"
+        "def _slow(name=None):\n"
+        "    time.sleep(30)\n"
+        "    return _orig(name)\n"
+        "socket.getfqdn = _slow\n",
+        encoding="utf-8")
+    try:
+        srv = UiServer(sb, extra_env={"PYTHONPATH": str(hook)})
+        started = time.time()
+        srv.wait(timeout=10)
+        cost = time.time() - started
+        expect(cost < 10, "getfqdn 卡 30s 时面板仍应秒起，实际用了 %.1fs" % cost)
+        code, _ = http_call("GET", srv.base + "/api/ping")
+        expect(code == 200, "就绪后 /api/ping 应 200，实际 %s" % code)
+    finally:
+        if srv is not None:
+            srv.stop()
         sb.cleanup()
 
 

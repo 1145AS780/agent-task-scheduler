@@ -15,6 +15,7 @@ import hmac
 import json
 import os
 import secrets
+import socketserver
 import subprocess
 import sys
 import threading
@@ -1989,6 +1990,21 @@ refresh();
 """
 
 
+class UiHttpServer(ThreadingHTTPServer):
+    """跳过 HTTPServer.server_bind 里的 socket.getfqdn()。
+
+    getfqdn 会先做反向解析再正查，DNS/mDNS 不通时（典型是 macOS runner）能卡住
+    几十秒；而它发生在 listen() 之前，表现就是「进程活着、端口不应答、日志一片空白」。
+    server_name 只影响响应里的默认主机名，本面板一律用请求自带的 Host，不需要它。
+    """
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "AtsUI/" + HTTP_VERSION
@@ -2279,7 +2295,7 @@ def serve(root, host, port, open_browser, log_path=None, mcp_port=None, token_fi
     if not (Path(root) / "tasks").exists() and not (Path(root) / "schedules").exists():
         print("提示：%s 下还没有 tasks/ 或 schedules/，界面会监听后续变化" % root)
     try:
-        httpd = ThreadingHTTPServer((host, port), Handler)
+        httpd = UiHttpServer((host, port), Handler)
     except OSError as exc:
         print("无法监听 %s:%d —— %s" % (host, port, exc))
         print("若已有实例在运行，请用 --ensure 复用；否则换 --port。")

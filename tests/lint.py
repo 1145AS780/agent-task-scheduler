@@ -94,6 +94,32 @@ def check_actionable_error(f):
                         % (f.relative_to(REPO), node.lineno))
 
 
+def check_py39_path_newline(f):
+    """Path.read_text/write_text 的 newline 参数是 Python 3.10 才加的。
+
+    CI 的 lint 与 py3.9 的 test 都跑在 3.9 上，这行在 3.9 会直接 TypeError，而
+    compileall 与语法检查都看不出来 —— 只能靠 AST 拦。要固定换行就写
+    open(..., newline="\\n") 或自己替换，别用 3.10 才有的便利参数。
+    """
+    try:
+        tree = compile(f.read_bytes(), str(f), "exec", ast.PyCF_ONLY_AST)
+    except (SyntaxError, ValueError):
+        return                       # 语法错误已由 check_compiles 报过，不重复报
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute):
+            continue
+        if func.attr not in ("read_text", "write_text"):
+            continue
+        for kw in node.keywords:
+            if kw.arg == "newline":
+                problems.append("%s:%d: %s(newline=...) 是 Python 3.10 才有的参数，"
+                                "3.9 上会 TypeError —— 改用 open(..., newline=\"\\n\")"
+                                % (f.relative_to(REPO), node.lineno, func.attr))
+
+
 def utf8_console():
     """把 stdout/stderr 切到 UTF-8，避免 Windows 管道下打印中文抛 UnicodeEncodeError。"""
     for stream in (sys.stdout, sys.stderr):
@@ -118,6 +144,7 @@ def main():
         check_trailing_ws(f)
         check_final_newline(f)
         check_actionable_error(f)
+        check_py39_path_newline(f)
 
     if problems:
         for p in problems:

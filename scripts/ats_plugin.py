@@ -975,7 +975,8 @@ def scaffold(plugin_id, force=False):
     try:
         for path, content in files.items():
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content, encoding="utf-8", newline="\n")
+            with path.open("w", encoding="utf-8", newline="\n") as fh:
+                fh.write(content)
             written.append(str(path))
     except OSError as exc:
         return ({"error": "scaffold_write_failed", "plugin_id": text,
