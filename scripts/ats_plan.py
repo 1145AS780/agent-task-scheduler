@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""agent-task-scheduler — Plan / Schedule 层执行器 (v4.0.0-R0)
+"""agent-task-scheduler — Plan / Schedule 层执行器 (v0.3.1.1：w17vbc)
 
 命令：
   submit_plan --spec plan.json [--id ID]
@@ -30,10 +30,17 @@ Plan spec：
        "steps": [
          {"id": "one", "command": "...", "cwd": null, "level": "L1",
           "timeout": 600, "depends_on": "zero",
-          "retry": 1, "retry_backoff": 5, "idempotent": false, "critical": false}
+          "retry": 1, "retry_backoff": 5, "idempotent": false, "critical": false,
+          "on_failure": "two"}
        ]}
     ]
   }
+
+Step 级 `on_failure`（可选）：本 Step 最终 failed/timeout（重试耗尽）时，把 `on_failure`
+指向的同 Stage 步骤唤醒为 pending 并照常走权限门执行；该兜底步骤对被触发的这一步免除
+depends_on 要求（失败正是唤醒理由）。同一兜底步骤只能被一个步骤引用，且不得自指；
+兜底链深度记在 step.json 的 `fallback_chain`，超过 MAX_FALLBACK_DEPTH 不再唤醒，
+Stage 直接 failed(error_type=fallback_depth_exceeded)。
 
 Schedule spec：
   {"id": "p1", "every": 3600, "plan": "plan.json",
@@ -74,6 +81,7 @@ TERMINAL_STEP = ("succeeded", "failed", "timeout", "skipped")
 FAILED_STEP = ("failed", "timeout")
 POLL_STALLED = 30
 MAX_WAVES = 1000
+MAX_FALLBACK_DEPTH = 5
 
 
 # ---------------------------------------------------------------- 通用
@@ -195,6 +203,36 @@ def find_step(stage, step_id):
     return None
 
 
+def fallback_map(stage) -> dict:
+    """{兜底步骤 id: 触发它的步骤 id}；同一兜底被多处引用时保留首个（validate_spec 已拒重）。"""
+    out = {}
+    for step in stage.get("steps") or []:
+        if isinstance(step, dict) and step.get("on_failure"):
+            out.setdefault(str(step["on_failure"]), step.get("id"))
+    return out
+
+
+def fallback_cycle(steps):
+    """沿 `on_failure` 边找环，返回环路径（如 ["a", "b", "a"]），无环返回 None。
+
+    自指已由 `on_failure_self` 单独拒绝，这里只查长度 ≥2 的环。之所以在提交阶段就拒，
+    是因为环上的每个步骤都是别人的兜底：谁都不进待办，Stage 会一步不跑却报 `done`。
+    """
+    edges = {}
+    for step in steps:
+        if isinstance(step, dict) and step.get("id") and step.get("on_failure"):
+            edges[str(step.get("id"))] = str(step.get("on_failure"))
+    for start in edges:
+        path = [start]
+        cur = start
+        while cur in edges:
+            cur = edges[cur]
+            if cur in path:
+                return path[path.index(cur):] + [cur]
+            path.append(cur)
+    return None
+
+
 def order_steps(steps) -> list:
     """Kahn 拓扑排序；返回长度小于有效 step 数说明存在环。无依赖时保持声明顺序。"""
     valid = [s for s in steps if isinstance(s, dict) and s.get("id")]
@@ -306,6 +344,35 @@ def validate_spec(spec, root=None):
                 elif dep_id not in stage_ids:
                     errors.append("stage[%s].step[%s].depends_on_unknown:%s"
                                   % (stage_id, step.get("id"), dep_id))
+        seen_targets = {}
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            target = step.get("on_failure")
+            if target is None:
+                continue
+            if not isinstance(target, str) or not target.strip():
+                errors.append("stage[%s].step[%s].on_failure_invalid"
+                              % (stage_id, step.get("id")))
+                continue
+            if target == step.get("id"):
+                errors.append("stage[%s].step[%s].on_failure_self"
+                              % (stage_id, step.get("id")))
+                continue
+            if target not in stage_ids:
+                errors.append("stage[%s].step[%s].on_failure_unknown:%s"
+                              % (stage_id, step.get("id"), target))
+                continue
+            if target in seen_targets:
+                # 同一兜底被两个步骤引用时「谁触发」不可判定，宁可拒绝也不猜
+                errors.append("stage[%s].step[%s].on_failure_target_duplicate:%s"
+                              % (stage_id, step.get("id"), target))
+                continue
+            seen_targets[target] = step.get("id")
+        cycle = fallback_cycle(steps)
+        if cycle:
+            errors.append("stage[%s].fallback_cycle:%s"
+                          % (stage_id, "->".join(cycle)))
         if len(order_steps(steps)) < len([s for s in steps if isinstance(s, dict) and s.get("id")]):
             errors.append("stage[%s].depends_on_cycle" % stage_id)
     return errors
@@ -320,6 +387,10 @@ def plan_fingerprint(plan):
 
     归一化只做两件不改变语义的事：depends_on 统一成字符串列表并排序、env 键排序。
     其余字段逐字进入哈希，所以改命令、改等级、改依赖都会让指纹变，签证自动失效。
+
+    `on_failure`（Step 级兜底）改变「失败后跑什么」，属于行为字段，必须进指纹；
+    但只在声明了才写入投影 —— 否则未用该字段的既有 Plan 指纹会集体变化，
+    把存量签证无谓地全部作废。
     """
     stages = []
     for stage in (plan.get("stages") or []):
@@ -330,7 +401,7 @@ def plan_fingerprint(plan):
             if not isinstance(step, dict):
                 continue
             env = step.get("env") or {}
-            steps.append({
+            entry = {
                 "id": step.get("id"),
                 "command": step.get("command"),
                 "level": str(step.get("level") or ats.DEFAULT_TASK_LEVEL).upper(),
@@ -341,7 +412,10 @@ def plan_fingerprint(plan):
                 "cwd": step.get("cwd") or None,
                 "env": {str(k): str(v) for k, v in sorted(env.items())}
                        if isinstance(env, dict) else {},
-            })
+            }
+            if step.get("on_failure"):
+                entry["on_failure"] = step.get("on_failure")
+            steps.append(entry)
         stages.append({"id": stage.get("id"),
                        "mode": stage.get("mode", "serial"),
                        "steps": steps})
@@ -401,6 +475,10 @@ def default_step_state(step):
         "skipped_by": None,
         "blocked_by": None,
         "dependency_status": None,
+        "fallback_of": None,
+        "fallback_armed": False,
+        "fallback_chain": 0,
+        "fallback_armed_at": None,
     }
 
 
@@ -465,6 +543,8 @@ def materialize_plan(root, sdir, spec, plan_id=None, attempt=1):
 # ---------------------------------------------------------------- 依赖执行
 
 def stage_todo(pdir, stage):
+    """可推进步骤。兜底步骤平时挂起，只有被触发（fallback_armed）后才进入待办。"""
+    fallbacks = fallback_map(stage)
     todo = []
     for step in stage.get("steps") or []:
         state = load_step(pdir, stage.get("id"), step.get("id"))
@@ -472,14 +552,20 @@ def stage_todo(pdir, stage):
             continue
         if state.get("status") == "running":
             continue
+        if step.get("id") in fallbacks and not state.get("fallback_armed"):
+            continue
         todo.append((step, state))
     return todo
 
 
 def deps_ready(pdir, stage, step):
+    """依赖是否全部成功。兜底步骤对「触发它的那一步」免除依赖要求：那一步失败正是唤醒理由。"""
+    trigger = fallback_map(stage).get(step.get("id"))
     for dep_id in step_deps(step):
         dep = find_step(stage, dep_id)
         if not dep:
+            continue
+        if trigger and dep_id == trigger:
             continue
         state = load_step(pdir, stage.get("id"), dep_id)
         if state.get("status") != "succeeded":
@@ -490,6 +576,7 @@ def deps_ready(pdir, stage, step):
 def skip_dependents(root, pdir, sdir, plan, stage, todo):
     """依赖失败/超时/跳过时，把下游 step 标记 skipped(dependency)。"""
     changed = False
+    fallbacks = fallback_map(stage)
     for step, state in todo:
         deps = step_deps(step)
         if not deps:
@@ -498,6 +585,9 @@ def skip_dependents(root, pdir, sdir, plan, stage, todo):
         for candidate in deps:
             dep = find_step(stage, candidate)
             if not dep:
+                continue
+            if fallbacks.get(step.get("id")) == candidate:
+                # 兜底步骤不因触发步骤失败而跳过：失败正是它被唤醒的理由
                 continue
             status = load_step(pdir, stage.get("id"), candidate).get("status")
             if status in FAILED_STEP + ("skipped",):
@@ -518,6 +608,75 @@ def skip_dependents(root, pdir, sdir, plan, stage, todo):
         plan_log(root, plan, "task_skipped", stage_id=stage.get("id"),
                  step_id=step.get("id"), skipped_by="dependency",
                  blocked_by=dep_id, dependency_status=dep_status)
+        changed = True
+    return changed
+
+
+def arm_fallbacks(root, pdir, sdir, plan, stage):
+    """触发步骤最终失败/超时（重试已耗尽）时，唤醒它声明的 on_failure 兜底步骤。
+
+    返回 (armed, exceeded)。exceeded 非空表示兜底链超过 MAX_FALLBACK_DEPTH：
+    此时不唤醒，由调用方按 fail_on_critical 熔断整个 Stage，避免无限套娃。
+    """
+    armed, exceeded = [], []
+    sid = stage.get("id")
+    for step in stage.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        target = step.get("on_failure")
+        if not target:
+            continue
+        trigger = load_step(pdir, sid, step.get("id"))
+        if trigger.get("status") not in FAILED_STEP:
+            continue
+        fb_state = load_step(pdir, sid, target)
+        if fb_state.get("fallback_armed"):
+            continue
+        if fb_state.get("status") in TERMINAL_STEP:
+            continue
+        depth = int(trigger.get("fallback_chain") or 0) + 1
+        if depth > MAX_FALLBACK_DEPTH:
+            exceeded.append({"step_id": step.get("id"), "fallback": target,
+                             "depth": depth, "limit": MAX_FALLBACK_DEPTH})
+            continue
+        fb_state.update({"status": "pending", "attempts": 0, "exit_code": None,
+                         "started_at": None, "ended_at": None,
+                         "stall_delivered": False, "skipped_by": None,
+                         "blocked_by": None, "dependency_status": None,
+                         "fallback_of": step.get("id"), "fallback_armed": True,
+                         "fallback_chain": depth,
+                         "fallback_armed_at": now_ts()})
+        save_step(pdir, sid, target, fb_state)
+        armed.append(target)
+        emit(sdir, {"type": "fallback_armed", "schedule_id": Path(sdir).name,
+                    "plan_id": plan.get("id"), "stage_id": sid,
+                    "step_id": target, "fallback_of": step.get("id"),
+                    "trigger_status": trigger.get("status"), "depth": depth})
+        plan_log(root, plan, "fallback_armed", stage_id=sid, step_id=target,
+                 fallback_of=step.get("id"),
+                 trigger_status=trigger.get("status"), depth=depth)
+    return armed, exceeded
+
+
+def mark_untriggered_fallbacks(root, pdir, sdir, plan, stage):
+    """Stage 正常收尾时，把始终没被唤醒的兜底步骤标 skipped(fallback_untriggered)。
+
+    否则它们会永远停在 pending：既不算失败、也不进 todo，`show` 里看着像卡住。
+    """
+    changed = False
+    sid = stage.get("id")
+    for target in fallback_map(stage):
+        state = load_step(pdir, sid, target)
+        if state.get("fallback_armed") or state.get("status") in TERMINAL_STEP:
+            continue
+        state.update({"status": "skipped", "skipped_by": "fallback_untriggered",
+                      "ended_at": now_ts()})
+        save_step(pdir, sid, target, state)
+        emit(sdir, {"type": "task_skipped", "schedule_id": Path(sdir).name,
+                    "plan_id": plan.get("id"), "stage_id": sid,
+                    "step_id": target, "skipped_by": "fallback_untriggered"})
+        plan_log(root, plan, "task_skipped", stage_id=sid, step_id=target,
+                 skipped_by="fallback_untriggered")
         changed = True
     return changed
 
@@ -932,6 +1091,29 @@ def run_stage(root, sdir, plan, stage, approval, fail_fast=False):
     # 波次数跨 pause/resume 累加：暂停前的轮次已落盘在 stage.json
     waves = int(stage_state.get("waves") or 0)
     while waves < MAX_WAVES:
+        # 兜底唤醒放在波次开头：既覆盖「上一轮刚失败」，也覆盖「只剩兜底待跑」——
+        # 若等取完 todo 再唤醒，stage_todo 为空会先 break，兜底永远等不到执行。
+        _armed, exceeded = arm_fallbacks(root, pdir, sdir, plan, stage)
+        if exceeded:
+            for item in exceeded:
+                emit(sdir, {"type": "fallback_depth_exceeded",
+                            "schedule_id": Path(sdir).name,
+                            "plan_id": plan.get("id"), "stage_id": stage_id,
+                            "step_id": item["step_id"],
+                            "fallback": item["fallback"], "depth": item["depth"],
+                            "limit": item["limit"]})
+                plan_log(root, plan, "fallback_depth_exceeded", stage_id=stage_id,
+                         step_id=item["step_id"], fallback=item["fallback"],
+                         depth=item["depth"], limit=item["limit"])
+            mark_remaining_skipped(root, pdir, sdir, plan, stage,
+                                   "fallback_depth_exceeded")
+            stage_state["status"] = "failed"
+            stage_state["ended_at"] = now_ts()
+            stage_state["waves"] = waves
+            stage_state["error_type"] = "fallback_depth_exceeded"
+            save_stage(pdir, stage_id, stage_state)
+            return "failed", {"fallback_depth_exceeded": True,
+                              "detail": exceeded}
         todo = stage_todo(pdir, stage)
         if not todo:
             break
@@ -940,7 +1122,7 @@ def run_stage(root, sdir, plan, stage, approval, fail_fast=False):
         skip_dependents(root, pdir, sdir, plan, stage, todo)
         todo = stage_todo(pdir, stage)
         if not todo:
-            break
+            continue
 
         for step, _state in todo:
             action, payload = ensure_step_permission(root, plan, sdir, stage, step, approval)
@@ -983,13 +1165,23 @@ def run_stage(root, sdir, plan, stage, approval, fail_fast=False):
             save_stage(pdir, stage_id, stage_state)
             return "failed", {"critical_failure": True}
 
-        if on_failure == "stop" and any(r["status"] in FAILED_STEP for r in results):
-            mark_remaining_skipped(root, pdir, sdir, plan, stage, "stage_failed")
-            stage_state["status"] = "failed"
-            stage_state["ended_at"] = now_ts()
-            stage_state["waves"] = waves
-            save_stage(pdir, stage_id, stage_state)
-            return "failed", {}
+        if on_failure == "stop":
+            # 声明了 on_failure 的失败不触发即停：先让兜底跑，兜底自己失败（且无兜底可接）才停。
+            # 否则 `on_stage_failure: "stop"` 会把刚被唤醒的兜底一起标 skipped(stage_failed)，
+            # 让 Step 级 on_failure 在 stop 模式下彻底失效。
+            unrescued = [r["step_id"] for r in results
+                         if r["status"] in FAILED_STEP
+                         and not (find_step(stage, r["step_id"]) or {}).get("on_failure")]
+            if unrescued:
+                mark_remaining_skipped(root, pdir, sdir, plan, stage, "stage_failed")
+                stage_state["status"] = "failed"
+                stage_state["ended_at"] = now_ts()
+                stage_state["waves"] = waves
+                save_stage(pdir, stage_id, stage_state)
+                return "failed", {}
+
+    # 正常收尾：没被唤醒的兜底步骤标 skipped(fallback_untriggered)，避免长期停在 pending
+    mark_untriggered_fallbacks(root, pdir, sdir, plan, stage)
 
     todo = stage_todo(pdir, stage)
     if todo:
@@ -1039,6 +1231,9 @@ def summarize_plan(pdir, plan):
                 "ended_at": state.get("ended_at"),
                 "skipped_by": state.get("skipped_by"),
                 "blocked_by": state.get("blocked_by"),
+                "fallback_of": state.get("fallback_of"),
+                "fallback_armed": bool(state.get("fallback_armed")),
+                "fallback_chain": state.get("fallback_chain") or 0,
             })
     return {
         "plan_id": plan.get("id"),
@@ -1533,7 +1728,10 @@ def cmd_resume(root, args):
             "stage_id": plan.get("paused_stage"),
             "step_id": plan.get("paused_step"),
             "approval_id": state.get("approval_id"),
-            "hint": "批准后使用 resume <id> --approval <approval_id>",
+            "resume": ats._resume_command(
+                "python ats_plan.py resume %s --approval <approval_id>" % plan["id"],
+                state.get("approval_id"), plan["id"]),
+            "hint": "计划停在审批上：先批准，再用下面这条命令续跑",
         })
     result, code = run_plan(root, plan["id"], args.approval,
                             fail_fast=getattr(args, "fail_fast", False))
@@ -2020,7 +2218,7 @@ def cmd_prune(root, args):
 def build_parser():
     ap = argparse.ArgumentParser(
         prog="ats_plan.py",
-        description="agent-task-scheduler — Plan / Schedule 层执行器 (v4.0.0-R0)",
+        description="agent-task-scheduler — Plan / Schedule 层执行器 (v0.3.1.1：w17vbc)",
     )
     ap.add_argument("--root", default=None, help="ATS_ROOT，默认 <ats 本体目录>/.ats")
     sub = ap.add_subparsers(dest="command_name")

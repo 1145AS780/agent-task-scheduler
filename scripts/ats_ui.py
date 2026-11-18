@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ats_ui.py — agent-task-scheduler 人类用本地 Web 面板 (v4.0.0-R0)
+"""ats_ui.py — agent-task-scheduler 人类用本地 Web 面板 (v0.3.1.1：w17vbc)
 
 只读监控 + 运行控制 + 审批 + 创建编排。纯标准库，无第三方依赖。
 
@@ -28,7 +28,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "4.0.0-R0"
+VERSION = "0.3.1.1：w17vbc"
+HTTP_VERSION = VERSION.replace("：", "-")
 SERVER_START = int(time.time())
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -51,6 +52,7 @@ MCP_ENDPOINT = None                     # 由 serve() 创建，默认关闭，�
 JOBS = []
 JOBS_LOCK = threading.Lock()
 POLICY_CACHE = {"ts": 0.0, "data": None}
+VISA_CACHE = {"ts": 0.0, "data": None}
 
 
 def default_root():
@@ -199,14 +201,40 @@ def normalize_task(task, fallback_id):
     return task
 
 
+def task_dir_for(root, task_id):
+    """任务目录：运行目录优先，已归档则回退 <root>/archive/<id>/。
+
+    归档只搬目录不删任务，界面必须跟着回退，否则瘦身后的任务在抽屉里看不到日志。
+    """
+    active = Path(root) / "tasks" / str(task_id)
+    if active.exists():
+        return active
+    archived = Path(root) / "archive" / str(task_id)
+    if archived.exists():
+        return archived
+    return active
+
+
 def task_rows(root):
     rows = []
     base = Path(root) / "tasks"
-    if base.exists():
-        for path in base.glob("*/task.json"):
-            task = read_json(path)
-            if isinstance(task, dict):
-                rows.append(normalize_task(task, path.parent.name))
+    archived = Path(root) / "archive"
+    seen = set()
+    paths = []
+    if base.is_dir():
+        paths += list(base.glob("*/task.json"))
+    if archived.is_dir():
+        paths += list(archived.glob("*/task.json"))
+    for path in paths:
+        task = read_json(path)
+        if not isinstance(task, dict):
+            continue
+        normalize_task(task, path.parent.name)
+        tid = str(task.get("id") or path.parent.name)
+        if tid in seen:
+            continue
+        seen.add(tid)
+        rows.append(task)
     rows.sort(key=lambda t: (to_ts(t.get("created_at")), str(t.get("id") or "")), reverse=True)
     return rows[:300]
 
@@ -274,6 +302,31 @@ def invalidate_policy_cache():
     POLICY_CACHE.update(ts=0.0, data=None)
 
 
+def visa_rows(root, errors=None):
+    """现有签证（valid 与 invalid 分开）。15s 缓存，签发/吊销后立即失效。
+
+    走 `ats.py visa list` 而不是直接读 visas/*.json：剩余配额、过期判定、
+    损坏识别都在 ats_guard.visa_state() 里，UI 只消费同一份结论，
+    不重新实现一遍配额语义（否则两边迟早对不上）。
+    """
+    now = time.time()
+    if VISA_CACHE["data"] is not None and now - VISA_CACHE["ts"] < 15:
+        return VISA_CACHE["data"]
+    result = run_cli(ATS, ["--root", str(root), "visa", "list"], timeout=20)
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    if not data and errors is not None:
+        detail = (result.get("stderr") or "").strip().splitlines()
+        errors.append({"scope": "签证",
+                       "message": (detail[-1] if detail else "exit %s" % result.get("code"))[:300]})
+    VISA_CACHE.update(ts=now, data=data)
+    return data
+
+
+def invalidate_visa_cache():
+    """visa.issue / visa.revoke 成功后立即失效，避免页面还显示已扣掉的旧配额。"""
+    VISA_CACHE.update(ts=0.0, data=None)
+
+
 def mcp_state():
     """MCP 端点状态。来自进程内存里的真实监听对象，不做持久化猜测。"""
     if MCP_ENDPOINT is None:
@@ -308,6 +361,7 @@ def build_state(root):
     events = safe("事件", lambda: event_rows(root), [])
     jobs = safe("后台操作", lambda: jobs_snapshot(), [])
     policy = safe("策略", lambda: policy_info(root, errors), {})
+    visas = safe("签证", lambda: visa_rows(root, errors), {})
 
     running = [t for t in tasks if t.get("status") in ("starting", "running")]
     failed = [t for t in tasks if t.get("status") == "failed"]
@@ -323,6 +377,7 @@ def build_state(root):
         "events": events,
         "jobs": jobs,
         "policy": policy,
+        "visas": visas,
         "errors": errors,
         "counts": {
             "tasks": len(tasks),
@@ -331,6 +386,7 @@ def build_state(root):
             "pending_approvals": len(pending),
             "schedules": len(schedules),
             "plans_running": sum(1 for s in schedules if s.get("plan_status") in ("running", "starting")),
+            "visas": len((visas or {}).get("visas") or []),
         },
         "mcp": safe("MCP", mcp_state,
                     {"available": False, "status": "stopped",
@@ -372,7 +428,7 @@ def spawn_async(root, action, script, argv, label):
 
 
 def task_detail(root, task_id):
-    tdir = Path(root) / "tasks" / task_id
+    tdir = task_dir_for(root, task_id)
     task = read_json(tdir / "task.json")
     if not isinstance(task, dict):
         return None
@@ -420,7 +476,7 @@ def passphrase_error(action):
     """口令缺失时的统一返回体，形状与 action_result 一致，前端 errText 可直接读。"""
     return {"ok": False, "action": action, "async": False, "exit_code": 4,
             "result": {"error": "passphrase_required",
-                       "hint": "审批与策略写入必须持口令：在页面顶部填好后重试"}}
+                       "hint": "审批、策略写入与签发签证都必须持口令：在页面顶部填好后重试"}}
 
 
 def passphrase_stdin(payload):
@@ -561,6 +617,39 @@ def dispatch(root, payload):
         argv += flag
         result = action_result(run_cli(ATS, argv, 30, stdin_text=stdin_text), action)
         invalidate_policy_cache()
+        return result
+
+    if action == "visa.issue":
+        flag, stdin_text = passphrase_stdin(payload)
+        if flag is None:
+            return passphrase_error(action)
+        task = str(payload.get("task") or "").strip()
+        plan = str(payload.get("plan") or "").strip()
+        if task and plan:
+            raise ValueError("task 与 plan 只能二选一：一张签证只绑一个对象")
+        argv = ["--root", str(root), "visa", "issue"]
+        if payload.get("number") not in (None, ""):
+            argv += ["--number", str(payload["number"])]
+        if payload.get("time") not in (None, ""):
+            argv += ["--time", str(int(payload["time"]))]
+        if payload.get("note"):
+            argv += ["--note", str(payload["note"])]
+        if task:
+            argv += ["--task", task]
+        elif plan:
+            argv += ["--plan", plan]
+        argv += flag
+        result = action_result(run_cli(ATS, argv, 40, stdin_text=stdin_text), action)
+        if result.get("ok"):
+            invalidate_visa_cache()
+        return result
+
+    if action == "visa.revoke":
+        visa_id = str(require(payload, "visa_id")).strip()
+        argv = ["--root", str(root), "visa", "revoke", visa_id]
+        result = action_result(run_cli(ATS, argv, 20), action)
+        if result.get("ok"):
+            invalidate_visa_cache()
         return result
 
     if action == "plan.submit":
@@ -881,6 +970,7 @@ pre.log{background:#0b0f15;border:1px solid var(--line);border-radius:8px;paddin
   <button class="tab active" data-tab="tasks">任务 <b id="cntTasks">0</b></button>
   <button class="tab" data-tab="plans">计划 <b id="cntPlans">0</b></button>
   <button class="tab" data-tab="approvals">审批 <b id="cntApprovals">0</b></button>
+  <button class="tab" data-tab="visas">签证 <b id="cntVisas">0</b></button>
   <button class="tab" data-tab="events">事件</button>
   <button class="tab" data-tab="new">新建</button>
 </nav>
@@ -941,6 +1031,36 @@ pre.log{background:#0b0f15;border:1px solid var(--line);border-radius:8px;paddin
       <div class="hint">相对路径与不存在的目录都会被拒绝：相对串以 ATS root 为基准解析，与你的本意容易错位。保存要口令，写入后同样重封签。</div>
     </div>
     <div class="cards" id="approvalBody"></div>
+  </section>
+
+  <section class="panel" id="panel-visas">
+    <div class="cards">
+      <div class="card">
+        <h3>签发签证</h3>
+        <div class="field"><label>绑定对象</label>
+          <select id="vTargetKind">
+            <option value="task">任务（绑命令原文哈希，推荐）</option>
+            <option value="plan">计划（绑整条 DAG 指纹，配额可 unlimited）</option>
+            <option value="digest">不绑对象（只跳完整性校验）</option>
+          </select></div>
+        <div class="field" id="vTaskWrap"><label>任务</label><select id="vTask"></select></div>
+        <div class="field" id="vPlanWrap"><label>计划</label><select id="vPlan"></select></div>
+        <div class="grid2">
+          <div class="field"><label>配额次数</label><input id="vNumber" value="1"></div>
+          <div class="field"><label>有效期（分钟）</label><input id="vTime" type="number" value="30"></div>
+        </div>
+        <div class="field"><label>备注（可空）</label><input id="vNote" placeholder="为什么发这张签证"></div>
+        <div class="actions"><button class="primary" id="btnIssueVisa">签发签证</button>
+          <span class="hint" id="visaHint"></span></div>
+        <div class="hint" id="visaScopeHint">-</div>
+        <div class="hint">签发要口令：填在页面顶部输入框，只存本页内存，经 stdin 交给子进程，不进命令行参数。口令错时子进程直接拒绝，签证不会落盘。</div>
+      </div>
+      <div class="card">
+        <h3>现有签证 <span class="sub" id="visaCount"></span></h3>
+        <div class="hint">每消费 1 次配额减 1，扣到 0 当场删文件；过期即失效，不接受永不过期。吊销是降权操作（只会让权限变小），因此不需要口令。</div>
+        <div class="events" id="visaBody"></div>
+      </div>
+    </div>
   </section>
 
   <section class="panel" id="panel-events">
@@ -1194,6 +1314,7 @@ function render(){
   $('#cntPlans').textContent = c.schedules || 0;
   $('#cntApprovals').textContent = c.pending_approvals || 0;
   renderTasks(); renderPlans(); renderApprovals(); renderEvents(); renderMcp(); renderPolicyControls(); renderAllowDirs(); renderCwdOptions();
+  renderVisas(); renderVisaTargets();
   if(SEL_TASK && TICK % 3 === 0) loadTask(true);
   if(SEL_PLAN && TICK % 3 === 0) loadPlan(true);
 }
@@ -1443,6 +1564,132 @@ function renderAllowDirs(){
   $('#allowBody').innerHTML = (rows.length ? rows.join('') : '<div class="empty">未配置：任务 cwd 只允许 root 内部</div>')
     + warns.map(w => '<div class="hint bad">'+esc(w)+'</div>').join('');
   $('#allowDirs').value = raw.join('\n');
+}
+
+let VISA_SIG = '';
+let VT_SIG = '';
+
+function renderVisas(){
+  const V = DATA && DATA.visas;
+  if(!V || !$('#visaBody')) return;
+  const list = V.visas || [];
+  const invalid = V.invalid || [];
+  const sig = JSON.stringify([list, invalid]);
+  if(sig === VISA_SIG) return;
+  VISA_SIG = sig;
+  $('#cntVisas').textContent = list.length;
+  $('#visaCount').textContent = list.length ? '('+list.length+' 张有效)' : '(无有效签证)';
+  const rows = list.map(v => '<div class="ev"><div class="t">'+esc(v.scope_type||'-')+'</div>'
+    + '<div class="type">'+esc(v.visa_id)+'</div>'
+    + '<div class="body">剩 <b>'+esc(v.number==null?'-':v.number)+'</b>'
+    + (v.expires_iso ? ' · 到 '+esc(v.expires_iso) : '')
+    + (v.task_id ? ' · 任务 '+esc(v.task_id) : '')
+    + (v.plan_id ? ' · 计划 '+esc(v.plan_id) : '')
+    + (v.note ? ' · '+esc(v.note) : '')
+    + ' <button class="danger" data-visa="'+esc(v.visa_id)+'">吊销</button>'
+    + '</div></div>');
+  const bad = invalid.map(v => '<div class="ev"><div class="t">失效</div>'
+    + '<div class="type">'+esc(v.visa_id)+'</div>'
+    + '<div class="body">'+esc(v.status||'invalid')+'</div></div>');
+  const body = $('#visaBody');
+  body.innerHTML = (rows.concat(bad).join('') || '<div class="empty">当前没有签证</div>');
+  body.querySelectorAll('[data-visa]').forEach(b => b.onclick = () => revokeVisa(b.dataset.visa));
+}
+
+function renderVisaTargets(){
+  if(!DATA || !$('#vTask')) return;
+  const tasks = (DATA.tasks||[]).filter(t => t && t.id)
+    .map(t => [String(t.id), String(t.id)+'  ·  '+String(t.status||'-')]);
+  const plans = (DATA.schedules||[]).filter(s => s && s.schedule_id)
+    .map(s => [String(s.schedule_id), String(s.schedule_id)+'  ·  '+(s.current_plan||'-')]);
+  const sig = JSON.stringify([tasks, plans]);
+  if(sig === VT_SIG) return;
+  VT_SIG = sig;
+  const fill = (sel, items, emptyText) => {
+    const el = $(sel);
+    if(!el) return;
+    const keep = el.value;
+    el.innerHTML = items.length
+      ? items.map(i => '<option value="'+esc(i[0])+'">'+esc(i[1])+'</option>').join('')
+      : '<option value="">'+esc(emptyText)+'</option>';
+    el.value = items.some(i => i[0] === keep) ? keep : (items.length ? items[0][0] : '');
+    el.disabled = !items.length;
+  };
+  fill('#vTask', tasks, '（还没有任务）');
+  fill('#vPlan', plans, '（还没有计划）');
+}
+
+function syncVisaKind(){
+  const kind = $('#vTargetKind').value;
+  $('#vTaskWrap').style.display = kind === 'task' ? '' : 'none';
+  $('#vPlanWrap').style.display = kind === 'plan' ? '' : 'none';
+  $('#visaScopeHint').textContent = kind === 'task'
+    ? '绑任务：签发时读 task.json 的命令原文算 SHA-256，之后谁改任务内容，这张签证自动失效。'
+    : (kind === 'plan'
+      ? '绑计划：签发前先校验整条 DAG，合法才给签；配额可写 unlimited（只对 plan 开放）。'
+      : '不绑对象：只跳完整性校验，不跳审批门，也不能替代重封签。');
+  const num = $('#vNumber');
+  if(kind === 'plan'){
+    num.placeholder = '1 或 unlimited';
+  }else{
+    num.placeholder = '1';
+    if(String(num.value).trim().toLowerCase() === 'unlimited') num.value = '1';
+  }
+}
+
+async function issueVisa(){
+  const kind = $('#vTargetKind').value;
+  const pass = uiPass();
+  if(!pass){ $('#visaHint').textContent = '未填口令，未签发'; return; }
+  const payload = {action:'visa.issue', passphrase:pass,
+    number:$('#vNumber').value.trim() || '1',
+    time:$('#vTime').value.trim() || '30',
+    note:$('#vNote').value.trim()};
+  if(kind === 'task'){
+    const t = $('#vTask').value;
+    if(!t){ $('#visaHint').textContent = '没有可绑定的任务'; return; }
+    payload.task = t;
+  }else if(kind === 'plan'){
+    const p = $('#vPlan').value;
+    if(!p){ $('#visaHint').textContent = '没有可绑定的计划'; return; }
+    payload.plan = p;
+  }
+  const btn = $('#btnIssueVisa');
+  btn.disabled = true;
+  $('#visaHint').textContent = '签发中…';
+  try{
+    const d = await api('/api/action',{method:'POST',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}, 60000);
+    if(d && d.ok){
+      const r = d.result || {};
+      $('#visaHint').textContent = '已签发 '+(r.visa_id||'');
+      toast('签证已签发：'+(r.visa_id||''),'ok');
+      VISA_SIG = ''; VT_SIG = '';
+      refresh();
+    }else{
+      $('#visaHint').textContent = '签发失败';
+      toast(errText(d||{}),'bad');
+    }
+  }catch(e){
+    $('#visaHint').textContent = '签发失败';
+    toast('请求失败：'+e.message,'bad');
+  }finally{
+    btn.disabled = false;
+  }
+}
+
+async function revokeVisa(id){
+  if(!id) return;
+  if(!confirm('吊销签证 '+id+'？吊销后立刻失效，不可恢复。')) return;
+  try{
+    const d = await api('/api/action',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:'visa.revoke', visa_id:id})}, 30000);
+    if(d && d.ok){ toast('已吊销 '+id,'ok'); VISA_SIG = ''; refresh(); }
+    else toast(errText(d||{}),'bad');
+  }catch(e){
+    toast('请求失败：'+e.message,'bad');
+  }
 }
 
 let CWD_SIG = '';
@@ -1695,6 +1942,8 @@ $('#taskSearch').oninput = renderTasks;
 $('#showAllApprovals').onchange = renderApprovals;
 $('#btnSavePolicy').onclick = savePolicy;
 $('#btnSaveAllow').onclick = saveAllowDirs;
+$('#btnIssueVisa').onclick = issueVisa;
+$('#vTargetKind').onchange = syncVisaKind;
 document.querySelectorAll('.tab').forEach(b => b.onclick = () => showTab(b.dataset.tab));
 
 $('#btnCreateTask').onclick = () => {
@@ -1731,6 +1980,7 @@ $('#btnAuthClear').onclick = () => {
 $('#authToken').addEventListener('keydown', e => { if(e.key === 'Enter') $('#btnAuthSave').click(); });
 
 restartTimer();
+syncVisaKind();
 if(SRV.auth && !getToken()) showAuthGate();
 refresh();
 </script>
@@ -1741,7 +1991,7 @@ refresh();
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "AtsUI/" + VERSION
+    server_version = "AtsUI/" + HTTP_VERSION
 
     def log_message(self, fmt, *args):
         return
@@ -1829,7 +2079,7 @@ class Handler(BaseHTTPRequestHandler):
                            "hook": "hook-enc.log", "supervisor": "supervisor.log"}
                 if name not in mapping:
                     return self._send({"error": "bad_file"}, code=400)
-                path = Path(ROOT) / "tasks" / task_id / mapping[name]
+                path = task_dir_for(ROOT, task_id) / mapping[name]
                 return self._send({"task": task_id, "file": name,
                                    "text": tail_text(path, max(1, min(lines, 1000)))})
             if parsed.path == "/api/events":

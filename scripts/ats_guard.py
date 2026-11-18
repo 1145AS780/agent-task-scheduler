@@ -35,7 +35,7 @@
 信任基线。本地文件权限相等时，代码无法阻止删除，这条只能由人守。
 ==================================================================
 
-用法（--root 省略时默认 <ats 本体目录>/.ats，即 OCSKIS/.ats；也可用 ATS_ROOT 环境变量）：
+用法（--root 省略时默认 <ats 本体目录>/.ats，即仓库根目录下的 .ats；也可用 ATS_ROOT 环境变量）：
     python ats_guard.py verify [--root DIR] [--json]
     python ats_guard.py seal   [--root DIR] --confirm [--passphrase-stdin]
     python ats_guard.py init   [--root DIR] --confirm [--passphrase-stdin]
@@ -74,6 +74,7 @@
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import os
@@ -111,6 +112,14 @@ VISA_SCOPE_TYPES = (VISA_SCOPE_DIGEST, VISA_SCOPE_COMMAND, VISA_SCOPE_PLAN)
 VISA_UNLIMITED = "unlimited"         # 只允许 plan 场景：Plan 跑完前不限次数
 VISA_SUBS = ("issue", "list", "peek", "revoke", "consume")
 
+# —— 封包态热修改（3.2）：白名单文件可在封签状态下改，只更新它自己的哈希
+# 默认拒绝：只有明确列进 HOT_PATCH_SAFE 的文件才可热改，其余一律走 unpack/repack。
+HOT_PATCH_SAFE = ("ats_download.py", "ats_torrent.py")
+HOT_PATCH_REDLINE = (GUARD_FILE, KEY_NAME, "policy.json")   # 改动即全面停机
+SNAPSHOT_DIR_NAME = "snapshots"      # <root>/snapshots/ 存封签态原文，供 patch 生成 Diff
+HOT_PATCH_DIFF_LIMIT = 200           # Diff 最多回传的行数，防止刷屏吃掉上下文
+HOT_PATCH_LOG_LIMIT = 50             # 清单里保留的热修改记录条数上限
+
 
 def sha256_file(path):
     """流式算 sha256；文件不存在或读失败返回 None，不抛异常。"""
@@ -134,7 +143,7 @@ def core_files():
 def resolve_root(root):
     """解析状态根。优先级：显式 root > 环境变量 ATS_ROOT > <ats 本体目录>/.ats。
 
-    默认取脚本所在目录的父目录（即 OCSKIS/），而不是当前工作目录：
+    默认取脚本所在目录的父目录（即仓库根目录），而不是当前工作目录：
     否则从不同 cwd 调用会各自生成一份 .ats，信任根被拆散。
     """
     if root:
@@ -219,7 +228,8 @@ def check_passphrase(root, passphrase):
     key = read_key(root)
     if key is None:
         return {"ok": False, "error": "key_missing", "key": str(key_path(root)),
-                "hint": "密钥文件不存在：由人执行 init --confirm 创建"}
+                "hint": "密钥文件不存在，口令校验无从进行：由人执行 %s 创建"
+                        % gcmd("init", "--confirm", "--passphrase-stdin")}
     if key.get("kdf") != KDF_NAME or key.get("version") != KEY_VERSION:
         return {"ok": False, "error": "key_format",
                 "kdf": key.get("kdf"), "version": key.get("version")}
@@ -255,6 +265,16 @@ def emit(payload, code):
     return code
 
 
+def gcmd(*parts):
+    """看门狗命令的可复制形式：`python scripts/ats_guard.py <子命令>`。
+
+    所有 hint 里给命令的地方都走这里，避免写出 `seal --confirm` 这种
+    「在仓库根目录敲会找不到文件」的半截命令。
+    """
+    tail = " ".join(str(p) for p in parts if p is not None and str(p) != "")
+    return "python scripts/%s %s" % (GUARD_FILE, tail)
+
+
 def cmd_self():
     path = SCRIPT_DIR / GUARD_FILE
     return emit({"ok": True, "file": GUARD_FILE, "path": str(path),
@@ -265,7 +285,8 @@ def cmd_init(root, confirm, passphrase):
     """创建密钥文件。清单或密钥任一已存在时拒绝 —— 没有「重置」入口。"""
     if not confirm:
         return emit({"ok": False, "error": "confirm_required",
-                     "hint": "创建密钥会建立信任根，必须由人显式确认：init --confirm"},
+                     "hint": "创建密钥会建立信任根，必须由人显式确认：%s"
+                             % gcmd("init", "--confirm", "--passphrase-stdin")},
                     EXIT_USAGE)
     # 只删清单、留下密钥，曾能用新口令覆盖信任根 —— 密钥本身不可合法再生，
     # 它存在就说明本 root 已初始化过，因此两个产物任一存在都拒绝。
@@ -276,7 +297,8 @@ def cmd_init(root, confirm, passphrase):
                      "existing": existing,
                      "hint": "清单或密钥已存在，禁止重建密钥。本仓的 ats_guard_key.json "
                              "与 ats_guard_manifest.json 当前未被 git 跟踪，无法从 git 恢复；"
-                             "确认要全新开始，须由人先手动删除这两个文件"},
+                             "确认要全新开始，须由人先手动删除这两个文件，再执行 %s"
+                             % gcmd("init", "--confirm", "--passphrase-stdin")},
                     EXIT_MISMATCH)
     if len(passphrase) < PASSPHRASE_MIN:
         return emit({"ok": False, "error": "passphrase_too_short",
@@ -306,7 +328,8 @@ def cmd_auth(root, passphrase):
 def cmd_seal(root, confirm, passphrase):
     if not confirm:
         return emit({"ok": False, "error": "confirm_required",
-                     "hint": "封签会重建信任基线，必须由人显式确认：seal --confirm"},
+                     "hint": "封签会重建信任基线，必须由人显式确认：%s"
+                             % gcmd("seal", "--confirm", "--passphrase-stdin")},
                     EXIT_USAGE)
     auth = check_passphrase(root, passphrase)
     if not auth.get("ok"):
@@ -316,7 +339,11 @@ def cmd_seal(root, confirm, passphrase):
                     EXIT_MISMATCH)
     if sha256_file(SCRIPT_DIR / "ats.py") is None:
         return emit({"ok": False, "error": "ats_missing",
-                     "hint": "ats.py 不在本目录，拒绝生成不完整清单"}, EXIT_USAGE)
+                     "path": str(SCRIPT_DIR / "ats.py"),
+                     "hint": "ats.py 不在本目录，拒绝生成不完整清单；"
+                             "从仓库恢复 scripts/ats.py 后重跑 %s"
+                             % gcmd("seal", "--confirm", "--passphrase-stdin")},
+                    EXIT_USAGE)
 
     path = manifest_path(root)
     previous = read_manifest(path) or {}
@@ -343,6 +370,7 @@ def cmd_seal(root, confirm, passphrase):
         "key": key,
     }
     write_manifest(path, record)
+    refresh_snapshots(root)
     return emit({"ok": True, "manifest": str(path), "files": files,
                  "policy": policy, "key": key, "changed": changed}, EXIT_OK)
 
@@ -357,14 +385,17 @@ def cmd_verify(root):
             return emit({"ok": False, "error": "manifest_missing",
                          "manifest": str(path),
                          "next_action": "seal",
-                         "hint": "清单缺失但密钥仍在：由人执行 seal --confirm 重新封签，"
-                                 "口令须与 init 时一致"},
+                         "hint": "清单缺失但密钥仍在：由人执行 %s 重新封签，"
+                                 "口令须与 init 时一致"
+                                 % gcmd("seal", "--confirm", "--passphrase-stdin")},
                         EXIT_NO_MANIFEST)
         return emit({"ok": False, "error": "manifest_missing",
                      "manifest": str(path),
                      "next_action": "init",
-                     "hint": "本 root 尚未建立信任根：由人先执行 init --confirm 创建密钥，"
-                             "再执行 seal --confirm 建立基线"},
+                     "hint": "本 root 尚未建立信任根：由人先执行 %s 创建密钥，"
+                             "再执行 %s 建立基线"
+                             % (gcmd("init", "--confirm", "--passphrase-stdin"),
+                                gcmd("seal", "--confirm", "--passphrase-stdin"))},
                     EXIT_NO_MANIFEST)
     if manifest.get("version") != MANIFEST_VERSION:
         return emit({"ok": False, "error": "manifest_version",
@@ -423,6 +454,152 @@ def cmd_verify(root):
                            "与 ats_guard_manifest.json；确认要全新开始，须由人先手动"
                            "删除这两个文件，再重跑 init --confirm 与 seal --confirm")
     return emit(payload, EXIT_OK if not problems else EXIT_MISMATCH)
+
+
+# ---------------------------------------------------------------- 封包态热修改（3.2）
+
+def snapshot_dir(root):
+    return Path(root) / SNAPSHOT_DIR_NAME
+
+
+def snapshot_path(root, name):
+    return snapshot_dir(root) / name
+
+
+def refresh_snapshots(root):
+    """把白名单文件的当前内容留作「封签基线」，供 patch 生成 Diff。
+
+    只处理 HOT_PATCH_SAFE：其余文件不落副本，避免每次 seal 复制整目录。
+    内容与已有快照一致时跳过写入 —— 大多数 seal 都是重封签、文件没动。
+    """
+    for name in HOT_PATCH_SAFE:
+        src = SCRIPT_DIR / name
+        if not src.is_file():
+            continue
+        dst = snapshot_path(root, name)
+        if dst.is_file() and sha256_file(dst) == sha256_file(src):
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            dst.write_bytes(src.read_bytes())
+        except OSError:
+            # 快照只是「更好的 Diff」的辅助，写不进去不该让 seal 整体失败。
+            continue
+
+
+def _read_text_lines(path):
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    return text.splitlines()
+
+
+def make_diff(root, name):
+    """生成封签基线 -> 当前内容的统一 Diff；无快照时返回 None。"""
+    old_lines = _read_text_lines(snapshot_path(root, name))
+    new_lines = _read_text_lines(SCRIPT_DIR / name)
+    if old_lines is None or new_lines is None:
+        return None
+    lines = list(difflib.unified_diff(
+        old_lines, new_lines,
+        fromfile="%s（封签基线）" % name, tofile="%s（当前）" % name, lineterm=""))
+    truncated = len(lines) > HOT_PATCH_DIFF_LIMIT
+    lines = lines[:HOT_PATCH_DIFF_LIMIT]
+    if truncated:
+        lines.append("...（Diff 过长，已截断，完整内容请用 diff 工具比对）")
+    return "\n".join(lines)
+
+
+def cmd_patch(root, name, confirm, passphrase):
+    """封签态热修改：只允许白名单文件，Diff 供人确认后只更新该文件的哈希。
+
+    红线（ats_guard.py / 密钥 / policy.json）不在此列：它们改动必须触发全面停机。
+    """
+    if not name:
+        return emit({"ok": False, "error": "file_required",
+                     "hint": "指定要热修改的文件，例如 %s"
+                             % gcmd("patch", "--file", "ats_download.py"),
+                     "whitelist": list(HOT_PATCH_SAFE)}, EXIT_USAGE)
+    if name in HOT_PATCH_REDLINE:
+        return emit({"ok": False, "error": "red_line_file", "file": name,
+                     "hint": "红线文件不可热修改：改动它会触发全面停机，"
+                             "必须由人走停机流程：%s -> 改代码 -> %s"
+                             % (gcmd("unpack", "--confirm"),
+                                gcmd("repack", "--confirm")),
+                     "redline": list(HOT_PATCH_REDLINE)}, EXIT_MISMATCH)
+    if name not in HOT_PATCH_SAFE:
+        return emit({"ok": False, "error": "not_whitelisted", "file": name,
+                     "hint": "该文件不在热修改白名单，改动会让看门狗判失配。"
+                             "白名单文件可由人改代码后 %s；其余请走 %s / %s"
+                             % (gcmd("patch", "--file", name),
+                                gcmd("unpack", "--confirm"),
+                                gcmd("repack", "--confirm")),
+                     "whitelist": list(HOT_PATCH_SAFE)}, EXIT_MISMATCH)
+
+    path = manifest_path(root)
+    manifest = read_manifest(path)
+    if manifest is None:
+        return emit({"ok": False, "error": "manifest_missing",
+                     "manifest": str(path),
+                     "hint": "本 root 还没有封签基线：由人先执行 %s"
+                             % gcmd("seal", "--confirm", "--passphrase-stdin")},
+                    EXIT_NO_MANIFEST)
+
+    current = sha256_file(SCRIPT_DIR / name)
+    if current is None:
+        return emit({"ok": False, "error": "file_missing", "file": name,
+                     "hint": "白名单文件不存在，无法热修改；确认文件是否被误删"},
+                    EXIT_MISMATCH)
+    expected = (manifest.get("files") or {}).get(name)
+    if current == expected:
+        return emit({"ok": True, "changed": False, "file": name,
+                     "sha256": current,
+                     "note": "与封签基线一致，无需热修改"}, EXIT_OK)
+
+    diff = make_diff(root, name)
+    if not confirm:
+        payload = {"ok": False, "error": "confirm_required", "file": name,
+                   "old_sha256": expected, "new_sha256": current,
+                   "diff": diff,
+                   "hint": "请人先看上面的 Diff；确认无误后执行 %s（需口令）"
+                           % gcmd("patch", "--file", name, "--confirm",
+                                  "--passphrase-stdin")}
+        if diff is None:
+            payload["diff_note"] = ("没有封签基线快照，无法生成 Diff（基线可能来自旧版本）。"
+                                    "请人用 git diff 或编辑器自行核对后再确认")
+        return emit(payload, EXIT_USAGE)
+
+    auth = check_passphrase(root, passphrase)
+    if not auth.get("ok"):
+        return emit({"ok": False, "error": "passphrase_required", "detail": auth,
+                     "hint": "热修改会改动信任基线，必须由人确认口令：%s"
+                             % gcmd("patch", "--file", name, "--confirm",
+                                    "--passphrase-stdin")},
+                    EXIT_MISMATCH)
+
+    manifest.setdefault("files", {})[name] = current
+    records = manifest.get("hot_patches")
+    if not isinstance(records, list):
+        records = []
+    records.append({"file": name, "old": expected, "new": current,
+                    "at": int(time.time()),
+                    "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "by": "human-with-passphrase"})
+    manifest["hot_patches"] = records[-HOT_PATCH_LOG_LIMIT:]
+    write_manifest(path, manifest)
+
+    dst = snapshot_path(root, name)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        dst.write_bytes((SCRIPT_DIR / name).read_bytes())
+    except OSError:
+        pass
+
+    return emit({"ok": True, "changed": True, "file": name,
+                 "old_sha256": expected, "new_sha256": current,
+                 "manifest": str(path), "diff": diff,
+                 "note": "已只更新该文件的哈希，其余基线未动"}, EXIT_OK)
 
 
 # ---------------------------------------------------------------- 签证（Visa）
@@ -533,7 +710,11 @@ def normalize_scope(scope_type, scope_hash, task_id, plan_id):
     kind = (scope_type or VISA_SCOPE_DIGEST)
     if not isinstance(kind, str) or kind not in VISA_SCOPE_TYPES:
         return _bad_scope({"ok": False, "error": "bad_scope_type",
-                           "hint": "--scope-type 只能是 digest / command / plan"})
+                           "hint": "--scope-type 只能是 digest / command / plan，"
+                                   "照这个形式复制：%s"
+                                   % gcmd("visa", "issue", "--time", "30",
+                                          "--scope-type", "digest",
+                                          "--passphrase-stdin")})
     digest = (scope_hash or "").strip().lower()
     task = (task_id or "").strip()
     plan = (plan_id or "").strip()
@@ -541,20 +722,29 @@ def normalize_scope(scope_type, scope_hash, task_id, plan_id):
         if digest or task or plan:
             return _bad_scope({"ok": False, "error": "scope_not_applicable",
                                "hint": "digest 签证不绑任何对象；要绑任务或计划请显式给 "
-                                       "--scope-type command / plan"})
+                                       "--scope-type command / plan，并同时带 --scope-hash "
+                                       "与 --task-id（或 --plan-id）。现有签证用 %s 查看"
+                                       % gcmd("visa", "list")})
         return {"scope_type": kind}, None
     if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
         return _bad_scope({"ok": False, "error": "bad_scope_hash",
                            "hint": "%s 签证的 --scope-hash 必须是 64 位小写十六进制 "
-                                   "SHA-256" % kind})
+                                   "SHA-256；用这条命令现算（把命令原文从标准输入喂进去）："
+                                   "python -c \"import hashlib,sys;"
+                                   "print(hashlib.sha256(sys.stdin.buffer.read())"
+                                   ".hexdigest())\"" % kind})
     if kind == VISA_SCOPE_COMMAND:
         if not task or plan:
             return _bad_scope({"ok": False, "error": "bad_scope_target",
-                               "hint": "command 签证必须给 --task-id，且不能带 --plan-id"})
+                               "hint": "command 签证必须同时给 --scope-hash 与 --task-id，"
+                                       "且不能带 --plan-id。现有签证用 %s 查看"
+                                       % gcmd("visa", "list")})
         return {"scope_type": kind, "scope_hash": digest, "task_id": task}, None
     if not plan or task:
         return _bad_scope({"ok": False, "error": "bad_scope_target",
-                           "hint": "plan 签证必须给 --plan-id，且不能带 --task-id"})
+                           "hint": "plan 签证必须同时给 --scope-hash 与 --plan-id，"
+                                   "且不能带 --task-id。现有签证用 %s 查看"
+                                   % gcmd("visa", "list")})
     return {"scope_type": kind, "scope_hash": digest, "plan_id": plan}, None
 
 
@@ -662,18 +852,21 @@ def cmd_visa_list(root):
 def cmd_visa_revoke(root, visa_id):
     if not valid_visa_id(visa_id):
         return emit({"ok": False, "error": "bad_visa_id",
-                     "hint": "签证 ID 形如 v-0123abcd，即 v- 加 8 位小写十六进制"},
+                     "hint": "签证 ID 形如 v-0123abcd，即 v- 加 8 位小写十六进制；"
+                             "先用 %s 看现有签证" % gcmd("visa", "list")},
                     EXIT_USAGE)
     path = visa_path(root, visa_id)
     if not path.is_file():
         return emit({"ok": False, "error": "visa_not_found", "visa_id": visa_id,
-                     "hint": "该签证不存在，用 visa list 查看现有签证"}, EXIT_MISMATCH)
+                     "hint": "该签证不存在，先用 %s 查看现有签证"
+                             % gcmd("visa", "list")}, EXIT_MISMATCH)
     try:
         path.unlink()
     except OSError as exc:
         return emit({"ok": False, "error": "visa_revoke_failed", "visa_id": visa_id,
                      "detail": "%s: %s" % (type(exc).__name__, exc),
-                     "hint": "删除签证文件失败，检查文件权限后重试"}, EXIT_MISMATCH)
+                     "hint": "删除签证文件失败，检查 %s 的写权限后重试"
+                             % visa_path(root, visa_id)}, EXIT_MISMATCH)
     return emit({"ok": True, "visa_id": visa_id, "revoked": True,
                  "path": str(path)}, EXIT_OK)
 
@@ -683,13 +876,18 @@ def cmd_visa_peek(root, visa_id):
     if not valid_visa_id(visa_id):
         return emit({"ok": False, "error": "visa_invalid", "reason": "bad_id",
                      "visa_id": visa_id,
-                     "hint": "签证 ID 形如 v-0123abcd；不带签证时只能走重封签"},
+                     "hint": "签证 ID 形如 v-0123abcd；先用 %s 看现有签证，"
+                             "不带签证时只能走 %s"
+                             % (gcmd("visa", "list"),
+                                gcmd("seal", "--confirm", "--passphrase-stdin"))},
                     EXIT_MISMATCH)
     record = read_visa(root, visa_id)
     if record is None:
         return emit({"ok": False, "error": "visa_invalid", "reason": "not_found",
                      "visa_id": visa_id,
-                     "hint": "签证不存在或已被销毁，由人重新执行 visa issue"},
+                     "hint": "签证不存在或已被销毁，由人重新签发：%s"
+                             % gcmd("visa", "issue", "--time", "30",
+                                    "--passphrase-stdin")},
                     EXIT_MISMATCH)
     state, number = visa_state(record)
     return emit({"ok": state == "valid", "visa_id": visa_id, "status": state,
@@ -739,25 +937,34 @@ def cmd_visa_consume(root, visa_id, scope=None):
     if not valid_visa_id(visa_id):
         return emit({"ok": False, "error": "visa_invalid", "reason": "bad_id",
                      "visa_id": visa_id,
-                     "hint": "签证 ID 形如 v-0123abcd；不带签证时只能走重封签"},
+                     "hint": "签证 ID 形如 v-0123abcd；先用 %s 看现有签证，"
+                             "不带签证时只能走 %s"
+                             % (gcmd("visa", "list"),
+                                gcmd("seal", "--confirm", "--passphrase-stdin"))},
                     EXIT_MISMATCH)
     lock = acquire_visa_lock(root)
     if lock is None:
         return emit({"ok": False, "error": "visa_invalid", "reason": "locked",
                      "visa_id": visa_id,
-                     "hint": "签证扣减被其他进程占用，稍后重试"}, EXIT_MISMATCH)
+                     "hint": "签证扣减被其他进程占用，稍后重试；"
+                             "确认占用者是否已退出可用 %s 看配额是否已变"
+                             % gcmd("visa", "list")}, EXIT_MISMATCH)
     try:
         record = read_visa(root, visa_id)
         if record is None:
             return emit({"ok": False, "error": "visa_invalid", "reason": "not_found",
                          "visa_id": visa_id,
-                         "hint": "签证不存在或已被销毁，由人重新执行 visa issue"},
+                         "hint": "签证不存在或已被销毁，由人重新签发：%s"
+                                 % gcmd("visa", "issue", "--time", "30",
+                                        "--passphrase-stdin")},
                         EXIT_MISMATCH)
         state, number = visa_state(record)
         if state != "valid":
             return emit({"ok": False, "error": "visa_invalid", "reason": state,
                          "visa_id": visa_id,
-                         "hint": "签证已过期或配额耗尽，由人重新执行 visa issue"},
+                         "hint": "签证已过期或配额耗尽，由人重新签发：%s"
+                                 % gcmd("visa", "issue", "--time", "30",
+                                        "--passphrase-stdin")},
                         EXIT_MISMATCH)
         reason = scope_mismatch(record, scope)
         if reason:
@@ -771,7 +978,10 @@ def cmd_visa_consume(root, visa_id, scope=None):
                          "given_task": (scope.get("task_id") or "").strip(),
                          "given_plan": (scope.get("plan_id") or "").strip(),
                          "hint": "签证只对它签发时绑定的对象生效：哈希或 ID 不符就是"
-                                 "跨任务使用，请由人重新签发对应签证"},
+                                 "跨任务使用，请由人按 expected_* 重新签发对应签证：%s"
+                                 % gcmd("visa", "issue", "--time", "30",
+                                        "--scope-type", visa_scope_type(record),
+                                        "--passphrase-stdin")},
                         EXIT_MISMATCH)
         if number == VISA_UNLIMITED:
             return emit({"ok": True, "visa_id": visa_id,
@@ -786,7 +996,10 @@ def cmd_visa_consume(root, visa_id, scope=None):
                 return emit({"ok": False, "error": "visa_invalid",
                              "reason": "unlink_failed", "visa_id": visa_id,
                              "detail": "%s: %s" % (type(exc).__name__, exc),
-                             "hint": "签证文件无法删除，为免配额被重复使用，本次不放行"},
+                             "hint": "签证文件无法删除，为免配额被重复使用，本次不放行；"
+                                     "由人检查 %s 的写权限后 %s"
+                                     % (visa_path(root, visa_id),
+                                        gcmd("visa", "revoke", visa_id))},
                             EXIT_MISMATCH)
             # 只写 stderr：stdout 必须是纯 JSON，否则 ats.py 的 _run_guard 解析不到结果。
             sys.stderr.write("[Visa] 配额已耗尽，签证已销毁，"
@@ -829,6 +1042,7 @@ VALUE_FLAGS = {
     "--time": "minutes",
     "--note": "note",
     "--id": "visa_id",
+    "--file": "patch_file",
     "--scope-type": "scope_type",
     "--scope-hash": "scope_hash",
     "--task-id": "task_id",
@@ -839,14 +1053,15 @@ VALUE_FLAGS = {
 def parse_args(argv):
     """解析参数，返回 (action, opts)；用法错误返回 (None, None)。
 
-    --number / --time / --note / --id / --scope-type / --scope-hash /
-    --task-id / --plan-id 只在 visa 子命令里有意义，其余子命令带上
+    --number / --time / --note / --id / --file / --scope-type / --scope-hash /
+    --task-id / --plan-id 只在各自子命令里有意义，其余子命令带上
     也不会被消费（保持旧调用方按位置解析的兼容性）。
     """
     opts = {"root": None, "confirm": False, "passphrase_stdin": False,
             "number": None, "minutes": None, "note": None,
             "visa_id": None, "sub": None, "scope_type": None,
-            "scope_hash": None, "task_id": None, "plan_id": None}
+            "scope_hash": None, "task_id": None, "plan_id": None,
+            "patch_file": None}
     words = []
     i = 0
     while i < len(argv):
@@ -894,8 +1109,9 @@ def parse_args(argv):
     return action, opts
 
 
-USAGE = ("python ats_guard.py verify|seal|init|auth|self "
+USAGE = ("python ats_guard.py verify|seal|init|auth|self|patch "
          "[--root DIR] [--confirm] [--passphrase-stdin] [--json]；"
+         "patch: --file <白名单文件> [--confirm --passphrase-stdin]；"
          "visa: issue --time MINUTES [--number N|unlimited] [--note TEXT] "
          "[--scope-type digest|command|plan --scope-hash SHA256 "
          "--task-id TASK|--plan-id PLAN] | list | peek --id <visa_id> | "
@@ -906,7 +1122,7 @@ USAGE = ("python ats_guard.py verify|seal|init|auth|self "
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     action, opts = parse_args(argv)
-    if action not in ("verify", "seal", "init", "auth", "self", "visa"):
+    if action not in ("verify", "seal", "init", "auth", "self", "visa", "patch"):
         return emit({"ok": False, "error": "usage", "usage": USAGE}, EXIT_USAGE)
     root = resolve_root(opts.get("root"))
     if action == "visa":
@@ -927,6 +1143,9 @@ def main(argv=None):
     if action == "seal":
         return cmd_seal(root, opts.get("confirm"),
                         read_passphrase(opts.get("passphrase_stdin")))
+    if action == "patch":
+        return cmd_patch(root, opts.get("patch_file"), opts.get("confirm"),
+                         read_passphrase(opts.get("passphrase_stdin")))
     return cmd_self()
 
 

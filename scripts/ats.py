@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""agent-task-scheduler — Task 层执行器 (v4.0.0-R0)
+"""agent-task-scheduler — Task 层执行器 (v0.3.1.1：w17vbc)
 
 命令：
   create <id> --command "..." [--cwd DIR] [--level L0..L3] [--timeout SEC]
@@ -4510,6 +4510,37 @@ def _guard_visa_gate(root, visa_id, verify_payload, files):
     return None
 
 
+def _consume_visa_when_clean(root, visa_id):
+    """基线干净时也把 digest 签证用掉一次：一张签证 = 有限次握手。
+
+    不扣的话会出现「基线干净 + 一张签证 → 可以无限次带着跑」：verify 每次
+    都通过，签证从来没被用过，配额、有效期全成了摆设，签证退化成永久护身符。
+    这里补上这一扣，让「带着签证跑一次 = 消耗 1 次配额」对所有路径都成立。
+
+    只扣 digest：command / plan 绑的是具体任务/计划，由 _visa_task_gate 消费。
+    扣减失败只记事件、不拦截 —— 本次命令本来就不需要签证。
+    """
+    visa_id = (visa_id or "").strip()
+    if not visa_id:
+        return
+    rc, peek = _run_guard(["visa", "peek", "--id", visa_id], root)
+    if rc != EXIT_OK or not peek.get("ok"):
+        return
+    if peek.get("scope_type") != "digest":
+        return
+    rc, result = _run_guard(["visa", "consume", "--id", visa_id], root)
+    if rc != EXIT_OK or not result.get("ok"):
+        log_event(root, "guard_visa_unused", visa_id=visa_id,
+                  reason=result.get("reason") or result.get("error"))
+        return
+    if result.get("destroyed"):
+        sys.stderr.write("[Visa] 基线本来就干净，这张签证没用上，"
+                         "但配额已扣到 0，签证已销毁。\n")
+    log_event(root, "guard_visa_used", visa_id=visa_id,
+              remaining=result.get("remaining"), destroyed=result.get("destroyed"),
+              files=[], reason="baseline_clean")
+
+
 def _visa_task_gate(root, command, context, result):
     """approval_required 时的 Task / Plan Visa 闸门；不涉及签证一律返回 None。
 
@@ -4566,7 +4597,8 @@ def guard_handshake(root, skip_guard=False, guard_approval=None, visa_id=None):
     """启动准入。返回 None 表示放行；否则返回 {"code", "payload"}。
 
     顺序：--skip-guard 先过 L3 审批闸门 → 自检看门狗摘要 → 跑 verify →
-    （verify 仅因核心 .py 摘要不符失败时，凭签证放行一次并扣配额）→
+    （verify 仅因核心 .py 摘要不符失败时，凭签证放行一次并扣配额；
+     verify 通过时也扣一次 digest 配额，避免「一张签证无限次带着跑」）→
     持只读句柄 → 冻结策略快照。任一步失败都 fail-closed。
     """
     global GUARD_SKIP_ACTIVE
@@ -4630,6 +4662,9 @@ def guard_handshake(root, skip_guard=False, guard_approval=None, visa_id=None):
                                            "manifest": str(_guard_manifest_path(root)),
                                            "next_action": payload.get("next_action"),
                                            "hint": hint}}}
+        # 校验通过：基线干净，这张 digest 签证这次没用上，但配额照样要扣
+        # —— 否则一张签证就能无限次带着跑，「限额」形同虚设。
+        _consume_visa_when_clean(root, visa_id)
     _hold_handles()
     _freeze_policy(root)
     return None
@@ -4777,7 +4812,7 @@ def print_json(data, code=EXIT_OK):
 def build_parser():
     ap = argparse.ArgumentParser(
         prog="ats.py",
-        description="agent-task-scheduler — Task 层执行器 (v4.0.0-R0)",
+        description="agent-task-scheduler — Task 层执行器 (v0.3.1.1：w17vbc)",
     )
     ap.add_argument("--root", default=None,
                     help="状态根目录，默认 <ats 本体目录>/.ats（即仓库根目录下的 .ats）；"
