@@ -32,6 +32,28 @@ tests/split/
 # It changes every session and carries no shipped value, so keep it out of the repo.
 NEXT-OPTIONS.md
 
+# 信任根与封签基线：万一 root 被指到仓库根目录，这两个文件会落在仓库里。
+# 密钥是本机私有物、清单是本机代码快照，都不该进 git（历史上从未跟踪过）。
+ats_guard_key.json
+ats_guard_manifest.json
+
+# 看门狗写文件用的临时件（先写 .tmp 再原子替换），崩溃残留不该进仓库。
+*.tmp
+
+# Python 测试 / 静态检查缓存
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# 合并与编辑器残留
+*.orig
+*.rej
+*.swp
+*.swo
+*~
+
 # Backups
 *.bak
 *.bak-*

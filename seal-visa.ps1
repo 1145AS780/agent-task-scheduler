@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 
@@ -194,14 +194,14 @@ $sealBlocked = $false
 
 if ($verifyRc -eq 0) {
     Write-Bi '      现在是封好的状态（校验通过），可以只发签证。' '      Everything matches the sealed baseline, so a visa alone is enough.' 'Green'
-    $ans = Read-Host '      还要重新封签吗？(y/N)'
+    $ans = [string](Read-Host '      还要重新封签吗？(y/N)')
     if ($ans -match '^[yY]') { $needSeal = $true }
 } elseif ($verifyRc -eq 3) {
     Write-Bi '      密钥还在，但封签清单丢了 —— 只能重新封签。' '      The key is still here but the manifest is gone, so sealing is the only way forward.' 'Yellow'
     $needSeal = $true
 } else {
     Write-Bi '      校验没通过：有核心脚本和上次封签对不上（上面 problems 里列的就是）。' '      Verification failed: some core scripts differ from the sealed baseline (see "problems" above).' 'Yellow'
-    $ans = Read-Host '      现在重新封签吗？(Y/n)'
+    $ans = [string](Read-Host '      现在重新封签吗？(Y/n)')
     if ($ans -notmatch '^[nN]') {
         $needSeal = $true
     } else {
@@ -210,7 +210,7 @@ if ($verifyRc -eq 0) {
 }
 
 Write-Host ''
-$ans = Read-Host '      顺便发一张签证吗？(Y/n)'
+$ans = [string](Read-Host '      顺便发一张签证吗？(Y/n)')
 $needVisa = $true
 if ($ans -match '^[nN]') { $needVisa = $false }
 
@@ -300,9 +300,11 @@ if ($needVisa) {
         Write-Bi '      注意：现在没封签，选 2 / 3 会因为摘要不符被直接拒绝，选 1 才是当下有用的。' '      Note: the baseline is not sealed right now, so 2 / 3 would be rejected on digest mismatch; only 1 makes sense here.' 'Yellow'
     } elseif ($needSeal) {
         Write-Bi '      刚封完签，digest 签证已经用不上了，建议选 2 或 3。' '      The baseline is freshly sealed, so digest is pointless now; prefer 2 or 3.' 'Yellow'
+    } else {
+        Write-Bi '      现在是封好的状态：选 1 的签证会在下一次握手被扣掉（校验本来就通过，用不上），要放行任务请选 2 或 3。' '      The baseline is already sealed: a digest visa would be spent by the next handshake without being needed, so pick 2 or 3 to clear a task.' 'Yellow'
     }
     Write-Host ''
-    $pick = (Read-Host '      输入 1 / 2 / 3（回车 = 1）').Trim()
+    $pick = ([string](Read-Host '      输入 1 / 2 / 3（回车 = 1）')).Trim()
     if (-not $pick) { $pick = '1' }
 
     $taskId = ''
@@ -316,7 +318,7 @@ if ($needVisa) {
             Write-Bi '      现在一条任务都没有，先用 ats.py create 建一条。' '      There are no tasks yet; create one with ats.py create first.'
         }
         Write-Host ''
-        $taskId = (Read-Host '      task id').Trim()
+        $taskId = ([string](Read-Host '      task id')).Trim()
         if (-not $taskId) {
             $plain = $null
             Exit-With 2 '[停止] task id 是空的，没有签发签证。' '[STOP] The task id is empty. No visa was issued.'
@@ -330,7 +332,7 @@ if ($needVisa) {
             Write-Bi '      现在一个计划都没有，先建一个计划再来。' '      There are no plans yet; create one first.'
         }
         Write-Host ''
-        $planId = (Read-Host '      plan id').Trim()
+        $planId = ([string](Read-Host '      plan id')).Trim()
         if (-not $planId) {
             $plain = $null
             Exit-With 2 '[停止] plan id 是空的，没有签发签证。' '[STOP] The plan id is empty. No visa was issued.'
@@ -340,22 +342,25 @@ if ($needVisa) {
     }
 
     Write-Host ''
-    $mins = (Read-Host '      有效期多少分钟？(回车 = 30)').Trim()
+    $mins = ([string](Read-Host '      有效期多少分钟？(回车 = 30)')).Trim()
     if (-not $mins) { $mins = '30' }
     if (($mins -notmatch '^\d+$') -or ([int]$mins -lt 1)) {
         $plain = $null
         Exit-With 2 '[停止] 有效期必须是正整数（分钟），没有签发签证。' '[STOP] The lifetime must be a positive whole number of minutes. No visa was issued.'
     }
 
+    Write-Host ''
+    Write-Bi '      配额按「握手次数」扣：每跑一条命令扣 1 次，扣完当场销毁这张签证。' '      The quota counts handshakes: every command you run spends 1, and the visa destroys itself at 0.'
+    Write-Bi '      所以「改一次代码、跑一次」= 1 次；想连着跑几条，就先把次数给够。' '      So "edit once, run once" = 1; give more if you want several runs back to back.'
     if ($pick -eq '3') {
-        $cnt = (Read-Host '      能用几次？(回车 = unlimited，计划跑完就散)').Trim()
+        $cnt = ([string](Read-Host '      给几次？(回车 = unlimited：计划内每条任务各扣 1 次)')).Trim()
         if (-not $cnt) { $cnt = 'unlimited' }
     } else {
-        $cnt = (Read-Host '      能用几次？(回车 = 1)').Trim()
+        $cnt = ([string](Read-Host '      给几次？(回车 = 1)')).Trim()
         if (-not $cnt) { $cnt = '1' }
     }
 
-    $note = (Read-Host '      备注（写给自己看的，可空）').Trim()
+    $note = ([string](Read-Host '      备注（写给自己看的，可空）')).Trim()
 
     $visaArgs = @('--root', $Root, 'visa', 'issue', '--time', $mins, '--number', $cnt)
     if ($pick -eq '2') { $visaArgs += @('--task', $taskId) }
@@ -375,18 +380,20 @@ if ($needVisa) {
         $zh = @'
 [失败] 签证没有签发成功。看上面 JSON 里的 "error"：
 
-  task_not_found      task id 写错了，或者那条任务还没建
-  plan_not_found      plan id 写错了
-  plan_spec_invalid   这个计划的 DAG 本身不合法，先修好再签
-  bad_number          配额 / 有效期不合法（unlimited 只能用在 plan 上）
+  passphrase_required  口令不对（detail 里是 passphrase_mismatch），重跑本脚本
+  task_not_found       task id 写错了，或者那条任务还没建
+  plan_not_found       plan id 写错了
+  plan_spec_invalid    这个计划的 DAG 本身不合法，先修好再签
+  bad_number           配额 / 有效期不合法（unlimited 只能用在 plan 上）
 '@
         $en = @'
 [FAILED] The visa was not issued. Check the "error" field in the JSON above:
 
-  task_not_found     the task id is wrong, or the task was never created
-  plan_not_found     the plan id is wrong
-  plan_spec_invalid  the plan DAG itself is invalid; fix it before signing
-  bad_number         the quota / lifetime is invalid (unlimited only works for plan)
+  passphrase_required  the passphrase is wrong (see passphrase_mismatch in detail); run this script again
+  task_not_found       the task id is wrong, or the task was never created
+  plan_not_found       the plan id is wrong
+  plan_spec_invalid    the plan DAG itself is invalid; fix it before signing
+  bad_number           the quota / lifetime is invalid (unlimited only works for plan)
 '@
         $plain = $null
         Exit-With $visaRes.Code $zh $en
@@ -398,6 +405,12 @@ if ($needVisa) {
     Write-Bi ('      作用域：{0}' -f $visaJson.scope_type) ('      Scope: {0}' -f $visaJson.scope_type)
     Write-Bi ('      配额：{0}' -f $visaJson.number) ('      Quota: {0}' -f $visaJson.number)
     Write-Bi ('      到期：{0}' -f $visaJson.expires_iso) ('      Expires: {0}' -f $visaJson.expires_iso)
+    if ($visaJson.task_id) {
+        Write-Bi ('      只认这条任务：{0}' -f $visaJson.task_id) ('      Bound to task: {0}' -f $visaJson.task_id)
+    }
+    if ($visaJson.plan_id) {
+        Write-Bi ('      只认这个计划：{0}' -f $visaJson.plan_id) ('      Bound to plan: {0}' -f $visaJson.plan_id)
+    }
     if ($visaJson.note) {
         Write-Bi ('      备注：{0}' -f $visaJson.note) ('      Note: {0}' -f $visaJson.note)
     }
@@ -411,11 +424,14 @@ Write-Rule
 Write-Host ''
 
 if ($visaId) {
-    $runLine = 'python scripts\ats.py run <task_id> --visa-id ' + $visaId
+    $runTarget = if ($taskId) { $taskId } else { '<task_id>' }
+    $runLine = 'python scripts\ats.py run ' + $runTarget + ' --visa-id ' + $visaId
     $envLine = '$env:ATS_VISA_ID = "' + $visaId + '"'
+    $peekLine = 'python scripts\ats.py visa peek ' + $visaId
     $revokeLine = 'python scripts\ats.py visa revoke ' + $visaId
     Write-Bi ('  拿这张签证去跑：    {0}' -f $runLine) ('  {0} {1}' -f 'Use the visa:', $runLine)
     Write-Bi ('  或者设环境变量：    {0}' -f $envLine) ('  {0} {1}' -f 'Or set an env var:', $envLine)
+    Write-Bi ('  还剩几次（不扣）：  {0}' -f $peekLine) ('  {0} {1}' -f 'Remaining quota:', $peekLine)
     Write-Bi ('  反悔就撤销：        {0}' -f $revokeLine) ('  {0} {1}' -f 'Revoke it:', $revokeLine)
 }
 Write-Bi ('  看所有签证：        {0}' -f 'python scripts\ats.py visa list') ('  {0} {1}' -f 'List visas:', 'python scripts\ats.py visa list')

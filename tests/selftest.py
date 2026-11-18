@@ -139,6 +139,18 @@ class Sandbox:
         (self.root / "policy.json").write_text(
             json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
+    def task_record(self, task_id):
+        """读任务记录：运行目录优先，已归档则回退 archive/（与 CLI 的 task_files_dir 同口径）。
+
+        failed / timeout / killed 任务收尾后会整目录搬进 <root>/archive/<id>/，用例不能
+        只认 tasks/<id>/task.json，否则任务刚结束就读到 FileNotFoundError。
+        """
+        for base in (self.root / "tasks", self.root / "archive"):
+            p = base / task_id / "task.json"
+            if p.is_file():
+                return json.loads(p.read_text(encoding="utf-8"))
+        raise AssertionError("任务 %s 的 task.json 既不在 tasks/ 也不在 archive/" % task_id)
+
 
 def expect(cond, msg):
     if not cond:
@@ -288,7 +300,7 @@ def supervisor_lost_is_detected():
             ec.unlink()
 
         rc, st = sb.json_out("status", "lost")
-        raw = json.loads(p.read_text(encoding="utf-8"))
+        raw = sb.task_record("lost")
         expect(st["status"] == "failed", "应 failed，实际 %s" % st["status"])
         expect(raw.get("note") == "supervisor_lost",
                "应标记 supervisor_lost，实际 %r" % raw.get("note"))
@@ -582,7 +594,7 @@ def hook_glob_no_match_fails_loudly():
         rc, run = sb.json_out("run", "glob0", "--wait")
         rc, st = sb.json_out("status", "glob0")
         expect(st["status"] == "failed", "无匹配时任务应 failed，实际 %s" % st["status"])
-        rec = json.loads((sb.root / "tasks" / "glob0" / "task.json").read_text(encoding="utf-8"))
+        rec = sb.task_record("glob0")
         hook = rec.get("post_hook") or {}
         expect(hook.get("error_type") == "hook_glob_no_match",
                "应报 hook_glob_no_match，实际 %r" % hook.get("error_type"))
@@ -614,7 +626,7 @@ def hook_glob_rejects_mixed_paths():
         sb.json_out("create", "globamb", "--cwd", str(sb.dir), "--level", "L0",
                     "--command", "echo hi @enc a.txt *.txt")
         sb.json_out("run", "globamb", "--wait")
-        rec = json.loads((sb.root / "tasks" / "globamb" / "task.json").read_text(encoding="utf-8"))
+        rec = sb.task_record("globamb")
         hook = rec.get("post_hook") or {}
         expect(hook.get("error_type") == "hook_glob_ambiguous",
                "应报 hook_glob_ambiguous，实际 %r" % hook.get("error_type"))
@@ -1442,6 +1454,32 @@ def visa_allows_runs_then_destroys_itself():
         payload = json.loads(out)
         expect(payload.get("error") == "visa_invalid",
                "应报 visa_invalid，实际 %r" % payload.get("error"))
+    finally:
+        sb.cleanup()
+
+
+@case
+def visa_is_consumed_even_when_baseline_is_clean():
+    """基线干净时也照扣：一张 digest 签证只能陪着跑一次握手，不许无限次带着跑。"""
+    sb = Sandbox()
+    try:
+        sb.seal()
+        rc, out, err = sb.guard("visa", "issue", "--time", "10")
+        expect(rc == 0, "签发应成功，实际 %s\n%s" % (rc, out))
+        visa_id = json.loads(out)["visa_id"]
+        visa_file = sb.root / "visas" / (visa_id + ".json")
+        expect(visa_file.is_file(), "签证应落盘")
+
+        sb.auto_seal = False
+        rc, out, err = sb.ats("list", "--visa-id", visa_id)
+        expect(rc == 0, "基线干净时执行应放行，实际 %s\n%s\n%s" % (rc, out, err))
+        expect(not visa_file.exists(),
+               "基线干净时也应扣掉这 1 次配额（否则一张签证能无限次带着跑）")
+
+        rc, out, err = sb.ats("list", "--visa-id", visa_id)
+        expect(rc == 0, "签证已销毁但基线干净，命令仍应放行，实际 %s\n%s\n%s"
+               % (rc, out, err))
+        expect(not visa_file.exists(), "已销毁的签证不应复活")
     finally:
         sb.cleanup()
 
