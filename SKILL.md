@@ -1,10 +1,10 @@
 ---
 name: agent-task-scheduler
 description: A local task scheduler an AI agent starts, polls, and steers between turns. Three entity layers (Task / Plan / Schedule), L0-L3 permission tiers with human approval, intra-stage dependency orchestration with failure propagation, step retry with backoff, stall detection, run snapshots and logs, a built-in HTTP downloader with resume and integrity check, torrent and magnet download via aria2c, and automatic encoding conversion via the @enc hook. Use when a long-running command must leave the chat turn, when commands need staged orchestration, when work repeats on a schedule, when batch-downloading files or torrents, or when a high-risk command needs approval first. 中文触发：面向 AI Agent 的本地任务调度技能，Agent 能在轮次之间启动、轮询并中途转向。三层实体（Task / Plan / Schedule）、L0-L3 分级权限与人工审批闭环（有效期、批量批准、白名单放行、存活租约免审、启动准入看门狗与口令闸门）、Stage 内依赖编排（depends_on + 失败传播）、步骤自动重试与退避、停滞检测（plan_stalled）、运行快照与调度器日志、内置 HTTP 下载器（断点续传、自动重试、完整性校验、并发与限速）、种子/磁力下载（aria2c）、命令成功后自动编码转换（`@enc` 钩子）。当需要让长时间运行的命令脱离对话轮次、分阶段编排多条命令、按周期反复执行、批量下载文件或种子、把多条命令一次性登记为指令包（仅登记不执行）、或需要审批才能执行高风险命令时使用。Licensed MIT. Source: github.com/1145AS780
-version: "4.0.0-R0"
+version: "0.3.1.1：w17vbc"
 ---
 
-# agent-task-scheduler v4.0.0-R0
+# agent-task-scheduler v0.3.1.1：w17vbc
 
 一个纯本地、无守护进程的调度器。它把「命令」分成三层实体，用文件系统作为唯一状态源，由 Agent 在轮次之间启动、轮询并中途转向。
 
@@ -761,7 +761,9 @@ python scripts/ats.py run deploy1 --approval ap-3f2a91c4
 
 **握手拦截逻辑**（`ats.py` 启动时 `guard_handshake`）：
 
-1. `verify` 通过 → 正常执行，签证完全不参与（也不会被消耗）。
+1. `verify` 通过 → 正常执行；**但 digest 签证照样扣 1 次**（command / plan 签证不动，
+   它们由权限门按任务/计划消费）。不扣的话「基线干净 + 一张签证」可以无限次带着跑，
+   配额与有效期全成摆设，签证会退化成永久护身符。
 2. `verify` 失败 → 判 `_visa_scope`：**只有全部 problem 都是 `.py` 的 `digest_mismatch`**
    才算签证覆盖范围；清单缺失、清单版本不符、空清单、`policy.json`/密钥文件被改、
    新增未封签文件，任何一条命中即**不覆盖**，仍报 `guard_check_failed`。
@@ -782,19 +784,22 @@ python scripts/ats.py run deploy1 --approval ap-3f2a91c4
   签证只把「代码完整性」这一关放过去，命令等级与审批判定一行都不放宽
 - 签证**不是封签的替代品**：它只覆盖 `.py` 摘要漂移；策略文件、密钥、清单本身被改
   时签证无效，改完策略仍须 `seal`
-- 签证**只在放行时消耗**：verify 失败但不在覆盖范围内（如 policy 被改）不扣配额，
-  免得白烧次数
+- 签证**不白烧次数，但也不许白蹭**：verify 失败且不在覆盖范围内（如 policy 被改）不扣配额；
+  verify 通过时 digest 签证照扣一次 —— 所以基线干净时别签 digest 签证，直接用
+  `task` / `plan` 签证放行具体对象
 
 `--visa-id` 与 `--guard-approval` / `--skip-guard` / `--passphrase-stdin` 一样是
 **全局开关**，在 argparse 之前被 `_extract_guard_flags` 剥离，子命令位置随意
 （`ats.py list --visa-id v-xxx` 与 `ats.py --visa-id v-xxx list` 等价）。
 `ats_plan.py` 复用同一套握手函数，因此签证对它自动生效。
 
-实测（`tests/selftest.py -k visa`，本节这 7 条 digest 签证用例全通过）：无口令签发 →
+实测（`tests/selftest.py -k visa`，本节这 8 条 digest 签证用例全通过）：无口令签发 →
 `passphrase_required`；错口令 → `passphrase_mismatch`；`number=2` 跑两次，第二次扣到 0
 并打印 `[Visa]`、文件消失，第三次 → `visa_invalid`；`expires_at` 改到过去 →
 `reason=expired`；`policy.json` 被改 → 仍 `guard_check_failed` 且配额未被消耗；
-L3 任务持签证仍 `approval_required`；`ATS_VISA_ID` 与 `--visa-id` 等价。
+L3 任务持签证仍 `approval_required`；`ATS_VISA_ID` 与 `--visa-id` 等价；
+基线干净时带 1 次 digest 签证跑一次，命令照常放行、签证同时被扣光销毁（第二次仍放行，
+但签证不会复活）。
 
 #### 5.7.2 Task Visa / Plan Visa：把配额绑到具体对象上
 
@@ -1275,7 +1280,7 @@ HTTP 层额外状态码：`403`（`forbidden_host` / `forbidden_origin`）、`41
 - [command-guide.md](references/command-guide.md) — 命令书写与调用规范
 - [anti-patterns.md](references/anti-patterns.md) — 常见错误用法
 - [api-guide.md](references/api-guide.md) — 对外协议、退出码、审批协议与扩展点清单
-- [versioning.md](references/versioning.md) — 版本号规范 `vA.B.C-Rx`、进位条件、发版纪律与 20 处落点清单
+- [versioning.md](references/versioning.md) — 版本号规范 `vA.B.C.D：XXXXXX`、进位条件、发版纪律与 20 处落点清单
 - [examples/](references/examples) — 可直接运行的最小样例
 
 ---
@@ -1304,19 +1309,25 @@ HTTP 层额外状态码：`403`（`forbidden_host` / `forbidden_origin`）、`41
 
 ## 15. 版本历史
 
-> ⚠️ **4.0.0-R0 是 A 级（安全）版本，升级必读。** 它把「任务可以在任意目录执行」改成
-> 「只能在 ATS root 内部，或 `policy.allow_dirs` 人类显式授权的目录（含子孙）」。
+> ⚠️ **本版沿用 `v4.0.0-R0` 发布的执行目录边界，升级必读。** 它把「任务可以在任意目录执行」
+> 改成「只能在 ATS root 内部，或 `policy.allow_dirs` 人类显式授权的目录（含子孙）」。
 > 拉取本版本后，**原有 `cwd` 落在 root 之外的任务会直接报 `bad_cwd` / `cwd_outside_allowlist`**，
 > 需先在审批页或 `ats.py policy --set allow_dirs` 里显式登记目录（该写入要口令）。
-> 另外 `scripts/` 下有四个 `.py` 改动（`ats.py` / `ats_plan.py` / `ats_torrent.py` / `ats_ui.py`），必须重新封签（`setup.bat` 或 `seal --confirm`），
-> 否则看门狗会以 `manifest_mismatch` 拒绝执行。
+> `0.3.1.1：w17vbc` 只是在这条边界之上追加功能，**没有放宽任何一条判定**，故这条警告继续适用；
+> 后续只换构建码的发版不再重复贴这条警告，口径见 [versioning.md](references/versioning.md) §4。
+> 另外 `scripts/` 下本轮有七个 `.py` 落点（`ats.py` / `ats_guard.py` / `ats_plan.py` / `ats_torrent.py` /
+> `ats_ui.py`，以及新增的 `ats_maintenance.py` / `ats_telegraph.py`），必须重新封签（`setup.bat` 或
+> `seal --confirm`），否则看门狗会以 `manifest_mismatch` 拒绝执行。
 
-版本号格式遵循 [versioning.md](references/versioning.md) 的 `vA.B.C-Rx`：`A` 安全/架构级、
-`B` 核心功能新增、`C` 修补、`Rx` 架构重置计数。旧 tag（`v3.1.1` 及更早）保持原样不回改。
+版本号格式遵循 [versioning.md](references/versioning.md) 的 `vA.B.C.D：XXXXXX`：`A` 世代位（只有推倒
+重写才 +1，至今为 `0`）、`B` 安全与架构位（**攒够 3 项 `C` 级变更才进位**）、`C` 核心功能里程碑、
+`D` 一批修补、`：XXXXXX` 6 位字母或数字的构建码（**日常发版只换这一位，数字不动**）。冒号必须是
+全角 `：`，半角写不进 git ref。旧 tag（`v3.1.1` 及更早）保持原样不回改。
 给使用者看的发版文档是 [CHANGELOG.md](CHANGELOG.md)，与本表同源，改版本时两处同步。
 
 | 版本 | 变更 |
 | --- | --- |
+| 0.3.1.1：w17vbc | **归档 / 急停 / 维护态 / 战情看板 / 热修补 / 兜底链**（只换构建码，数字沿用 GitHub 已发布的最新版 `3.1.1`；`v4.0.0-R0` 的安全边界与兼容承诺不变，判定与取舍见 [versioning.md](references/versioning.md) §7）。归档：`failed` / `timeout` / `killed` 收尾后整目录搬进 `<root>/archive/<id>/`，`tasks/` 只留活任务；保留集 `task.json` / `exit_code` / `stdout.log` / `stderr.log` 等证据文件，路径字段按新目录重定基（`_rebase_task_paths`），`status` / `logs` / `events` / `resume` 经 `task_files_dir()` 统一「运行目录优先、`archive/` 兜底」；容量闸 `ATS_ARCHIVE_MAX_TASKS`（默认 200）/ `ATS_ARCHIVE_MAX_BYTES`（默认 512 MiB），超限按最旧 `archived_at` 淘汰（`prune_archive`），另配 `unarchive_task` / `purge_archive` 两个反向操作。急停：`ats.py abort` 写 `<root>/abort.json`，除 `abort` 与 `approve` 外的子命令一律拒跑（否则标志一落就没人能解），解除走 `abort --clear`。维护态：`unpack` 停机进维护态（停任务、释放句柄、只放行 `MAINTENANCE_ALLOWED`）、`tryrun` 在窗口内跑自测命令（默认 300 秒、输出留尾 4000 字符）、`repack` 重建封签基线（不带 `--confirm` 只出 Diff）；三者实现移到 `scripts/ats_maintenance.py`，`ats.py` 只留延迟导入 + 转发，模块缺失时给可复制提示而不是 `ImportError`。战情看板：`telegraph/Receive.txt` 追加回执（追加锁 TTL 30 秒），`board_text` / `emit_board` 渲染最近 10 条并跳过 `supervise` 内部进程；渲染拆到 `scripts/ats_telegraph.py`，写入侧（`receipt_path` / `append_receipt`）仍留在 `ats.py`。看门狗热修补：`ats_guard.py patch` 从 `<root>/snapshots/` 取封签态原文生成 Diff（最多回传 200 行），`HOT_PATCH_REDLINE`（`ats_guard.py` 自身、密钥、`policy.json`）一旦出现在改动里即全面停机，清单保留最近 50 条热修记录。Plan 兜底链：Step 级 `on_failure` 在「重试耗尽仍 failed/timeout」时唤醒兜底 Step（`fallback_map` / `arm_fallbacks` / `mark_untriggered_fallbacks`）；提交阶段拒自指（`on_failure_self`）、拒未知目标、拒重复指向、拒长度 ≥2 的环（`fallback_cycle`），运行期兜底深度上限 `MAX_FALLBACK_DEPTH=5`；`fail_on_critical: stop` 下**声明了 `on_failure` 的失败不触发即停**（先让兜底跑，兜底自己失败才停）；`on_failure` 属行为字段，纳入 `plan_fingerprint`。控制台：新增**签证卡片**（`visa.issue` / `visa.revoke` 走 `/api/action`、口令经 stdin 交 CLI），成功后 `invalidate_visa_cache()` 立即失效，避免页面显示已扣掉的旧配额；签证结论仍只消费 `ats.py visa list`，UI 不自己判过期与配额。帮助层：`hint_command()` / `guard_command()` 统一生成可复制命令，`tutorial()` 按「给人 / 给 AI」输出分步引导（对应 `command-human.md` / `command-ai.md`），`--help` 顶层改分组菜单（`MENU_GROUPS`）。文档：新增 `command-ai.md` / `command-human.md` 两份行为协议与 `FEATURES.md` 功能地图。测试：新增 `tests/mini.py` 迷你沙箱；3 条会读已归档任务的用例（`supervisor_lost_is_detected` / `hook_glob_no_match_fails_loudly` / `hook_glob_rejects_mixed_paths`）改用 `Sandbox.task_record()` 的「运行目录优先、`archive/` 兜底」口径（全量仍 95 条） |
 | 4.0.0-R0 | **执行目录边界（P0）+ 控制台升级（P1）+ 库级编排层**（见 §5、§3.7）。安全机制：任务 `cwd` 从「任意已存在目录」收窄为「ATS root 内部 + `policy.allow_dirs` 每一项及其全部子孙」，判定由三个函数承担——`_path_within()`（带分隔符比较，`/allowed` 不会把 `/allowed-evil` 误判为子孙）、`resolve_cwd()`（相对路径一律以 **root** 为基准，不用调用方 cwd，避免「校验一处、执行另一处」）、`cwd_allowed()`（返回 `(ok, resolved, reason)`）；`allow_dirs` 是 `RESTRICTED_POLICY_KEYS` 成员，`policy --set` 必须带人类口令。边界在三处落地：`create` / `pack` 建阶段拒越界（`bad_cwd`，`reason` ∈ `cwd_outside_allowlist` / `cwd_missing`）、`_start_task` 与 `_supervise` **两道执行前二次校验**（`allow_dirs` 事后被改、白名单目录被删或移走都会在启动前拦下，**绝不静默回退到 root**）、Plan 层 `validate_spec` / `materialize_plan` / `ensure_step_permission` / `start_step` 与 preflight 上下文复用同一解析结果（Task 与 Plan 两条执行路径由同一套规则约束）；`policy --set allow_dirs` 写入前逐项校验（相对路径、缺失目录拒 `bad_allow_dir`），`policy --json` 输出 `allow_dirs_detail`（每项含原始写法 `raw` / `exists` / `broader_than_root`）与 `boundary_warnings`。控制台：`ats_ui.py` 增 `--token-file`，绑非回环地址（如 `--host 0.0.0.0`）时必须同时给令牌文件，否则进程直接退出（返回码 2）并打印可复制的补救命令，**没有「无鉴权降级」**；令牌只从文件读、不进 argv，缺失时自动生成 `secrets.token_urlsafe(32)` 并收紧权限；`_authorized()` 用 `hmac.compare_digest` 校验 `Authorization: Bearer`，同一闸门罩住 `do_GET` 的 `/api/*` 与 `do_POST` 的 `/api/action`（缺失/错误回 401 + `WWW-Authenticate`），页面首次打开弹令牌框（`#authGate`）、令牌存浏览器 `localStorage`，回环默认模式不强迫配令牌以保持本机体验。审批页新增**路径白名单卡片**：逐条并排显示「配置里的写法 / 归一后的绝对路径」，标出目录是否存在、是否覆盖了 root 本身，`boundary_warnings` 原样红字渲染；编辑区一行一个绝对路径，保存走 `/api/action` 的 `policy.set`，口令经 stdin 交 CLI，**UI 不代批、不做二次判断**，权限边界始终在 CLI 侧。创建表单的 `cwd` 由自由文本框改为**白名单下拉**（首项「（默认：root 内部）」= 留空，`exists:false` 的标 `[目录缺失]`，白名单为空时禁用并提示去审批页添加，重建选项时保留用户已选值），手打越界路径的入口因此消失，但 CLI 侧 `bad_cwd` 校验原样保留——**UI 只减少误触，不构成权限边界**。窄屏适配：窗口窄于 860px 时表格转卡片（`thead{display:none}` + `tbody td::before{content:attr(data-label)}`，两个表格 14 格逐格补 `data-label`）、`table{min-width:0}` 覆盖原 `min-width:760px`、顶栏与 MCP 条 `flex-wrap` + `min-width:0` + `word-break:break-all` 修掉长串撑破、按钮 `min-height:38px`、输入/选择/文本框 `font-size:16px`（低于 16px 会触发 iOS 聚焦缩放）；断点从 720 抬到 860 是实测结论（760 宽时列被挤成「等/级」逐字换行）。库层：新增 `api/ats_api.py`（`AtsClient`，`create` / `run` / `wait_task` / `wait_for_approval` / `run_and_wait` 等编排），只以**子进程**调 CLI、**绝不 import `ats.py` / `ats_plan.py`**（import 后直接调 handler 会绕过 verify、只读句柄与策略冻结）、不内置也不缓存口令、不重实现任何权限判断；它位于 `scripts/` 之外故不在摘要范围，代价是自身不受封签保护，所以这三条自我约束写在文件头。新增 13 条用例（`cwd_outside_allowlist_rejected_at_create` / `relative_cwd_is_root_relative` / `cwd_gone_blocks_run_without_fallback` / `supervise_rechecks_cwd_before_spawn` / `policy_allow_dirs_validates_each_entry` / `policy_reports_allow_dirs_boundary` / `plan_step_cwd_respects_allowlist` / `ui_refuses_public_bind_without_token` / `ui_token_gate` / `ui_loopback_without_token` / `ui_allow_dirs_panel` / `ui_task_cwd_is_select` / `ui_narrow_screen_cards`，全量 95 条） |
 | 3.3.0-R0 | **Task Visa / Plan Visa：作用域绑定的自动审批豁免**（见 §5.7.2）。基础签证只覆盖 `digest_mismatch`，本次覆盖「反复点批准」的审批疲劳：签证绑到**具体对象**，命中即在 `permission_gate` 的 `approval_required` 分支自动放行。作用域三选一互斥，老签证文件无需迁移（缺省即 `digest`）：`digest`（老语义）/ `command`（Task Visa，绑 `scope_hash` + `task_id`）/ `plan`（Plan Visa，绑 DAG 指纹 + `plan_id`）。签发：`ats.py visa issue --task <task_id>` 读 `task.json` 命令原文算 `SHA-256(归一化原文)`；`ats.py visa issue --plan <plan_id>` 先 `validate_spec`（DAG 不合法即 `plan_spec_invalid` 拒签）再绑 `plan_fingerprint`；底层仍可 `ats_guard.py visa issue --scope-type/--scope-hash/--task-id/--plan-id`，三条路径一律要人类口令。`plan_fingerprint` 只投影 stage 的 `id`/`mode` 与 step 的 `id`/`command`/`level`/`depends_on`(排序)/`retry`/`retry_backoff`/`timeout`/`cwd`/`env`(键排序)，排除 `attempt`/`status`/时间戳等运行期元数据，故跑完再跑与 `resume` 都不改指纹。`--number unlimited` **只对 `scope_type=plan` 开放**（command / digest 写 unlimited 直接 `bad_number`），unlimited 扣减不写文件、`number` 保持字符串。消费：`_visa_task_gate` 先 `visa peek` 只读预检（不存在 / 过期 / 耗尽 / 非法 ID / digest → `visa_task_skipped` 并**交回人工审批**，不报错不扣配额），再 `visa consume` 比对作用域；不匹配即 `visa_mismatch`（`task_mismatch` / `plan_mismatch` / `hash_mismatch` / `scope_required`）且**不扣配额、不回落审批**；匹配则扣配额并写 `auto_approved` 审批记录 + `visa_auto_approved` 事件，记录 `expires_at == created_at`（落地即过期，只供追溯、不可当凭证重放，身份在 `resolved_by = visa:<visa_id>`）。`ats_plan.py` 的 `ensure_step_permission` 收到 `visa_mismatch` 时该 step 直接 `failed`（`error_type=visa_mismatch`），不建审批单、不重试。安全底线：Task Visa 哈希签发时写死（改 `task.json` 命令即 `hash_mismatch`）、Plan Visa 消费端按 `plan_id` 级联匹配（指纹用于签发门槛与留痕，改 DAG 不在消费端拦，拿去跑普通 Task 则退化成哈希比对 → `hash_mismatch`）、`task_id`/`plan_id` 逐字比对绝不跨任务、只免 `approval_required` 一环（`deny_rules`/`policy` 上限/hard floor/preflight 全原样生效）、command/plan 签证**不覆盖核心脚本摘要不符**（硬拿它过握手即 `visa_scope_not_applicable` 且不扣配额）；准入失败时豁免扩到 `approve` 与 `visa issue/list/peek`（否则核心脚本正在改时签不了证），`revoke`/`consume` 不放行。新增 7 条用例（`visa_task_scope_auto_approves_bound_task` / `visa_task_scope_rejects_other_task` / `visa_task_scope_binds_command_text` / `visa_plan_scope_covers_whole_dag` / `visa_plan_scope_rejects_other_plan` / `visa_unlimited_requires_plan_scope` / `visa_command_scope_does_not_cover_core_tamper`，全量 82 条） |
 | 3.2.0-R0 | `extend` **扩展插件层**：插件是 `<ATS_ROOT>/extend/<extend_id>/` 下自包含目录，用 `instruction.json` 声明入口与指令；`scripts/ats_extend.py` 的发现层**只扫描、不导入、不执行**，执行时复用普通 Task 全链路（权限门、预检、审批、日志、`stop`）；子命令 `list` / `help` / `check`（纯预演，不写审批、不碰租约、不执行）/ `run`；目录名须等于 `extend_id`、id 匹配 `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`、入口禁目录穿越，任一不符即 `inactive`；等级声明不被信任（`EXTEND_LEVEL_FLOOR = "L2"`，低于 L2 抬到 L2、缺失或非法按 L3）；`run` 的 `command` 与 `check` 的 `gate_text` 逐字相同、`shell=false`、`--arg` 进 argv 不进 shell；非 active 直接 `inactive_extend`（退出码 4）不建 Task。同时新增 `scripts/ats_preflight.py` 静态预检，入口绝对路径进 `gate_text`，因此插件源码会被扫到。**一键安装** `setup.ps1`：口令经 stdin 传入（不进 argv / 进程列表 / 命令历史），密钥不存在时先 `init` 再 `seal`，失败按 `passphrase_too_short` / `passphrase_mismatch` 给出可复制下一步。`torrent` **自动注入公共 Tracker**：`scripts/ats_torrent.py` 常量区新增 `DEFAULT_TRACKERS`（138 条 udp / http / https 公共节点），`start_aria2` 构建 argv 时动态追加 `--bt-tracker=<列表>`，磁力链与 `.torrent` 共用同一参数（前者靠它取元数据、后者靠它找 peer）；可用环境变量 `ATS_TRACKERS` 覆盖，优先级高于内置表，设成空串表示显式关闭注入；新增 `sanitize_trackers` 统一清洗换行 / 制表 / 反引号 / 引号 / 多余空格 / 空项 / 重复项，只保留 `udp://` `http://` `https://`（`wss://` 等 aria2c 不支持的 scheme 静默丢弃），缺路径的地址自动补 `/announce`；`aria2_start` 事件新增 `trackers`（生效条数）与 `tracker_source`（`default` / `env:ATS_TRACKERS` / `env:ATS_TRACKERS(disabled)`），变量里一条合法地址都没有时输出 `tracker_warning` 而非崩溃；错误返回体批量补齐可复制 `hint`，并由 `tests/lint.py` 第 5 项 `check_actionable_error` 强制——字面量 `print_json({"error": ...})` 缺 `hint` / `message` 直接判失败；文档与 `--help` 文本统一 `--root` 默认值口径为 `<ats 本体目录>/.ats`（`ats_ui.py` 例外为 `<cwd>/.ats`）；版本号格式改用 `vA.B.C-Rx`（规范见 [versioning.md](references/versioning.md)），全仓 19 处版本号落点统一到 `3.2.0-R0`，顺带修正 `ats.py` 残留的 `v2.7`（docstring 与 `--help` 两处）；新增**签证（Visa）**：带配额与过期时间的完整性豁免，用于「改完核心脚本还要跑测试」的场景，只跳过 `digest_mismatch` 这一关，绝不绕过审批门（见 §5.7.1）：签证存 `<root>/visas/<visa_id>.json`（`visa_id` 为 `v-`+8 位 hex，字段 `number` / `created_at` / `expires_at` / `note`），`visa issue --number N --time 分钟` 必须持人类口令（`--number` 缺省 1、`--time` 缺省 30 分钟、`--note` 可选），`visa list` 只列未过期且 `number > 0` 的签证，`visa revoke <id>` 提前报废；`ats.py` 握手在 `verify` 失败时先判 `_visa_scope`（**仅当全部 problem 都是 `.py` 的 `digest_mismatch`** 才覆盖，清单缺失 / 版本不符 / 空清单 / `policy.json` / 密钥 / 新增未封签文件一律不覆盖），再读 `--visa-id` 或 `ATS_VISA_ID`（命令行优先，与 `--guard-approval` / `--skip-guard` / `--passphrase-stdin` 同为 `_extract_guard_flags` 剥离的全局开关），校验未过期且 `number > 0` 后放行并**原子扣减**（独立锁文件互斥，读-改-写一次落盘），扣到 0 当场删签证文件并向 stderr 打印 `[Visa] 配额已耗尽，签证已销毁，后续执行请重新封签或申请新签证。`；未带 ID 报 `guard_check_failed`、ID 不存在 / 非法 / 过期报 `visa_invalid`（`reason` 为 `not_found` / `bad_id` / `expired`）；签证不在覆盖范围内时不扣配额；`ats_plan.py` 复用同一套握手函数自动生效；新增 7 条用例（`visa_issue_requires_passphrase` / `visa_allows_runs_then_destroys_itself` / `visa_expired_is_rejected` / `visa_does_not_cover_policy_tamper` / `visa_does_not_bypass_approval` / `visa_id_from_env_is_equivalent` / `visa_list_and_revoke`，全量 75 条） |

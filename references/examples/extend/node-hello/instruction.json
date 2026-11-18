@@ -1,0 +1,14 @@
+{
+  "extend_id": "node-hello",
+  "dis_name": "Node 最小示例",
+  "desc": "非 Python 入口的最小插件：验证发现、预演、审批与拉起四段链路",
+  "version": "0.1.0",
+  "language": "node",
+  "entry_point": "main.mjs",
+  "commands": {
+    "hello": "打印一条问候",
+    "echo": "回显传入的参数",
+    "fail": "以退出码 3 结束，用来验证失败收敛"
+  },
+  "level": "L2"
+}

@@ -1,4 +1,4 @@
-# 编排规格 — agent-task-scheduler v4.0.0-R0
+# 编排规格 — agent-task-scheduler v0.3.1.1：w17vbc
 
 本文是 Plan / Schedule 层的权威规格。实现以 `scripts/ats_plan.py` 为准；若文档与实现不一致，以脚本行为为准并修正文档。
 

@@ -1,4 +1,4 @@
-# 状态机 — agent-task-scheduler v4.0.0-R0
+# 状态机 — agent-task-scheduler v0.3.1.1：w17vbc
 
 本文描述 Task / Plan / Stage / Step / Schedule / Approval 六类实体的状态集合、迁移条件与对应事件。
 

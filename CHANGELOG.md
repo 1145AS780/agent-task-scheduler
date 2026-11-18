@@ -1,12 +1,100 @@
 # 变更日志 — agent-task-scheduler
 
-版本号遵循 `vA.B.C-Rx` 规范：`A` 安全与架构级、`B` 核心功能新增、`C` 修补、`Rx` 架构重置计数。
+版本号遵循 `vA.B.C.D：XXXXXX` 规范：`A` 世代位（只有推倒重写才 +1，至今为 `0`）、`B` 安全与架构位
+（**攒够 3 项 `C` 级变更才进位**）、`C` 核心功能里程碑、`D` 一批修补、`：XXXXXX` 6 位字母或数字的
+构建码（**日常发版只换这一位，数字不动**）。冒号必须是全角 `：`，半角写不进 git ref。
 进位条件、发版纪律与 20 处版本号落点见 [references/versioning.md](references/versioning.md)。
 
 本文件与 `SKILL.md` §15「版本历史」同源，**改版本时两处必须同步**，否则使用者从
 GitHub Releases 和从 SKILL.md 会读到两套说法。
 
 ---
+
+## 0.3.1.1：w17vbc — 2026-11-18
+
+> 本版**只换构建码**：数字沿用 GitHub 已发布的最新版 `3.1.1`，**不放宽也不收窄任何权限边界**，
+> `v4.0.0-R0` 那条升级警告继续适用（`cwd` 白名单照旧生效，判定函数一行未改）。日常发版只换码、
+> 数字少跳，原因见 [versioning.md](references/versioning.md) §2.1。
+> 口径冲突要写明：`v4.0.0-R0` 的 tag 已推到 `origin/master` 但没有对应 GitHub Release，
+> 本次按「已发布 Release」口径续号，代价是数字不再严格表达那次边界收窄——所以上面这条警告不撤。
+>
+> **仍然必须重新封签**：本轮 `scripts/` 下变了七个 `.py`（`ats.py`、`ats_guard.py`、`ats_plan.py`、
+> `ats_torrent.py`、`ats_ui.py`，以及新增的 `ats_maintenance.py`、`ats_telegraph.py`）。
+> 在 `OCSKIS/` 下运行 `setup.bat`（口令经 stdin，不进 argv、不进命令历史），
+> 再用 `python scripts/ats_guard.py verify` 确认 `"ok": true`、`"problems": []`。
+
+### 新增能力
+
+- **任务归档**：`failed` / `timeout` / `killed` 收尾后，整个任务目录从 `<root>/tasks/<id>/` 搬进
+  `<root>/archive/<id>/`，`tasks/` 只留活任务，`status` 列表不再被历史任务淹没。证据文件
+  （`task.json`、`exit_code`、`stdout.log`、`stderr.log` 等）随目录整体搬走，路径字段用
+  `_rebase_task_paths()` 重定基，不会出现「记录里还是旧目录、文件已经不在」。
+- **读取侧统一口径 `task_files_dir()`**：运行目录优先、已归档则回退 `archive/<id>/`。因此
+  `status` / `logs` / `events` / `resume` 对已归档任务**仍可读**，归档不是删除。
+- **归档容量闸**：`ATS_ARCHIVE_MAX_TASKS`（默认 200 个）、`ATS_ARCHIVE_MAX_BYTES`（默认 512 MiB），
+  超限按最旧 `archived_at` 淘汰（`prune_archive()`，当前要读的任务用 `keep_id` 免淘汰）；
+  另给 `unarchive_task()` / `purge_archive()` 两个反向操作，误归档能搬回、确不要能彻底删。
+- **人类急停 `ats.py abort`**：写 `<root>/abort.json`，此后除 `abort` 与 `approve` 外的子命令
+  一律拒跑（`abort` 自己必须在豁免名单里，否则标志一落就没人能解）；解除走 `abort --clear`。
+- **维护态 `unpack` / `tryrun` / `repack`**：`unpack` 停机进维护态（停任务、释放句柄，只放行
+  `MAINTENANCE_ALLOWED` 里的命令）；`tryrun` 在维护窗口内跑自测命令（默认 300 秒上限、输出保留
+  尾部 4000 字符，避免刷屏）；`repack` 在维护态下重建封签基线，不带 `--confirm` 只出 Diff。
+- **战情看板**：`telegraph/Receive.txt` 追加回执（追加锁 TTL 30 秒，崩溃残留可自动清理），
+  `board_text()` / `emit_board()` 渲染最近 10 条并跳过 `supervise` 内部进程。
+- **看门狗热修补 `ats_guard.py patch`**：从 `<root>/snapshots/` 取封签态原文生成 Diff（最多回传
+  200 行），`HOT_PATCH_REDLINE`（`ats_guard.py` 自身、密钥、`policy.json`）一旦出现在改动清单里
+  即全面停机——**能修的东西里不包括守门人自己**。
+- **Plan 兜底链**：Step 级 `on_failure` 在本 Step 重试耗尽仍 `failed` / `timeout` 时唤醒兜底 Step
+  （`fallback_map()` / `arm_fallbacks()` / `mark_untriggered_fallbacks()`）；提交阶段就拒自指
+  （`on_failure_self`）、拒未知目标、拒两个 Step 指向同一目标、拒长度 ≥2 的环（`fallback_cycle()`），
+  运行期兜底深度上限 `MAX_FALLBACK_DEPTH=5`。`fail_on_critical: stop` 模式下，**声明了 `on_failure`
+  的失败不触发即停**（先让兜底跑，兜底自己失败才停）。`on_failure` 属行为字段，纳入 `plan_fingerprint`。
+- **控制台签证卡片**：`visa.issue` / `visa.revoke` 经 `/api/action` 调 CLI（口令经 stdin），成功后
+  `invalidate_visa_cache()` 立即失效，避免页面显示已扣掉的旧配额；签证结论仍只消费
+  `ats.py visa list`，UI 不自己判过期、不自己算配额。
+- **帮助层**：`hint_command()` / `guard_command()` 统一生成可直接复制的命令，`tutorial()` 按
+  「给人 / 给 AI」输出分步引导（对应 `command-human.md` / `command-ai.md`），`--help` 顶层改分组菜单。
+
+### 修补
+
+- **签证配额在「基线干净」时也照扣**：此前 `verify` 通过时握手完全不碰签证，于是「基线干净 +
+  一张 digest 签证」可以无限次带着跑——签证从来没被消费过，配额与有效期形同虚设，从限额票据
+  退化成永久护身符。现在 `guard_handshake` 在 verify 通过时也调一次 `visa consume`
+  （只扣 digest；command / plan 仍由权限门按任务/计划消费），扣到 0 照样当场销毁。
+  契约统一成「带着签证跑一次 = 消耗 1 次配额」。
+- **`seal-visa.ps1` 的配额提示与真实行为对齐**：改成「配额按握手次数扣，每跑一条命令扣 1 次，
+  扣完当场销毁」，并补三条提示——封好的基线选 digest 会被下一次握手白扣、剩余配额用
+  `visa peek` 只看不扣、`run` 示例里直接填好真实 task id。
+
+### 结构改动
+
+- `unpack` / `tryrun` / `repack` 的实现移到 `scripts/ats_maintenance.py`，`ats.py` 只留延迟导入与
+  函数转发；模块缺失时给可复制的提示，而不是抛 `ImportError`。
+- 战情看板的**渲染**拆到 `scripts/ats_telegraph.py`，**写入**（`receipt_path()` / `append_receipt()`）
+  仍留在 `ats.py`，依赖方向单向：`ats_telegraph` → `ats.py`（core），用延迟导入避免循环。
+- 新增 `command-ai.md` / `command-human.md` 两份行为协议与 `FEATURES.md` 功能地图。
+
+### 测试
+
+- 新增 `tests/mini.py` 迷你沙箱，给「快速跑一条命令看行为」提供不碰主沙箱的落点。
+- 3 条会读已归档任务的用例（`supervisor_lost_is_detected`、`hook_glob_no_match_fails_loudly`、
+  `hook_glob_rejects_mixed_paths`）改用 `Sandbox.task_record()`，与 CLI 侧 `task_files_dir()` 同一
+  口径（运行目录优先、`archive/` 兜底）。全量仍 95 条，`python tests/selftest.py` 全绿。
+
+### 为什么只换码，不动 `C` 或 `D`
+
+按 [versioning.md](references/versioning.md) §2，`C` 的判据是「一整块新能力，需要使用者停下来单独
+评估」。本轮的归档 / 急停 / 维护态 / 热修补 / 兜底链**各自都够得上这个门槛**，严格记法应该是
+`0.3.2.0：<新码>`。本次按指令沿用 GitHub 已发布的最新版数字 `3.1.1`，故只换构建码 `w17vbc`，
+并把取舍写在这里：
+
+- **代价**：数字的承诺价值被稀释一次——只看数字的人会以为这一版只是「补齐」，也无法从中看出
+  `v4.0.0-R0` 那次边界收窄（tag 已推但没有 GitHub Release）。
+- **为什么还能接受**：本版所有新能力都是**追加**，没有一条放宽既有判定；`v4.0.0-R0` 的安全警告
+  仍然完整适用，升级风险与它同级，没有新增「必须停下来重读边界」的理由。
+- **下次怎么记**：若这批内容再叠一层安全或兼容性变更，就按 §2.1 的「`B` 攒够 3 项 `C` 级变更」
+  进位到 `0.4.0.0：<新码>` 起的新数字，而不是继续只换码。
+
 
 ## 4.0.0-R0 — 2026-11-14
 
