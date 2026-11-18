@@ -198,3 +198,56 @@ Invoke-RestMethod "https://api.github.com/repos/1145AS780/agent-task-scheduler/r
 | 已打 tag、未推送 | `git tag -d "v…：…"` → 重封签 → 重新打 |
 | 已推送 | **不回改**，发新版本（新码或进位），CHANGELOG 里说明上一版哪里错了 |
 | 只是运行中的任务失控 | 用 `ats.py abort` 急停、`unpack` 进维护态，不要用回滚代码来解决运行态问题 |
+
+---
+
+## 8. 附录：本机 GitHub 链路现状（2026-11-18 实测）
+
+发版流程里唯一依赖外网的环节是「推代码 / 推 tag / 发 Release」。各链路在本机实测结果不同，
+**不要把「配置里写了」当成「能用」**：
+
+| 链路 | 实测命令 | 结果 | 结论 |
+| --- | --- | --- | --- |
+| `git push`（HTTPS） | `git push origin master` | `30c4514..fd4a45e  master -> master` | **可用**，推代码 / 推 tag 走这条 |
+| 匿名 REST（公开读） | `GET api.github.com/repos/...` | `private=False`，`releases=3` | **可用**，查 tag / Release 用这条 |
+| `gh` CLI | `gh auth status` | `You are not logged into any GitHub hosts` | **不可用**，本机无法完成登录 |
+| MCP 本地 stdio | `search_repositories` / `get_file_contents` | 返回真实数据，26 个工具 | **可用**（2026-11-18 修好后） |
+| MCP 官方远程插件 | `mcp.config…:github.github` | `Unauthorized` / `authentication failed` | **不可用**，走 Trae 账号 OAuth，与 PAT 无关 |
+| `npx` 拉包 | `npm view …server-github version` | `version = '2025.4.8'` | **可用**（npm 已修，见下） |
+
+### 8.1 MCP 本地链路修通前踩的四个坑
+
+四条全部实测过，缺任何一条都起不来，且报错信息彼此掩盖：
+
+| 坑 | 现象 | 实测根因 | 处置 |
+| --- | --- | --- | --- |
+| npm 自损 | `npm error Class extends value undefined is not a constructor or null` | nvm 目录里 npm 11.19.1 自带的 `minipass-flush@1.0.6` 与 `minipass@7.1.3` 链断 | 用官方同版本包整体替换，坏目录备份为 `npm.broken-20261118` |
+| TLS 证书 | `fetch failed`，`cause=UNABLE_TO_VERIFY_LEAF_SIGNATURE` | node 自带 CA 库不读 Windows 证书库 | 给 server 的 env 加 `NODE_OPTIONS=--use-system-ca` |
+| 令牌失效 | `401 Bad credentials` | 旧 `github_pat_` 已废 | 换新令牌，实测 `/user` 200、仓库 `admin/push/pull` 全 True |
+| 服务重名 | 调本地名却落到远程插件，报 `Unauthorized` | 本地 `GitHub` 与官方远程 `github.github` 同名，本地被顶掉 | 本地改名 `github-local`，两者并存互不干扰 |
+
+改完要**重载窗口**才生效：MCP 工具表是启动时快照的，改名后当次会话仍按旧名查找，会报 `Server … not found`。
+
+### 8.2 Release 这一步为什么仍然只能手工做
+
+`github-mcp-server 0.6.2` 的 26 个工具里**没有任何 Release 相关工具**（只有文件、分支、Issue、PR、搜索）。
+所以「MCP 修好了」不等于「能发 Release」：
+
+- 查：走匿名 REST，`GET /repos/{owner}/{repo}/releases`
+- 发：`POST /repos/{owner}/{repo}/releases`，**必须带令牌**，无匿名路径
+- 别在脚本里写 `gh release create` 或假设 MCP 能建 Release，本机这两条都不成立
+
+顺带一个实测口径：远端现有 6 个 tag（`v2.7.0`…`v4.0.0-R0`），而 Release 只有 3 个
+（`v3.1.1`、`v2.9.1`、`v2.7.0`）——`v3.2.0-R0`、`v3.3.0-R0`、`v4.0.0-R0` 三个 tag 都没有对应 Release。
+这正是 §6「tag 存在 ≠ Release 已创建」的实证，不是个例。
+
+### 8.3 三条操作纪律
+
+- **令牌不进仓库、不进脚本、不进命令历史**。MCP 配置是 Trae 的用户级文件
+  `%APPDATA%\Trae CN\User\mcp.json`，不属于本仓库，也不该被复制进任何 `.ps1` / `.bat`。
+  另有一份同名配置在 `%USERPROFILE%\.marscode\IDEA.mcp.config.json`，两边令牌可能不同步，改动时以实测 `/user` 为准。
+- **只读查询一律走匿名 REST**（公开仓库不需要令牌），命令见 §6。
+- **修环境之后必须重跑本节的表**。上面每一条结论都是当时那套 `node` / `npm` / 令牌状态下的结果，
+  不是版本承诺；换了任何一个，旧结论立即失效。
+
+> 这一段只记录**当前环境**，不是版本承诺。改动时请重跑表里的命令，把新结果写回来，别沿用这里的旧结论。
