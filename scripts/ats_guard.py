@@ -51,6 +51,9 @@
     python ats_guard.py visa revoke <visa_id>
     python ats_guard.py visa consume --id <visa_id>
                          [--scope-hash SHA256 --task-id TASK --plan-id PLAN]
+    python ats_guard.py plugin seal   [plugin_id] --confirm [--passphrase-stdin]
+    python ats_guard.py plugin verify [plugin_id]
+    python ats_guard.py plugin list
 
 ========================= 签证（Visa）=========================
 签证是「改了核心脚本、还没重封签，但要先跑一轮测试」的临时通行证，存于
@@ -69,6 +72,18 @@
   * 带 scope 的签证必须带对应 scope 参数消费，参数对不上直接 visa_mismatch，
     **绝不跨任务**：哈希或 ID 不符就不放行，也不回落到审批；
   * 过期即失效，过期时间由 --time 分钟数决定，不接受「永不过期」。
+
+========================= 插件封签（plugin）=========================
+plugins/<plugin_id>/ 是插件**代码**，与 extend 插件（只读清单 + 子进程执行）相反：
+它的 Injection.py 由 ats 主进程 exec，因此封签是它唯一的闸门。
+
+  * 基线单独一份：<root>/ats_guard_plugin_manifest.json，不进核心清单，
+    插件换版只重封插件，核心脚本不用动；
+  * 未封签 / 哈希不符 / 目录缺失 → 一律拒绝导入，不回落到审批；
+  * 插件目录内的字节码（__pycache__、*.pyc）不参与封签，但也不得存在 ——
+    加载器全局设 sys.dont_write_bytecode，写出来的缓存只会让封签失配；
+  * 封签同样必须持人类口令，与 seal 同级。
+
 退出码：0 通过 / 2 用法错误 / 3 清单缺失 / 4 校验失败
 """
 
@@ -78,6 +93,7 @@ import difflib
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -1036,6 +1052,308 @@ def cmd_visa(root, sub, opts, passphrase):
                              "plan_id": opts.get("plan_id")})
 
 
+# ========================= 插件封签（Python 插件层）=========================
+# plugins/<plugin_id>/ 是**代码**，不是运行态，因此不进 core_files() 的基线：
+# 插件换版只重封插件清单，核心脚本不用动，避免「改个插件就要重封全仓」。
+#
+# 代价说清楚：插件封签清单是第二份基线，**只有**插件目录里的文件受它约束。
+# 插件里的 Injection.py 最终仍在主进程里跑（这点与 extend 插件的子进程模型相反），
+# 所以封签就是它唯一的闸门：清单缺失 / 哈希不符一律不导入，不回落到审批。
+PLUGIN_DIR_NAME = "plugins"
+PLUGIN_MANIFEST_NAME = "ats_guard_plugin_manifest.json"
+PLUGIN_MANIFEST_VERSION = 1
+PLUGIN_JSON_NAME = "plugin.json"
+PLUGIN_DEFAULT_INJECTION = "Injection.py"
+PLUGIN_SKIP_DIRS = ("__pycache__",)
+PLUGIN_SKIP_SUFFIX = (".pyc", ".pyo")
+PLUGIN_SUBS = ("seal", "verify", "list")
+PLUGIN_MAX_FILES = 5000
+PLUGIN_MAX_TOTAL_BYTES = 128 * 1024 * 1024
+PLUGIN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
+def plugins_root():
+    """插件代码根目录。ATS_PLUGINS_ROOT 仅供 CI / 自测隔离，与 ats_plugin.py 同口径。"""
+    env = os.environ.get("ATS_PLUGINS_ROOT")
+    if env:
+        return Path(env)
+    return SCRIPT_DIR.parent / PLUGIN_DIR_NAME
+
+
+def plugin_manifest_path(root):
+    return Path(root) / PLUGIN_MANIFEST_NAME
+
+
+def plugin_dirs():
+    """待封签的插件目录：跳过符号链接与隐藏目录，符号链接会把基线引到仓外。"""
+    base = plugins_root()
+    if not base.is_dir():
+        return []
+    out = []
+    for entry in sorted(base.iterdir(), key=lambda p: p.name.lower()):
+        if entry.is_symlink() or not entry.is_dir():
+            continue
+        if entry.name.startswith("."):
+            continue
+        out.append(entry)
+    return out
+
+
+def plugin_files(plugin_dir):
+    """插件目录内全部文件的 {相对路径: sha256}；跳过字节码，否则封签永远追不上缓存。"""
+    base = Path(plugin_dir)
+    files = {}
+    total = 0
+    for root, dirs, names in os.walk(base):
+        dirs[:] = sorted(d for d in dirs
+                         if d not in PLUGIN_SKIP_DIRS and not d.startswith("."))
+        for name in sorted(names):
+            if name.endswith(PLUGIN_SKIP_SUFFIX):
+                continue
+            path = Path(root) / name
+            rel = path.relative_to(base).as_posix()
+            digest = sha256_file(path)
+            if digest is None:
+                files[rel] = None
+                continue
+            total += path.stat().st_size
+            files[rel] = digest
+    return files, total
+
+
+def plugin_declared(plugin_dir):
+    """plugin.json 的极简校验：能解析、是对象、入口指向目录内的真实文件。
+
+    这里只做「能不能封签」的判断，字段级校验在 ats_plugin.py（导入前那一层）；
+    两处口径不必重复，但入口防穿越两边都必须挡 —— 封签封的正是那个入口文件。
+    """
+    try:
+        data = json.loads((Path(plugin_dir) / PLUGIN_JSON_NAME)
+                          .read_text(encoding="utf-8-sig"))
+    except Exception as exc:             # noqa: BLE001
+        return None, "plugin_manifest_invalid", "%s: %s" % (type(exc).__name__, exc)
+    if not isinstance(data, dict):
+        return None, "plugin_manifest_invalid", "plugin.json 顶层必须是对象"
+    injection = str(data.get("injection") or data.get("entry_point")
+                    or PLUGIN_DEFAULT_INJECTION).strip()
+    base = Path(plugin_dir).resolve()
+    try:
+        resolved = (base / injection).resolve()
+    except OSError as exc:
+        return None, "plugin_injection_invalid", "入口路径无法解析: %s" % exc
+    if resolved != base and base not in resolved.parents:
+        return None, "plugin_injection_invalid", "入口必须落在插件目录内: %r" % injection
+    if not resolved.is_file():
+        return None, "plugin_injection_missing", "入口文件不存在: %s" % injection
+    return data, None, None
+
+
+def cmd_plugin_seal(root, confirm, passphrase, plugin_id=None):
+    """重建插件封签清单。单插件模式只重封一个，其余条目不删不改。"""
+    if not confirm:
+        return emit({"ok": False, "error": "confirm_required",
+                     "hint": "插件封签会重建插件信任基线，必须由人显式确认：%s"
+                             % gcmd("plugin", "seal", "--confirm", "--passphrase-stdin")},
+                    EXIT_USAGE)
+    auth = check_passphrase(root, passphrase)
+    if not auth.get("ok"):
+        return emit({"ok": False, "error": "passphrase_required",
+                     "detail": auth,
+                     "hint": "重建插件基线需要人工口令。密钥文件：%s" % key_path(root)},
+                    EXIT_MISMATCH)
+
+    if plugin_id is not None:
+        text = str(plugin_id).strip()
+        if not PLUGIN_ID_PATTERN.match(text):
+            return emit({"ok": False, "error": "bad_plugin_id",
+                         "plugin_id": text,
+                         "hint": "插件 id 只允许字母、数字、下划线、短横线"}, EXIT_USAGE)
+        target = plugins_root() / text
+        if target.is_symlink() or not target.is_dir():
+            return emit({"ok": False, "error": "plugin_not_found",
+                         "plugin_id": text,
+                         "plugin_dir": str(plugins_root()),
+                         "hint": "该插件目录不存在；用 %s 看现有插件"
+                                 % gcmd("plugin", "list")}, EXIT_USAGE)
+        targets = [target]
+    else:
+        targets = plugin_dirs()
+
+    path = plugin_manifest_path(root)
+    previous = read_manifest(path) or {}
+    old_plugins = previous.get("plugins")
+    old_plugins = old_plugins if isinstance(old_plugins, dict) else {}
+
+    sealed = dict(old_plugins) if plugin_id is not None else {}
+    problems = []
+    changed = []
+    dropped = []
+    if plugin_id is None:
+        dropped = sorted(set(old_plugins) - {p.name for p in targets})
+
+    for plugin_dir in targets:
+        pid = plugin_dir.name
+        declared, code, detail = plugin_declared(plugin_dir)
+        if code:
+            problems.append({"plugin_id": pid, "error": code, "detail": detail})
+            continue
+        files, total = plugin_files(plugin_dir)
+        if not files:
+            problems.append({"plugin_id": pid, "error": "plugin_empty",
+                             "detail": "目录里没有任何文件"})
+            continue
+        if len(files) > PLUGIN_MAX_FILES or total > PLUGIN_MAX_TOTAL_BYTES:
+            problems.append({"plugin_id": pid, "error": "plugin_too_large",
+                             "detail": "%d 个文件 / %d 字节，超过封签上限 %d / %d"
+                                       % (len(files), total, PLUGIN_MAX_FILES,
+                                          PLUGIN_MAX_TOTAL_BYTES)})
+            continue
+        if any(digest is None for digest in files.values()):
+            problems.append({"plugin_id": pid, "error": "plugin_unreadable",
+                             "detail": "有文件读不出来，拒绝生成半份清单"})
+            continue
+        record = {"state": "active", "files": files,
+                  "entry": str(declared.get("injection")
+                               or declared.get("entry_point")
+                               or PLUGIN_DEFAULT_INJECTION),
+                  "version": str(declared.get("version") or ""),
+                  "sealed_at": int(time.time()),
+                  "sealed_iso": time.strftime("%Y-%m-%dT%H:%M:%S")}
+        old_files = (old_plugins.get(pid) or {}).get("files")
+        if isinstance(old_files, dict):
+            for name, digest in files.items():
+                if old_files.get(name) != digest:
+                    changed.append("%s/%s" % (pid, name))
+            for name in old_files:
+                if name not in files:
+                    changed.append("%s/%s" % (pid, name))
+        else:
+            changed.append("%s/*" % pid)
+        sealed[pid] = record
+
+    if problems and plugin_id is not None:
+        # 单插件模式：拒绝写盘，旧条目原样保留，避免「封失败还把旧基线抹了」。
+        return emit({"ok": False, "error": "plugin_seal_failed",
+                     "manifest": str(path), "problems": problems,
+                     "hint": "先修 problems 再重封；旧清单未被改动"}, EXIT_MISMATCH)
+
+    record = {
+        "version": PLUGIN_MANIFEST_VERSION,
+        "sealed_at": int(time.time()),
+        "sealed_iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "sealed_by": "human-with-passphrase",
+        "plugins_root": str(plugins_root()),
+        "plugins": sealed,
+    }
+    write_manifest(path, record)
+    return emit({"ok": True, "manifest": str(path),
+                 "plugins_root": str(plugins_root()),
+                 "plugins": {pid: {"files": len(entry.get("files") or {}),
+                                   "version": entry.get("version"),
+                                   "entry": entry.get("entry")}
+                             for pid, entry in sorted(sealed.items())},
+                 "changed": sorted(set(changed)),
+                 "dropped": dropped,
+                 "problems": problems}, EXIT_OK)
+
+
+def cmd_plugin_verify(root, plugin_id=None):
+    """比对插件字节与插件清单。只报事实，不修不封。"""
+    path = plugin_manifest_path(root)
+    manifest = read_manifest(path)
+    if manifest is None:
+        return emit({"ok": False, "error": "plugin_manifest_missing",
+                     "manifest": str(path),
+                     "next_action": "plugin_seal",
+                     "hint": "插件封签清单缺失：由人执行 %s 建立插件基线"
+                             % gcmd("plugin", "seal", "--confirm", "--passphrase-stdin")},
+                    EXIT_NO_MANIFEST)
+    if manifest.get("version") != PLUGIN_MANIFEST_VERSION:
+        return emit({"ok": False, "error": "plugin_manifest_version",
+                     "manifest": str(path),
+                     "expected": PLUGIN_MANIFEST_VERSION,
+                     "actual": manifest.get("version")}, EXIT_MISMATCH)
+
+    sealed = manifest.get("plugins")
+    sealed = sealed if isinstance(sealed, dict) else {}
+    base = plugins_root()
+    wanted = [str(plugin_id)] if plugin_id is not None else None
+    ids = sorted(set(list(sealed) + [p.name for p in plugin_dirs()]))
+    if wanted is not None:
+        ids = wanted
+
+    result = {}
+    all_problems = []
+    for pid in ids:
+        entry = sealed.get(pid)
+        plugin_dir = base / pid
+        problems = []
+        if entry is None:
+            state = "unsealed"
+            problems.append({"error": "plugin_unsealed",
+                             "detail": "该插件不在封签清单里"})
+        elif plugin_dir.is_symlink() or not plugin_dir.is_dir():
+            state = "missing"
+            problems.append({"error": "plugin_dir_missing",
+                             "detail": "清单里有、目录不见了"})
+        else:
+            current, _total = plugin_files(plugin_dir)
+            expected = entry.get("files")
+            expected = expected if isinstance(expected, dict) else {}
+            for name, digest in current.items():
+                if name not in expected:
+                    problems.append({"file": name, "error": "unsealed_file"})
+                elif digest != expected[name]:
+                    problems.append({"file": name, "error": "digest_mismatch"})
+            for name in expected:
+                if name not in current:
+                    problems.append({"file": name, "error": "missing_file"})
+            state = "modified" if problems else "active"
+        result[pid] = {"state": state, "problems": problems}
+        all_problems.extend(dict(p, plugin_id=pid) for p in problems)
+
+    ok = all(item["state"] == "active" for item in result.values())
+    payload = {"ok": ok, "manifest": str(path),
+               "plugins_root": str(base),
+               "checked": len(result), "plugins": result,
+               "problems": all_problems}
+    if not ok:
+        payload["next_action"] = "plugin_seal"
+        payload["hint"] = ("插件字节与封签不符，拒绝导入；确认改动可信后由人重封：%s"
+                           % gcmd("plugin", "seal", "--confirm", "--passphrase-stdin"))
+    return emit(payload, EXIT_OK if ok else EXIT_MISMATCH)
+
+
+def cmd_plugin_list(root):
+    path = plugin_manifest_path(root)
+    manifest = read_manifest(path)
+    sealed = (manifest or {}).get("plugins")
+    sealed = sealed if isinstance(sealed, dict) else {}
+    entries = []
+    for pid in sorted(set(list(sealed) + [p.name for p in plugin_dirs()])):
+        entry = sealed.get(pid) or {}
+        files = entry.get("files") if isinstance(entry.get("files"), dict) else {}
+        entries.append({"plugin_id": pid,
+                        "sealed": pid in sealed,
+                        "files": len(files),
+                        "version": entry.get("version"),
+                        "entry": entry.get("entry"),
+                        "sealed_iso": entry.get("sealed_iso")})
+    return emit({"ok": True, "manifest": str(path),
+                 "manifest_exists": manifest is not None,
+                 "plugins_root": str(plugins_root()),
+                 "count": len(entries), "plugins": entries}, EXIT_OK)
+
+
+def cmd_plugin(root, sub, opts, passphrase):
+    if sub == "seal":
+        return cmd_plugin_seal(root, opts.get("confirm"), passphrase,
+                               opts.get("plugin_id"))
+    if sub == "verify":
+        return cmd_plugin_verify(root, opts.get("plugin_id"))
+    return cmd_plugin_list(root)
+
+
 VALUE_FLAGS = {
     "--root": "root",
     "--number": "number",
@@ -1061,7 +1379,7 @@ def parse_args(argv):
             "number": None, "minutes": None, "note": None,
             "visa_id": None, "sub": None, "scope_type": None,
             "scope_hash": None, "task_id": None, "plan_id": None,
-            "patch_file": None}
+            "patch_file": None, "plugin_id": None}
     words = []
     i = 0
     while i < len(argv):
@@ -1104,6 +1422,19 @@ def parse_args(argv):
         if len(words) == 3:
             opts["visa_id"] = words[2]
         return action, opts
+    if action == "plugin":
+        # 插件封签：seal [plugin_id] / verify [plugin_id] / list。
+        # id 走位置参数而不是 --plugin-id，与 visa 的 `revoke <id>` 保持一致。
+        if len(words) < 2 or words[1] not in PLUGIN_SUBS:
+            return None, None
+        if len(words) > 3:
+            return None, None
+        opts["sub"] = words[1]
+        if len(words) == 3:
+            if words[1] == "list":
+                return None, None
+            opts["plugin_id"] = words[2]
+        return action, opts
     if len(words) > 1:
         return None, None
     return action, opts
@@ -1116,13 +1447,16 @@ USAGE = ("python ats_guard.py verify|seal|init|auth|self|patch "
          "[--scope-type digest|command|plan --scope-hash SHA256 "
          "--task-id TASK|--plan-id PLAN] | list | peek --id <visa_id> | "
          "revoke <visa_id> | consume --id <visa_id> "
-         "[--scope-hash SHA256] [--task-id TASK] [--plan-id PLAN]")
+         "[--scope-hash SHA256] [--task-id TASK] [--plan-id PLAN]；"
+         "plugin: seal [plugin_id] --confirm --passphrase-stdin | "
+         "verify [plugin_id] | list")
 
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     action, opts = parse_args(argv)
-    if action not in ("verify", "seal", "init", "auth", "self", "visa", "patch"):
+    if action not in ("verify", "seal", "init", "auth", "self", "visa", "patch",
+                      "plugin"):
         return emit({"ok": False, "error": "usage", "usage": USAGE}, EXIT_USAGE)
     root = resolve_root(opts.get("root"))
     if action == "visa":
@@ -1133,6 +1467,14 @@ def main(argv=None):
         if sub == "issue":
             passphrase = read_passphrase(opts.get("passphrase_stdin"))
         return cmd_visa(root, sub, opts, passphrase)
+    if action == "plugin":
+        sub = opts.get("sub")
+        if sub not in PLUGIN_SUBS:
+            return emit({"ok": False, "error": "usage", "usage": USAGE}, EXIT_USAGE)
+        passphrase = ""
+        if sub == "seal":
+            passphrase = read_passphrase(opts.get("passphrase_stdin"))
+        return cmd_plugin(root, sub, opts, passphrase)
     if action == "verify":
         return cmd_verify(root)
     if action == "auth":

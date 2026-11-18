@@ -214,12 +214,13 @@ python scripts/ats_ui.py --host 0.0.0.0 --token-file .ats/ui_tmp/token.txt
 
 | 命令 | 作用 | 关键参数 |
 | --- | --- | --- |
-| `create` | 创建任务（命令末尾可挂 `@enc` 钩子，见 §4.8） | `--command` / `--cwd` / `--level` / `--timeout` / `--env K=V` / `--no-shell` / `--spec` / `--force` |
+| `create` | 创建任务（命令末尾可挂 `@enc` 钩子，见 §4.9） | `--command` / `--cwd` / `--level` / `--timeout` / `--env K=V` / `--no-shell` / `--spec` / `--force` |
 | `pack` | 加载指令包：多条命令一次性登记为独立 Task，**不执行**（每项均可挂 `@enc`） | `commands`（英文逗号分隔）/ `--pack-id` / `--cwd` / `--level` / `--timeout` / `--description` |
 | `run` | 启动任务 | `--approval AP` / `--wait` / `--force`（重跑需 force） |
 | `download` | 创建并启动下载任务（`kind="download"`，复用 Task 全链路） | `--url` / `--file` / `--out` / `--name` / `--sha256` / `--size` / `--header` / `--proxy` / `--concurrency` / `--rate` / `--retry` / `--no-resume` / `--overwrite` / `--insecure` / `--level` |
 | `torrent` | 创建并启动种子下载任务（`kind="torrent"`，依赖 aria2c） | `--magnet` / `--torrent` / `--out` / `--seed-time` / `--max-download` / `--max-upload` / `--level` / `--timeout` |
 | `extend` | 扩展插件：`list` / `help` / `check`（预演，不执行）/ `run`（走普通 Task 全链路） | `extend_id` / `--action` / `--arg` / `--wait` / `--json` |
+| `plugin` | Python 插件：`list` / `help` / `check`（静态+封签，不导入）/ `load` / `run` / `lang` / `scaffold` | `plugin_id` / `--command` / `--arg` / `--lang` / `--key` / `--force` / `--json` |
 | `check` | 同步运行中任务（超时、退出、监督进程丢失） | 可选 `task_id`；不带则批量 |
 | `list` | 列表 | `--status succeeded,failed` / `--pack <pack_id>` / `--json` |
 | `show` | 详情 + stdout/stderr 尾部 | `--lines N` |
@@ -456,11 +457,57 @@ python scripts/ats.py extend run hello --action run --wait
  "gate": {"would": "ask", "reason": "approval"}, "preflight": {...}, "warnings": []}
 ```
 
-### 4.7 全局参数
+### 4.7 Python 插件 `ats.py plugin`
+
+`extend` 与 `plugin` 都叫「插件」，但执行模型相反，别混：
+
+| | `extend/<id>/instruction.json` | `plugins/<id>/plugin.json` + `Injection.py` |
+| --- | --- | --- |
+| 代码位置 | `<ATS_ROOT>/extend/`（运行态旁） | 代码根 `plugins/`（与 `scripts/` 平级） |
+| 执行方式 | **永远**拉起子进程，走普通 Task 全链路 | 导入**主进程**内执行 |
+| 闸门 | 权限门 / 预检 / 审批 / 日志 / `stop` | 静态校验 → 封签校验 → 受控 exec |
+| 谁来兜底 | Task 的等级与审批 | 封签基线（没封签或字节不符直接拒，**不回落审批**） |
+
+```bash
+python scripts/ats.py plugin scaffold demo-hello        # 生成最小骨架（plugin.json + Injection.py + strings.json）
+python scripts/ats_guard.py plugin seal --confirm --passphrase-stdin   # 人来做：口令经 stdin
+python scripts/ats.py plugin list                       # 扫描 + 封签状态（不导入）
+python scripts/ats.py plugin check demo-hello           # 静态校验 + 封签校验，到 exec 前停下
+python scripts/ats.py plugin load demo-hello            # 真正导入，列出登记的命令
+python scripts/ats.py plugin run demo-hello --command demo-hello.hello --arg trae
+python scripts/ats.py plugin lang demo-hello --key hello.said --lang zh
+```
+
+| 规则 | 说明 |
+| --- | --- |
+| 必填字段 | `plugin_id` / `name` / `version` / `description` / `level` / `allow_language`；`id`、`desc`、`language`、`entry_point` 等简写也认 |
+| 目录名 | 必须等于 `plugin.json` 的 `plugin_id`，否则 `plugin_id_mismatch` → `inactive` |
+| id 形状 | `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`，不匹配即 `inactive` |
+| 入口 | 默认 `Injection.py`，必须落在插件目录内（禁止穿越）；超过 512 KiB 直接判 `entry_too_large`——源码不会被人工看完 |
+| 语言 | `allow_language` 只接受 `python` / `py` / `python3`，其余按 `unsupported_language` |
+| 等级 | 声明值不被信任：低于 L2 抬到 L2，缺失或非法按 L3（与 `extend` 同一套 `_normalize_level`） |
+| `check` | 纯读：不导入插件、不跑顶层副作用、不写审批；**「check 通过」严格等于「load 不会被闸门拒绝」**，两者共用同一条 `_prepare` |
+| `load` / `run` | 共用同一条 `_prepare`，只在最后一步 exec 与否不同；没有第二条判定路径 |
+| 封签 | 独立清单 `<root>/ats_guard_plugin_manifest.json`，不进核心 `ats_guard_manifest.json`；单插件重封不影响其他插件，**插件换版不需要重封核心脚本** |
+| 命令名 | `api.command()` 登记的名字必须带插件前缀（如 `demo-hello.hello`），不得占用保留前缀 `ats.`、不得重复、长度 ≤64 |
+
+**三条铁律**（照搬 R1，理由不变）：
+
+1. **不写 `.pyc`**：`ats_plugin.py` 顶层就设 `sys.dont_write_bytecode = True`，否则插件目录多出 `__pycache__`，封签当场失配，且字节码能绕过「源码即审查对象」。
+2. **先封签再 exec**：没封签 / 封签与字节不符一律拒绝导入，`error` 为 `plugin_seal_invalid`、`hint` 直接给出可复制的封签命令；不存在「审批一下再导入」的回落。
+3. **导入后清缓存**：`_purge_plugin_modules()` 把从插件目录加载出来的模块全部从 `sys.modules` 摘掉（`ats_api` 除外），避免两个插件的同名 helper 互相顶替。
+
+**插件能拿到什么**：只有一个注入的窄接口 `import ats_api`（版本 `API_VERSION = "1.0"`），四个能力点——`tr()` 本地化、`command()` 登记命令、`log()` 写调度器日志、`state_dir()` 取 `<root>/plugin_state/<id>/`。**没有**执行命令、读写任务、发审批、拿 policy 的入口。插件目录里自带 `ats_api.py` 不生效（加载器先占住 `sys.modules`），`check` 会报 `shadow_api_module` 警告。
+
+**本地化**：`Localization/<locale>/strings.json`，回退链 `locale → en`；`api.tr()` 缺 key 时**返回 key 本身**（漏配一眼可见），`plugin lang --key` 查不到则 `value` 为 `null`、退出码 `3`。`scaffold` 生成的骨架自带 `en` / `zh` 两份文案，开箱可跑。
+
+**退出码**：`check` / `load` / `run` 通过为 `0`；插件不存在或目录非法 `3`（`plugin_not_found`）；`inactive`、未封签、封签失配、插件命令异常一律 `4`。
+
+### 4.8 全局参数
 
 `ats.py` / `ats_plan.py` / `ats_guard.py` 都支持 `--root <dir>`，优先级：`--root` > 环境变量 `ATS_ROOT` > `<ats 本体目录>/.ats`（即 `OCSKIS/.ats`，取脚本所在目录的父目录，不随 cwd 漂移）。`ats_ui.py` 是例外：默认 `<cwd>/.ats`，并把它显式传给子进程，所以 UI 与子进程看到的始终是同一个 root。
 
-### 4.8 `@enc` 后缀钩子（命令成功后自动转码）
+### 4.9 `@enc` 后缀钩子（命令成功后自动转码）
 
 在 `create` / `pack` 的命令文本**末尾**追加一段 `@enc <转换器参数>`，该任务就会在主命令**退出码为 0** 之后自动执行一次编码转换。`@enc` 必须是独立 token（前后为空白、行首或行尾）。
 

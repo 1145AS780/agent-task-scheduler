@@ -290,6 +290,25 @@ Rules that hold regardless of what the plugin declares:
 - `extend run` builds a task whose `command` is exactly the gate text `check` reports, sets `shell=false`, and passes arguments as an argv list, so `&` and `;` stay literal
 - Plugin entry sources are pulled into the preflight static scan automatically, because the entry's absolute path is part of the gate text
 
+## Python plugins
+
+`plugin` and `extend` are both called "plugins", but their execution models are opposite: `extend` always spawns a subprocess through the ordinary Task pipeline, while `plugin` **imports** `plugins/<plugin_id>/Injection.py` into the main process. The gate is therefore "static validation → seal verification → controlled exec", with no "approve and then import" fallback.
+
+```bash
+python scripts/ats.py plugin scaffold demo-hello      # skeleton: plugin.json + Injection.py + strings.json
+python scripts/ats_guard.py plugin seal --confirm --passphrase-stdin   # human step: passphrase via stdin
+python scripts/ats.py plugin list                     # scan plus seal state (never imports)
+python scripts/ats.py plugin check demo-hello         # static + seal checks, stops before exec
+python scripts/ats.py plugin load demo-hello          # actually import, list registered commands
+python scripts/ats.py plugin run demo-hello --command demo-hello.hello --arg trae
+```
+
+- `plugin.json` requires `plugin_id` / `name` / `version` / `description` / `level` / `allow_language`; the directory name must equal `plugin_id`
+- Three hard rules: never write `.pyc` (`sys.dont_write_bytecode = True`), verify the seal before exec, purge imported modules afterwards
+- Plugin seals live in their own manifest `<root>/ats_guard_plugin_manifest.json`, never in the core baseline, so shipping a plugin does not force a core re-seal
+- A plugin only gets one injected narrow interface, `import ats_api`: `tr()` / `command()` / `log()` / `state_dir()`. No command execution, task I/O, approvals or policy access
+- `check` never imports plugin code, so "check passes" is exactly "load will not be rejected by the gate" — both share a single decision chain
+
 ## Repository layout
 
 ```
@@ -311,6 +330,7 @@ scripts/                    The scheduler itself
 ├── ats_download.py         HTTP downloader with resume and integrity check
 ├── ats_torrent.py          aria2c wrapper for torrents and magnets
 ├── ats_extend.py           Extension discovery, level floor, gate text
+├── ats_plugin.py           Python plugins: static checks, seal checks, controlled import
 ├── ats_mcp.py              MCP adapter (stdio, 16 tools)
 ├── ats_mcp_http.py         Streamable HTTP endpoint hosted by the console
 ├── ats_ui.py               Local web console: monitor, run, approvals, create

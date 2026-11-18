@@ -36,6 +36,10 @@ NEXT-OPTIONS.md
 # 密钥是本机私有物、清单是本机代码快照，都不该进 git（历史上从未跟踪过）。
 ats_guard_key.json
 ats_guard_manifest.json
+ats_guard_plugin_manifest.json
+
+# 插件运行态：插件自己通过 state_dir() 写盘的地方，与本机相关，不进仓库。
+plugin_state/
 
 # 看门狗写文件用的临时件（先写 .tmp 再原子替换），崩溃残留不该进仓库。
 *.tmp

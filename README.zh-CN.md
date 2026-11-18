@@ -286,6 +286,25 @@ python scripts/ats.py extend run hello --action run --wait
 - `extend run` 建出的任务，其 `command` 与 `check` 报出的门禁文本完全一致，`shell=false`，参数以 argv 列表传递，所以 `&` 与 `;` 只是普通字符
 - 插件入口源码会自动进入预检静态扫描，因为入口绝对路径本身就是门禁文本的一部分
 
+## Python 插件
+
+`plugin` 与 `extend` 都叫「插件」，执行模型却相反：`extend` 永远拉起子进程走普通 Task 全链路；`plugin` 是把 `plugins/<plugin_id>/Injection.py` **导入主进程**执行，所以闸门换成「静态校验 → 封签校验 → 受控 exec」，没有「审批一下再导入」的回落路径。
+
+```bash
+python scripts/ats.py plugin scaffold demo-hello      # 生成骨架：plugin.json + Injection.py + strings.json
+python scripts/ats_guard.py plugin seal --confirm --passphrase-stdin   # 人来做：口令经 stdin
+python scripts/ats.py plugin list                     # 扫描 + 封签状态（不导入）
+python scripts/ats.py plugin check demo-hello         # 静态 + 封签校验，到 exec 前停下
+python scripts/ats.py plugin load demo-hello          # 真正导入，列出登记的命令
+python scripts/ats.py plugin run demo-hello --command demo-hello.hello --arg trae
+```
+
+- `plugin.json` 必填 `plugin_id` / `name` / `version` / `description` / `level` / `allow_language`；目录名必须等于 `plugin_id`
+- 三条铁律：不写 `.pyc`（`sys.dont_write_bytecode = True`）、先封签再 exec、导入后清模块缓存
+- 插件封签清单单独一份 `<root>/ats_guard_plugin_manifest.json`，不进核心基线，所以插件换版不需要重封核心脚本
+- 插件只拿到一个注入的窄接口 `import ats_api`：`tr()` / `command()` / `log()` / `state_dir()`，没有执行命令、读写任务、发审批、拿 policy 的入口
+- `check` 不导入插件代码，所以「check 通过」严格等于「load 不会被闸门拒绝」——两者共用同一条判定链
+
 ## 仓库结构
 
 ```
@@ -307,6 +326,7 @@ scripts/                    调度器本体
 ├── ats_download.py         HTTP 下载器，断点续传与完整性校验
 ├── ats_torrent.py          种子与磁力的 aria2c 封装
 ├── ats_extend.py           扩展发现、等级下限、门禁文本
+├── ats_plugin.py           Python 插件：静态校验、封签校验、受控导入
 ├── ats_mcp.py              MCP 适配器（stdio，16 个工具）
 ├── ats_mcp_http.py         控制台托管的 Streamable HTTP 端点
 ├── ats_ui.py               本地 Web 控制台：监控、运行、审批、创建

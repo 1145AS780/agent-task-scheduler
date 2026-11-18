@@ -87,6 +87,11 @@ try:                                    # 扩展发现层缺失时 extend 子命
 except Exception:                       # noqa: BLE001
     ats_extend = None
 
+try:                                    # Python 插件层缺失时 plugin 子命令直接报错
+    import ats_plugin
+except Exception:                       # noqa: BLE001
+    ats_plugin = None
+
 # —— 能力组件的薄包装：模块缺失时各归各的降级，调用点不必逐个判空
 
 
@@ -4202,6 +4207,95 @@ def cmd_extend_run(root, args):
     return print_json(payload, code)
 
 
+# ---------------------------------------------------------------- Python 插件
+
+def _plugin_logger(root):
+    """插件日志落事件流：插件自己 print 会污染 stdout 的纯 JSON 接口。"""
+    def _log(message):
+        log_event(root, "plugin_log", detail=str(message))
+    return _log
+
+
+def cmd_plugin(root, args):
+    """Python 插件入口：list / help / check / load / run / lang / scaffold。
+
+    与 extend 插件的唯一区别是执行模型：extend 永远拉子进程走 Task 链路，
+    这里是把 Injection.py 导入主进程，所以闸门顺序是
+    静态校验 → 封签校验 → exec，没有「审批一下再导入」这种回落路径。
+    """
+    if ats_plugin is None:
+        return print_json({"error": "plugin_module_missing",
+                           "hint": "scripts/ats_plugin.py 缺失或无法导入，插件层不可用"},
+                          EXIT_USAGE)
+    action = args.action
+
+    if action == "list":
+        data = ats_plugin.scan()
+        if args.json:
+            return print_json(data)
+        for line in ats_plugin.render_table(data["plugins"]):
+            print(line)
+        if not data["plugins"]:
+            print("no plugins in %s" % data["plugin_dir"])
+        return EXIT_OK
+
+    if action == "help":
+        item = ats_plugin.describe(args.plugin_id)
+        if item is None:
+            return print_json({"error": "not_found", "plugin_id": args.plugin_id,
+                               "hint": hint_command("插件目录不存在",
+                                                    "plugin", "list")},
+                              EXIT_CONFLICT)
+        if args.json:
+            return print_json({"plugin": item})
+        seal = ats_plugin.verify_seal(root)
+        entry = ats_plugin.seal_entry(seal, item["plugin_id"])
+        state = (entry or {}).get("state") or (
+            "unsealed" if seal.get("error") is None else "unknown")
+        for line in ats_plugin.render_help(item, {"state": state}):
+            print(line)
+        return EXIT_OK
+
+    if action == "check":
+        payload, code = ats_plugin.check(root, args.plugin_id, locale=args.lang)
+        return print_json(payload, code)
+
+    if action == "load":
+        payload, code = ats_plugin.load(root, args.plugin_id, locale=args.lang,
+                                        logger=_plugin_logger(root))
+        if code == EXIT_OK:
+            log_event(root, "plugin_load", plugin_id=payload["plugin_id"],
+                      commands=len(payload.get("commands") or {}))
+        return print_json(payload, code)
+
+    if action == "run":
+        if not args.command:
+            return print_json({"error": "missing_command",
+                               "plugin_id": args.plugin_id,
+                               "hint": hint_command("--command 要填插件登记的命令名",
+                                                    "plugin", "load",
+                                                    args.plugin_id)},
+                              EXIT_USAGE)
+        payload, code = ats_plugin.run(root, args.plugin_id, args.command,
+                                       argv=args.arg, locale=args.lang,
+                                       logger=_plugin_logger(root))
+        log_event(root, "plugin_run", plugin_id=args.plugin_id,
+                  command=args.command, ok=(code == EXIT_OK))
+        return print_json(payload, code)
+
+    if action == "lang":
+        item, payload, code = ats_plugin.lang_payload(args.plugin_id, args.lang,
+                                                      args.key)
+        if args.json or item is None:
+            return print_json(payload, code)
+        for line in ats_plugin.render_lang(payload):
+            print(line)
+        return code
+
+    payload, code = ats_plugin.scaffold(args.plugin_id, force=args.force)
+    return print_json(payload, code)
+
+
 # ---------------------------------------------------------------- 看门狗准入
 
 def _sha256_file(path):
@@ -4975,6 +5069,46 @@ def build_parser():
     e.add_argument("--force", action="store_true", help="task id 已存在时覆盖")
     e.add_argument("--json", action="store_true")
 
+    p = sub.add_parser("plugin",
+                       help="Python 插件（静态校验 / 封签校验 / 导入执行）")
+    psub = p.add_subparsers(dest="action", required=True)
+
+    e = psub.add_parser("list", help="列出插件与状态（active / inactive）")
+    e.add_argument("--json", action="store_true")
+
+    e = psub.add_parser("help", help="查看单个插件的说明与封签状态")
+    e.add_argument("plugin_id")
+    e.add_argument("--json", action="store_true")
+
+    e = psub.add_parser("check", help="静态校验 + 封签校验（不导入、不执行）")
+    e.add_argument("plugin_id")
+    e.add_argument("--lang", default=None, help="本地化语言，默认 en")
+    e.add_argument("--json", action="store_true")
+
+    e = psub.add_parser("load", help="导入插件并列出它登记的命令")
+    e.add_argument("plugin_id")
+    e.add_argument("--lang", default=None, help="本地化语言，默认 en")
+    e.add_argument("--json", action="store_true")
+
+    e = psub.add_parser("run", help="导入插件并执行它登记的一条命令")
+    e.add_argument("plugin_id")
+    e.add_argument("--command", default=None, help="命令名，形如 hello.hello")
+    e.add_argument("--arg", action="append", default=[],
+                   help="传给插件命令的参数，可重复")
+    e.add_argument("--lang", default=None, help="本地化语言，默认 en")
+    e.add_argument("--json", action="store_true")
+
+    e = psub.add_parser("lang", help="查看 / 查询插件的本地化文案")
+    e.add_argument("plugin_id")
+    e.add_argument("--lang", default=None, help="本地化语言，默认 en")
+    e.add_argument("--key", default=None, help="只看某一条文案")
+    e.add_argument("--json", action="store_true")
+
+    e = psub.add_parser("scaffold", help="生成最小插件骨架 plugins/<id>/")
+    e.add_argument("plugin_id")
+    e.add_argument("--force", action="store_true", help="目录已存在时覆盖模板文件")
+    e.add_argument("--json", action="store_true")
+
     p = sub.add_parser("visa",
                        help="签证管理（issue / list / peek / revoke / consume）")
     p.add_argument("visa_action",
@@ -5145,6 +5279,7 @@ HANDLERS = {
     "logs": cmd_logs,
     "policy": cmd_policy,
     "extend": cmd_extend,
+    "plugin": cmd_plugin,
     "visa": cmd_visa,
     "abort": cmd_abort,
     "unpack": cmd_unpack,
@@ -5178,7 +5313,7 @@ MENU_GROUPS = (
     ("看一眼现状", ("list", "show", "status", "check", "events", "logs", "policy")),
     ("跑任务", ("create", "run", "pack", "download", "torrent")),
     ("审批与通行", ("approve", "approval", "visa", "abort", "stop", "delete")),
-    ("维护与扩展", ("unpack", "tryrun", "repack", "extend")),
+    ("维护与扩展", ("unpack", "tryrun", "repack", "extend", "plugin")),
 )
 MENU_SKIP = ("supervise",)          # run 派生的内部进程，手敲没有意义
 

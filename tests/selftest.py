@@ -86,6 +86,7 @@ class Sandbox:
         # 断言就会拿短名/软链名去比长名，在 macos-latest 和 windows-latest 上假红。
         self.dir = Path(tempfile.mkdtemp(prefix="ats-selftest-")).resolve()
         self.root = self.dir / "root"
+        self.plugins = self.dir / "plugins"
         self.auto_seal = True
         self.manifest = self.root / "ats_guard_manifest.json"
 
@@ -117,6 +118,7 @@ class Sandbox:
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUTF8"] = "1"
         env["PYTHONDONTWRITEBYTECODE"] = "1"
+        env["ATS_PLUGINS_ROOT"] = str(self.plugins)
         proc = subprocess.run(cmd, input=stdin, capture_output=True, text=True, env=env,
                               encoding="utf-8", errors="replace", timeout=timeout)
         return proc.returncode, (proc.stdout or ""), (proc.stderr or "")
@@ -2555,6 +2557,336 @@ def extend_run_rejects_inactive_and_policy_cap():
                           .read_text(encoding="utf-8"))
         expect(task["status"] == "pending",
                "被策略拒绝的 task 应停在 pending，实际 %r" % task["status"])
+    finally:
+        sb.cleanup()
+
+
+# ---------------------------------------------------------------- Python 插件层
+
+def write_plugin(plugins_dir, plugin_id, injection_text=None,
+                 declared_id=None, files=None, **fields):
+    """在 <plugins_dir>/<id>/ 下写一个插件，返回目录。
+
+    injection_text 为 None 时不写入口文件（造 missing_injection）；
+    files 用于追加额外文件（造 __pycache__ / 篡改用例）。
+    """
+    base = Path(plugins_dir) / plugin_id
+    base.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "plugin_id": plugin_id,
+        "name": "Demo",
+        "version": "1.0.0",
+        "description": "示例插件",
+        "level": "L2",
+        "allow_language": ["python"],
+        "injection": "Injection.py",
+    }
+    if declared_id is not None:
+        payload["plugin_id"] = declared_id
+    payload.update(fields)
+    (base / "plugin.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    if injection_text is not None:
+        (base / "Injection.py").write_text(injection_text, encoding="utf-8")
+    for rel, content in (files or {}).items():
+        path = base / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    return base
+
+
+HELLO_INJECTION = (
+    "import ats_api\n"
+    "def cmd_hello(api, argv):\n"
+    "    return {'ok': True, 'said': argv[0] if argv else 'world'}\n"
+    "def register(api):\n"
+    "    api.command('%s.hello', cmd_hello, help_text='say hello')\n"
+)
+
+
+def plugin_seal(sb, plugin_id=None):
+    args = ["plugin", "seal", "--confirm"]
+    if plugin_id:
+        args.append(plugin_id)
+    return sb.guard(*args)
+
+
+@case
+def plugin_list_states():
+    """三种典型状态：合法 active、坏 JSON inactive、入口缺失 inactive。"""
+    sb = Sandbox()
+    try:
+        write_plugin(sb.plugins, "hello", HELLO_INJECTION % "hello")
+        broken = Path(sb.plugins) / "broken"
+        broken.mkdir(parents=True, exist_ok=True)
+        (broken / "plugin.json").write_text("{not json", encoding="utf-8")
+        write_plugin(sb.plugins, "noentry", injection_text=None)
+
+        rc, data = sb.json_out("plugin", "list", "--json")
+        expect(rc == 0, "plugin list 应退出 0，实际 %s\n%s" % (rc, data))
+        expect(data["count"] == 3, "应发现 3 个插件，实际 %s" % data["count"])
+        by_id = {x["plugin_id"]: x for x in data["plugins"]}
+        expect(by_id["hello"]["state"] == "active",
+               "hello 应为 active，实际 %r" % by_id["hello"]["state"])
+        expect(by_id["broken"]["reason"] == "missing_or_invalid_manifest",
+               "坏 JSON 应报 missing_or_invalid_manifest，实际 %r"
+               % by_id["broken"]["reason"])
+        expect(by_id["noentry"]["reason"] == "missing_injection",
+               "缺入口应报 missing_injection，实际 %r"
+               % by_id["noentry"]["reason"])
+        expect(data["active"] == 1 and data["inactive"] == 2,
+               "计数应为 1 active / 2 inactive，实际 %s / %s"
+               % (data["active"], data["inactive"]))
+    finally:
+        sb.cleanup()
+
+
+@case
+def plugin_list_empty_dir():
+    """plugins 目录不存在时返回空结果，不报错。"""
+    sb = Sandbox()
+    try:
+        rc, data = sb.json_out("plugin", "list", "--json")
+        expect(rc == 0, "无 plugins 目录也应退出 0，实际 %s\n%s" % (rc, data))
+        expect(data["count"] == 0, "应为 0 个插件，实际 %s" % data["count"])
+        expect(data["plugins"] == [], "plugins 应为空列表")
+    finally:
+        sb.cleanup()
+
+
+@case
+def plugin_never_imports_on_list():
+    """发现层只读 plugin.json：入口里的导入副作用不得发生。"""
+    sb = Sandbox()
+    try:
+        marker = Path(sb.dir) / "listed.marker"
+        write_plugin(sb.plugins, "side",
+                     "import pathlib\n"
+                     "pathlib.Path(%r).write_text('imported')\n" % str(marker))
+        rc, data = sb.json_out("plugin", "list", "--json")
+        expect(rc == 0, "list 应退出 0，实际 %s" % rc)
+        expect(not marker.exists(), "list 不得导入插件代码，但 marker 已生成")
+    finally:
+        sb.cleanup()
+
+
+@case
+def plugin_scaffold_is_runnable():
+    """骨架 → 封签 → check → load → run 全链路可用。"""
+    sb = Sandbox()
+    try:
+        rc, data = sb.json_out("plugin", "scaffold", "demo-hello", "--json")
+        expect(rc == 0, "scaffold 应退出 0，实际 %s\n%s" % (rc, data))
+        expect((sb.plugins / "demo-hello" / "plugin.json").is_file(),
+               "应生成 plugin.json")
+        expect((sb.plugins / "demo-hello" / "Injection.py").is_file(),
+               "应生成 Injection.py")
+        expect(not (sb.plugins / "demo-hello" / "__pycache__").exists(),
+               "骨架不得带 __pycache__")
+
+        rc, data = sb.json_out("plugin", "scaffold", "demo-hello", "--json")
+        expect(rc == 3 and data.get("error") == "plugin_exists",
+               "重复 scaffold 应报 plugin_exists，实际 %s / %r"
+               % (rc, data.get("error")))
+
+        rc, out, err = plugin_seal(sb, "demo-hello")
+        expect(rc == 0, "plugin seal 应退出 0，实际 %s\n%s\n%s" % (rc, out, err))
+
+        rc, data = sb.json_out("plugin", "check", "demo-hello", "--json")
+        expect(rc == 0, "封签后 check 应退出 0，实际 %s\n%s" % (rc, data))
+        expect(data["executed"] is False and data["would_load"] is True,
+               "check 只预演，不应执行")
+
+        rc, data = sb.json_out("plugin", "load", "demo-hello", "--json")
+        expect(rc == 0, "load 应退出 0，实际 %s\n%s" % (rc, data))
+        expect("demo-hello.hello" in (data.get("commands") or {}),
+               "应登记 demo-hello.hello，实际 %r" % data.get("commands"))
+        expect(data["no_bytecode"] is True, "load 必须禁用字节码")
+
+        rc, data = sb.json_out("plugin", "run", "demo-hello",
+                               "--command", "demo-hello.hello", "--json")
+        expect(rc == 0, "run 应退出 0，实际 %s\n%s" % (rc, data))
+        expect((data.get("result") or {}).get("said") == "Hello, world!",
+               "命令返回值应带 said=Hello, world!，实际 %r" % data.get("result"))
+
+        rc, data = sb.json_out("plugin", "run", "demo-hello",
+                               "--command", "demo-hello.hello",
+                               "--arg", "trae", "--json")
+        expect((data.get("result") or {}).get("said") == "Hello, trae!",
+               "argv 应经 tr 填进文案，实际 %r" % data.get("result"))
+    finally:
+        sb.cleanup()
+
+
+@case
+def plugin_blocks_unsealed():
+    """没封签的插件一律拒绝导入，且给出重封命令。"""
+    sb = Sandbox()
+    try:
+        write_plugin(sb.plugins, "sealed-one", HELLO_INJECTION % "sealed-one")
+        plugin_seal(sb, "sealed-one")
+        write_plugin(sb.plugins, "fresh", HELLO_INJECTION % "fresh")
+
+        rc, data = sb.json_out("plugin", "check", "fresh", "--json")
+        expect(rc == 4, "未封签应退出 EXIT_DENIED(4)，实际 %s\n%s" % (rc, data))
+        expect(data.get("error") == "plugin_unsealed",
+               "应报 plugin_unsealed，实际 %r" % data.get("error"))
+        expect(data.get("executed") is False, "被拒时不得执行")
+        expect("plugin seal" in (data.get("hint") or ""),
+               "应给出 plugin seal 命令，实际 %r" % data.get("hint"))
+
+        rc, data = sb.json_out("plugin", "load", "fresh", "--json")
+        expect(rc == 4, "未封签 load 应被拒，实际 %s\n%s" % (rc, data))
+        expect(data.get("error") == "plugin_unsealed",
+               "load 也应报 plugin_unsealed，实际 %r" % data.get("error"))
+    finally:
+        sb.cleanup()
+
+
+@case
+def plugin_tamper_detected():
+    """封签后改动入口文件：verify 报 modified，load 拒绝。"""
+    sb = Sandbox()
+    try:
+        write_plugin(sb.plugins, "tamper", HELLO_INJECTION % "tamper")
+        plugin_seal(sb, "tamper")
+
+        injection = sb.plugins / "tamper" / "Injection.py"
+        injection.write_text(HELLO_INJECTION % "tamper" + "# changed\n",
+                             encoding="utf-8")
+
+        rc, out, err = sb.guard("plugin", "verify", "tamper")
+        payload = json.loads(out)
+        expect(rc != 0, "字节被改后 verify 应失败，实际 %s" % rc)
+        expect(payload["plugins"]["tamper"]["state"] == "modified",
+               "应报 modified，实际 %r" % payload["plugins"]["tamper"]["state"])
+
+        rc, data = sb.json_out("plugin", "load", "tamper", "--json")
+        expect(rc == 4, "被改后 load 应拒绝，实际 %s\n%s" % (rc, data))
+        expect(data.get("error") == "plugin_modified",
+               "应报 plugin_modified，实际 %r" % data.get("error"))
+        expect(not (sb.plugins / "tamper" / "__pycache__").exists(),
+               "被拒后也不得留下字节码")
+    finally:
+        sb.cleanup()
+
+
+@case
+def plugin_check_never_executes():
+    """check 不导入插件：入口里的写盘副作用不得发生。"""
+    sb = Sandbox()
+    try:
+        marker = Path(sb.dir) / "checked.marker"
+        write_plugin(sb.plugins, "side",
+                     "import pathlib\n"
+                     "pathlib.Path(%r).write_text('imported')\n" % str(marker))
+        plugin_seal(sb, "side")
+
+        rc, data = sb.json_out("plugin", "check", "side", "--json")
+        expect(rc == 0, "check 应退出 0，实际 %s\n%s" % (rc, data))
+        expect(not marker.exists(), "check 不得导入插件代码，但 marker 已生成")
+    finally:
+        sb.cleanup()
+
+
+@case
+def plugin_rejects_bad_id_and_traversal():
+    """目录名与 plugin_id 不一致判 inactive；入口穿越插件目录同样判 inactive。"""
+    sb = Sandbox()
+    try:
+        write_plugin(sb.plugins, "mismatch", HELLO_INJECTION % "mismatch",
+                     declared_id="other")
+        write_plugin(sb.plugins, "escape", None,
+                     injection="../../scripts/ats.py")
+
+        rc, data = sb.json_out("plugin", "list", "--json")
+        by_id = {x["plugin_id"]: x for x in data["plugins"]}
+        expect(by_id["mismatch"]["state"] == "inactive"
+               and by_id["mismatch"]["reason"] == "plugin_id_mismatch",
+               "id 不一致应报 plugin_id_mismatch，实际 %r / %r"
+               % (by_id["mismatch"]["state"], by_id["mismatch"]["reason"]))
+        expect(by_id["escape"]["reason"] == "bad_injection_path",
+               "穿越入口应报 bad_injection_path，实际 %r"
+               % by_id["escape"]["reason"])
+
+        rc, data = sb.json_out("plugin", "run", "escape", "--command", "escape.hello",
+                               "--json")
+        expect(rc == 4, "inactive 插件 run 应退出 4，实际 %s" % rc)
+        expect(data.get("error") == "bad_injection_path",
+               "run 也应报 bad_injection_path，实际 %r" % data.get("error"))
+    finally:
+        sb.cleanup()
+
+
+@case
+def plugin_run_unknown_command():
+    """未登记的命令名直接拒绝，并列出可用命令。"""
+    sb = Sandbox()
+    try:
+        write_plugin(sb.plugins, "solo", HELLO_INJECTION % "solo")
+        plugin_seal(sb, "solo")
+
+        rc, data = sb.json_out("plugin", "run", "solo", "--command", "nope", "--json")
+        expect(rc == 2, "未知命令应退出 EXIT_USAGE(2)，实际 %s\n%s" % (rc, data))
+        expect(data.get("error") == "command_not_found",
+               "应报 command_not_found，实际 %r" % data.get("error"))
+        expect("solo.hello" in (data.get("available") or []),
+               "应列出可用命令，实际 %r" % data.get("available"))
+    finally:
+        sb.cleanup()
+
+
+@case
+def plugin_seal_single_keeps_others():
+    """单插件重封不影响其他已封插件，也不会把它们从清单里删掉。"""
+    sb = Sandbox()
+    try:
+        write_plugin(sb.plugins, "alpha", HELLO_INJECTION % "alpha")
+        write_plugin(sb.plugins, "beta", HELLO_INJECTION % "beta")
+        plugin_seal(sb, "alpha")
+        plugin_seal(sb, "beta")
+
+        (sb.plugins / "beta" / "Injection.py").write_text(
+            HELLO_INJECTION % "beta" + "# v2\n", encoding="utf-8")
+        rc, out, err = plugin_seal(sb, "beta")
+        expect(rc == 0, "单插件重封应成功，实际 %s\n%s\n%s" % (rc, out, err))
+        payload = json.loads(out)
+        expect("alpha" in payload["plugins"],
+               "单插件重封不得丢掉 alpha，实际 %r" % list(payload["plugins"]))
+
+        rc, data = sb.json_out("plugin", "check", "alpha", "--json")
+        expect(rc == 0, "alpha 仍应通过校验，实际 %s\n%s" % (rc, data))
+        rc, data = sb.json_out("plugin", "check", "beta", "--json")
+        expect(rc == 0, "beta 重封后应通过校验，实际 %s\n%s" % (rc, data))
+    finally:
+        sb.cleanup()
+
+
+@case
+def plugin_lang_fallback():
+    """请求语言缺失时回退 en；key 不存在返回 EXIT_CONFLICT。"""
+    sb = Sandbox()
+    try:
+        write_plugin(sb.plugins, "loc", HELLO_INJECTION % "loc",
+                     files={"Localization/en/strings.json":
+                            json.dumps({"hello.target": "world"}),
+                            "Localization/zh/strings.json":
+                            json.dumps({"hello.target": "世界"})})
+
+        rc, data = sb.json_out("plugin", "lang", "loc", "--key", "hello.target",
+                               "--lang", "zh", "--json")
+        expect(rc == 0 and data.get("value") == "世界",
+               "zh 应取到「世界」，实际 %s / %r" % (rc, data.get("value")))
+
+        rc, data = sb.json_out("plugin", "lang", "loc", "--key", "hello.target",
+                               "--lang", "de", "--json")
+        expect(rc == 0 and data.get("value") == "world",
+               "缺 de 应回退 en，实际 %s / %r" % (rc, data.get("value")))
+
+        rc, data = sb.json_out("plugin", "lang", "loc", "--key", "missing.key",
+                               "--json")
+        expect(rc == 3 and data.get("value") is None,
+               "不存在的 key 应退出 3，实际 %s / %r" % (rc, data.get("value")))
     finally:
         sb.cleanup()
 

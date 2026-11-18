@@ -27,13 +27,14 @@
 | 维护态 | `ats.py unpack` / `tryrun` / `repack` | 改核心脚本时的停机窗口：停任务、窗口内自测不限次、重建基线 |
 | 任务回执板 | 执行命令的 stderr 看板 + `telegraph/Receive.txt` | 每条终态一行 `[<task_id>]: true\|false`，行号即 `task.json` 的 `receive_line` |
 | 扩展插件 | `ats.py extend list` / `help` / `check` / `run` | 自己的小工具放进 `extend/<id>/`，`check` 预演后再走同一套审批 |
+| Python 插件 | `ats.py plugin list` / `help` / `check` / `load` / `run` / `lang` / `scaffold` | 自己的 Python 能力放进 `plugins/<id>/`，封签后导入主进程；`check` 到 exec 前停下，与 `load` 共用同一条判定链 |
 | 本地控制台 | `ats_ui.py --open`（或 `--ensure`） | 只读监控 + 运行/停止/重试 + 审批 + 签证 + 路径白名单 + 窄屏适配 |
 | MCP 接入 | `ats_mcp.py`（stdio）/ 控制台内 HTTP 端点 | 16 个工具覆盖 Task / 审批 / Plan / Schedule；HTTP 端点默认关闭 |
 | 事件与追溯 | `ats.py events` / `logs`、`ats_plan.py history` | 全局事件流带游标；运行快照不可变，可回看每步退出码 |
 | 转码钩子 | 命令末尾挂 `@enc` | 仅主命令成功时自动转码；失败 / 超时 / 被 stop 时不生成 |
 
-**计数**（供核对，改动脚本后请重核）：`ats.py` 23 个子命令、`ats_plan.py` 15 个、
-`ats_guard.py` 7 个动作、MCP 16 个工具。
+**计数**（供核对，改动脚本后请重核）：`ats.py` 24 个子命令、`ats_plan.py` 15 个、
+`ats_guard.py` 8 个动作（`plugin` 一个动作带 `seal` / `verify` / `list` 三个子命令）、MCP 16 个工具。
 
 ---
 

@@ -17,6 +17,10 @@ GitHub Releases 和从 SKILL.md 会读到两套说法。
 > 数字少跳，原因见 [versioning.md](references/versioning.md) §2.1。
 > 口径冲突要写明：`v4.0.0-R0` 的 tag 已推到 `origin/master` 但没有对应 GitHub Release，
 > 本次按「已发布 Release」口径续号，代价是数字不再严格表达那次边界收窄——所以上面这条警告不撤。
+> **自本版起口径合并**：`4.0.0-R0` 的全部内容与承诺由 `0.3.1.1：w17vbc` 承接，`4.0.0-R0` 降为
+> 历史 tag——不再作为对外版本号、不补 Release。远端 tag 不删：删除远端 ref 与「已推送的 tag 不回改」
+> 冲突，且已 fetch 过的人手上仍有它，删了只会多出一套事实。核对与落地规则见
+> [ATS-release-runbook.md](ATS-release-runbook.md) §6。
 >
 > **仍然必须重新封签**：本轮 `scripts/` 下变了七个 `.py`（`ats.py`、`ats_guard.py`、`ats_plan.py`、
 > `ats_torrent.py`、`ats_ui.py`，以及新增的 `ats_maintenance.py`、`ats_telegraph.py`）。
